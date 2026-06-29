@@ -1,4 +1,4 @@
-.PHONY: install test test-tempo lint fmt node-up node-down
+.PHONY: install test test-tempo test-consensus lint fmt node-up node-down
 
 BIN := .venv/bin
 
@@ -12,6 +12,10 @@ test:
 # Only tempo-native feature tests.
 test-tempo:
 	$(BIN)/pytest -m tempo -vv
+
+# Consensus RPC tests against a 4-validator localnet (needs tempo-xtask built).
+test-consensus:
+	$(BIN)/pytest -m consensus --consensus -vv
 
 lint:
 	$(BIN)/ruff check integration_tests
