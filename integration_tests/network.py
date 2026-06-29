@@ -66,6 +66,7 @@ class TempoNode:
         log_path: Path,
         http_port: int = DEFAULT_HTTP_PORT,
         ws_port: int | None = None,
+        p2p_port: int | None = None,
         genesis: Path | None = None,
         binary: list[str] | None = None,
         block_time: str = "1sec",
@@ -74,6 +75,9 @@ class TempoNode:
         self.log_path = Path(log_path)
         self.http_port = http_port
         self.ws_port = ws_port or free_port()
+        # Randomize the P2P + auth-RPC ports so multiple nodes can run at once (xdist, node-ops).
+        self.p2p_port = p2p_port or free_port()
+        self.auth_port = free_port()
         self.genesis = Path(genesis) if genesis else default_genesis()
         self.binary = binary or resolve_binary()
         self.block_time = block_time
@@ -105,6 +109,11 @@ class TempoNode:
             str(self.ws_port),
             "--ws.api",
             "all",
+            "--port",
+            str(self.p2p_port),
+            "--authrpc.port",
+            str(self.auth_port),
+            "--disable-discovery",
             "--engine.disable-precompile-cache",
             "--builder.gaslimit",
             "3000000000",
