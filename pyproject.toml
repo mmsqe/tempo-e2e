@@ -44,3 +44,7 @@ quote-style = "double"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Human-readable contract ABI signatures are unavoidably long.
+"integration_tests/abi.py" = ["E501"]
