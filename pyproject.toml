@@ -1,0 +1,46 @@
+[project]
+name = "tempo-e2e"
+version = "0.1.0"
+description = "End-to-end test suite for the tempo node binary"
+requires-python = ">=3.13"
+dependencies = [
+    "tempo-py",
+    "web3>=7.0.0",
+    "eth-account>=0.13.0",
+    "eth-contract>=0.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.0.0",
+    "pytest-xdist>=3.6.0",
+    "flaky>=3.8.1",
+    "pytest-github-actions-annotate-failures>=0.3.0",
+    "ruff>=0.15.0",
+]
+
+[tool.uv.sources]
+tempo-py = { git = "ssh://git@github.com/yihuang/tempo-py.git", branch = "main" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["integration_tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+markers = [
+    "slow: long-running tests",
+    "tempo: tempo-native feature tests (TIP-20, AA tx, access keys, fees)",
+    "consensus: requires a multi-validator consensus network",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

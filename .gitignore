@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+*.egg-info/
+
+# uv
+# (uv.lock IS committed)
+
+# pytest / tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Test runtime artifacts
+data/
+logs/
+*.log
+node-data/
+
+# Local env
+.env
