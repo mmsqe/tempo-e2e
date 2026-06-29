@@ -66,7 +66,7 @@ class ConsensusNetwork:
         self.binary = resolve_binary()
         self.genesis = self.base_dir / "genesis.json"
         self.secret_path = self.base_dir / "secret.txt"
-        self.procs: list[subprocess.Popen] = []
+        self.procs: list[subprocess.Popen | None] = []
         # Random free ports (baked into genesis) so runs don't collide with each other or a dev node.
         self.consensus_ports, self.http_ports = _alloc_region(validators)
 
@@ -155,16 +155,32 @@ class ConsensusNetwork:
         self.secret_path.write_text(SIGNING_KEY_PASSPHRASE + "\n")
         return self
 
+    def _spawn(self, i: int, peers: str) -> subprocess.Popen:
+        log = open(self.base_dir / f"node{i}.log", "a")
+        return subprocess.Popen(self._node_args(i, peers), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+
     def start(self) -> "ConsensusNetwork":
         peers = self._trusted_peers()
-        for i in range(self.validators):
-            log = open(self.base_dir / f"node{i}.log", "w")
-            self.procs.append(
-                subprocess.Popen(
-                    self._node_args(i, peers), stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-                )
-            )
+        self.procs = [self._spawn(i, peers) for i in range(self.validators)]
         return self
+
+    def _term(self, proc: subprocess.Popen | None) -> None:
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=15)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def stop_one(self, i: int) -> None:
+        self._term(self.procs[i])
+        self.procs[i] = None
+
+    def start_one(self, i: int) -> None:
+        self.procs[i] = self._spawn(i, self._trusted_peers())
 
     def wait_for_finalization(self, timeout: float = 120.0) -> "ConsensusNetwork":
         """Wait until validator 0 finalizes a block via consensus (not just produces one)."""
@@ -173,7 +189,7 @@ class ConsensusNetwork:
         last_err: Exception | None = None
         while time.time() < deadline:
             for proc in self.procs:
-                if proc.poll() is not None:
+                if proc is not None and proc.poll() is not None:
                     raise RuntimeError(f"a validator exited early (code {proc.returncode}); see {self.base_dir}")
             try:
                 finalized = (w3.provider.make_request("consensus_getLatest", []).get("result") or {}).get("finalized")
@@ -188,13 +204,5 @@ class ConsensusNetwork:
 
     def stop(self) -> None:
         for proc in self.procs:
-            if proc.poll() is None:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                    proc.wait(timeout=15)
-                except (ProcessLookupError, subprocess.TimeoutExpired):
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+            self._term(proc)
         self.procs = []
