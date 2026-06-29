@@ -32,3 +32,12 @@ FEE = Contract.from_abi(
         "function getPoolId(address userToken, address validatorToken) pure returns (bytes32)",
     ]
 )
+
+# TIP-20 token factory (ITIP20Factory) and AccessControl on the created tokens.
+TIP20_FACTORY = Contract.from_abi(
+    [
+        "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt) returns (address)",
+        "function isTIP20(address token) view returns (bool)",
+    ]
+)
+TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
