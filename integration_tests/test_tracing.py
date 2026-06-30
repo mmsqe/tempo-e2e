@@ -1,12 +1,8 @@
 """debug_traceTransaction: a tempo tx's real work (CREATE/CALL) appears as callTracer subcalls."""
 
-from eth_contract.erc20 import ERC20
 from hexbytes import HexBytes
-from tempo.constants import PATH_USD
 
-from .utils import deploy_contract, new_account, send_calls
-
-RETURN_42_INIT = "600a600c600039600a6000f3602a60005260206000f3"
+from .utils import RETURN_42_INIT, deploy_contract, new_account, send_calls, transfer_call
 
 
 async def _trace(w3, tx_hash, options):
@@ -31,10 +27,7 @@ async def test_call_tracer_shows_create_and_call_subcalls(w3, chain_id, funded_a
 
 async def test_struct_logger_responds(w3, chain_id, funded_account):
     receipt = await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=funded_account.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 1).data}],
+        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 1)]
     )
     trace = await _trace(w3, receipt["transactionHash"].to_0x_hex(), {})
     assert {"gas", "failed", "returnValue", "structLogs"} <= set(trace.keys())

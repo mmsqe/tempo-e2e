@@ -9,7 +9,7 @@ from tempo import Signer, serialize
 from tempo.constants import PATH_USD
 from tempo.keychain import sign_tx_access_key
 
-from .utils import build_tempo_tx, fund, get_nonce, new_account, suggested_max_fee
+from .utils import build_tempo_tx, fund, get_nonce, new_account, suggested_max_fee, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -26,7 +26,7 @@ async def test_admin_access_key_authorizes_transfer(w3, chain_id):
         nonce=await get_nonce(w3, root.address),
         fee_token=PATH_USD,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(recipient, 1500).data}],
+        calls=[transfer_call(recipient, 1500)],
     )
     signed = sign_tx_access_key(tx, access_key.key.hex(), Signer(root.key.hex()), is_admin=True)
     receipt = await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(serialize(signed)))

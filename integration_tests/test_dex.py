@@ -6,12 +6,10 @@ from hexbytes import HexBytes
 from tempo.constants import ALPHA_USD, PATH_USD, STABLECOIN_DEX_ADDRESS
 
 from .abi import DEX
-from .utils import fund, fund_token, new_account, send_calls
+from .utils import STATE_WRITE_GAS, fund, fund_token, new_account, send_calls
 
 pytestmark = pytest.mark.tempo
 
-# Placing/swapping writes order-book storage, which costs TIP-1060 state gas.
-DEX_GAS = 8_000_000
 MAX_UINT = 2**256 - 1
 
 
@@ -38,7 +36,7 @@ async def test_place_get_and_cancel_order(w3, chain_id):
         w3,
         chain_id=chain_id,
         private_key=maker.key.hex(),
-        gas_limit=DEX_GAS,
+        gas_limit=STATE_WRITE_GAS,
         calls=[
             {"to": ALPHA_USD, "data": ERC20.fns.approve(STABLECOIN_DEX_ADDRESS, MAX_UINT).data},
             {"to": STABLECOIN_DEX_ADDRESS, "data": DEX.fns.place(ALPHA_USD, 2_000_000_000, False, 0).data},
@@ -54,7 +52,7 @@ async def test_place_get_and_cancel_order(w3, chain_id):
         w3,
         chain_id=chain_id,
         private_key=maker.key.hex(),
-        gas_limit=DEX_GAS,
+        gas_limit=STATE_WRITE_GAS,
         calls=[{"to": STABLECOIN_DEX_ADDRESS, "data": DEX.fns.cancel(order_id).data}],
     )
     assert cancel["status"] == 1
@@ -69,7 +67,7 @@ async def test_swap_fills_resting_order(w3, chain_id):
         w3,
         chain_id=chain_id,
         private_key=maker.key.hex(),
-        gas_limit=DEX_GAS,
+        gas_limit=STATE_WRITE_GAS,
         calls=[
             {"to": ALPHA_USD, "data": ERC20.fns.approve(STABLECOIN_DEX_ADDRESS, MAX_UINT).data},
             {"to": STABLECOIN_DEX_ADDRESS, "data": DEX.fns.place(ALPHA_USD, 5_000_000_000, False, 0).data},
@@ -85,7 +83,7 @@ async def test_swap_fills_resting_order(w3, chain_id):
         w3,
         chain_id=chain_id,
         private_key=taker.key.hex(),
-        gas_limit=DEX_GAS,
+        gas_limit=STATE_WRITE_GAS,
         calls=[
             {"to": PATH_USD, "data": ERC20.fns.approve(STABLECOIN_DEX_ADDRESS, MAX_UINT).data},
             {"to": STABLECOIN_DEX_ADDRESS, "data": DEX.fns.swapExactAmountIn(PATH_USD, ALPHA_USD, amount_in, 0).data},

@@ -1,10 +1,6 @@
 """EVM contract deployment and calls via tempo (0x76) transactions."""
 
-from .utils import deploy_contract, get_nonce
-
-# Init code that deploys runtime returning the constant 42.
-RETURN_42_INIT = "600a600c600039600a6000f3602a60005260206000f3"
-RETURN_42_RUNTIME = bytes.fromhex("602a60005260206000f3")
+from .utils import RETURN_42_INIT, RETURN_42_RUNTIME, deploy_contract, get_nonce
 
 
 async def test_deploy_sets_code(w3, chain_id, funded_account):

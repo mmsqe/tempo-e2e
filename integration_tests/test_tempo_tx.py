@@ -5,7 +5,7 @@ from eth_contract.erc20 import ERC20
 from tempo import Signer, serialize, sign_transaction
 from tempo.constants import PATH_USD
 
-from .utils import build_tempo_tx, get_nonce, new_account, send_tempo_tx, suggested_max_fee
+from .utils import build_tempo_tx, get_nonce, new_account, send_tempo_tx, suggested_max_fee, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -19,7 +19,7 @@ async def test_serialized_tx_uses_0x76_type(w3, chain_id, funded_account):
         chain_id=chain_id,
         nonce=0,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 1).data}],
+        calls=[transfer_call(new_account().address, 1)],
     )
     assert serialize(sign_transaction(tx, Signer(funded_account.key.hex()))).startswith("0x76")
 
@@ -32,10 +32,7 @@ async def test_batched_heterogeneous_calls_one_nonce(w3, chain_id, funded_accoun
         chain_id=chain_id,
         nonce=nonce_before,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[
-            {"to": PATH_USD, "data": ERC20.fns.transfer(recipient, 321).data},
-            {"to": PATH_USD, "data": ERC20.fns.approve(spender, 654).data},
-        ],
+        calls=[transfer_call(recipient, 321), {"to": PATH_USD, "data": ERC20.fns.approve(spender, 654).data}],
     )
     receipt = await send_tempo_tx(w3, tx, funded_account.key.hex())
 
@@ -51,7 +48,7 @@ async def test_valid_before_in_past_is_rejected(w3, chain_id, funded_account):
         nonce=0,
         valid_before=await _now(w3) - 100,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 1).data}],
+        calls=[transfer_call(new_account().address, 1)],
     )
     signed = sign_transaction(tx, Signer(funded_account.key.hex()))
     with pytest.raises(Exception):
@@ -64,7 +61,7 @@ async def test_valid_after_in_future_is_rejected(w3, chain_id, funded_account):
         nonce=0,
         valid_after=await _now(w3) + 3600,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 1).data}],
+        calls=[transfer_call(new_account().address, 1)],
     )
     signed = sign_transaction(tx, Signer(funded_account.key.hex()))
     with pytest.raises(Exception):

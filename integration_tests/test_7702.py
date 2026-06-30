@@ -8,9 +8,8 @@ from eth_account import Account
 from hexbytes import HexBytes
 from web3 import AsyncWeb3
 
-from .utils import DEFAULT_MAX_PRIORITY_FEE_PER_GAS, deploy_contract, new_account, suggested_max_fee
+from .utils import DEFAULT_MAX_PRIORITY_FEE_PER_GAS, RETURN_42_INIT, deploy_contract, new_account, suggested_max_fee
 
-RETURN_42_INIT = "600a600c600039600a6000f3602a60005260206000f3"
 ZERO_ADDRESS = "0x" + "00" * 20
 SET_CODE_GAS = 500_000
 

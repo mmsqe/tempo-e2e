@@ -1,12 +1,11 @@
 """Tempo 2D nonces: parallel keys, sequencing, replay protection, and the Nonce precompile."""
 
 import pytest
-from eth_contract.erc20 import ERC20
 from tempo import Signer, serialize, sign_transaction
-from tempo.constants import NONCE_ADDRESS, PATH_USD
+from tempo.constants import NONCE_ADDRESS
 
 from .abi import NONCE
-from .utils import build_tempo_tx, get_nonce, new_account, send_tempo_tx, suggested_max_fee
+from .utils import build_tempo_tx, get_nonce, new_account, send_tempo_tx, suggested_max_fee, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -17,7 +16,7 @@ async def _transfer_tx(w3, chain_id, *, nonce, nonce_key, amount=10):
         nonce=nonce,
         nonce_key=nonce_key,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, amount).data}],
+        calls=[transfer_call(new_account().address, amount)],
     )
 
 

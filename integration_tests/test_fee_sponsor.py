@@ -8,7 +8,7 @@ from eth_contract.erc20 import ERC20
 from tempo import Signer, add_fee_payer_signature, serialize, sign_transaction
 from tempo.constants import PATH_USD
 
-from .utils import build_tempo_tx, fund, gas_cost_in_token, get_nonce, new_account, suggested_max_fee
+from .utils import build_tempo_tx, fund, gas_cost_in_token, get_nonce, new_account, suggested_max_fee, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -27,7 +27,7 @@ async def test_fee_payer_covers_gas(w3, chain_id):
         nonce=await get_nonce(w3, sender.address),
         fee_token=PATH_USD,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(recipient, 1000).data}],
+        calls=[transfer_call(recipient, 1000)],
     )
     tx = sign_transaction(tx, Signer(sender.key.hex()))
     tx = add_fee_payer_signature(tx, Signer(payer.key.hex()))

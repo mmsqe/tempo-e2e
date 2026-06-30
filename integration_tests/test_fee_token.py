@@ -5,7 +5,15 @@ from eth_contract.erc20 import ERC20
 from tempo import Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, PATH_USD
 
-from .utils import build_tempo_tx, fund_token, gas_cost_in_token, new_account, send_tempo_tx, suggested_max_fee
+from .utils import (
+    build_tempo_tx,
+    fund_token,
+    gas_cost_in_token,
+    new_account,
+    send_tempo_tx,
+    suggested_max_fee,
+    transfer_call,
+)
 
 pytestmark = pytest.mark.tempo
 
@@ -24,7 +32,7 @@ async def test_gas_paid_in_chosen_stablecoin(w3, chain_id, token):
         nonce=0,
         fee_token=token,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": token, "data": ERC20.fns.transfer(recipient, 1000).data}],
+        calls=[transfer_call(recipient, 1000, token)],
     )
     receipt = await send_tempo_tx(w3, tx, acct.key.hex())
 
@@ -41,7 +49,7 @@ async def test_fee_token_without_balance_is_rejected(w3, chain_id, funded_accoun
         nonce=0,
         fee_token=ALPHA_USD,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 1).data}],
+        calls=[transfer_call(new_account().address, 1)],
     )
     signed = sign_transaction(tx, Signer(funded_account.key.hex()))
     with pytest.raises(Exception):

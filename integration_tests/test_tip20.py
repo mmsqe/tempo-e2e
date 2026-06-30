@@ -4,7 +4,7 @@ import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 
-from .utils import STABLECOINS, fund, gas_cost_in_token, get_nonce, new_account, send_calls
+from .utils import STABLECOINS, fund, gas_cost_in_token, get_nonce, new_account, send_calls, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -19,10 +19,7 @@ async def test_transfer_accounting_includes_gas(w3, chain_id, funded_account):
     before = await ERC20.fns.balanceOf(funded_account.address).call(w3, to=PATH_USD)
 
     receipt = await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=funded_account.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(recipient, 1234).data}],
+        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(recipient, 1234)]
     )
 
     assert receipt["status"] == 1
@@ -75,10 +72,7 @@ async def test_batched_transfers_in_one_tx(w3, chain_id, funded_account):
         w3,
         chain_id=chain_id,
         private_key=funded_account.key.hex(),
-        calls=[
-            {"to": PATH_USD, "data": ERC20.fns.transfer(r1, 111).data},
-            {"to": PATH_USD, "data": ERC20.fns.transfer(r2, 222).data},
-        ],
+        calls=[transfer_call(r1, 111), transfer_call(r2, 222)],
     )
 
     assert receipt["status"] == 1
@@ -93,6 +87,6 @@ async def test_transfer_exceeding_balance_reverts(w3, chain_id, funded_account):
         w3,
         chain_id=chain_id,
         private_key=funded_account.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, balance + 1).data}],
+        calls=[transfer_call(new_account().address, balance + 1)],
     )
     assert receipt["status"] == 0

@@ -6,6 +6,7 @@ from typing import Sequence
 
 from eth_account import Account
 from eth_contract.erc20 import ERC20
+from hexbytes import HexBytes
 from tempo import Builder, Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, BETA_USD, NONCE_ADDRESS, PATH_USD, THETA_USD
 from web3 import AsyncWeb3
@@ -19,10 +20,22 @@ STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_US
 DEFAULT_GAS_LIMIT = 2_000_000
 DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
 DEFAULT_MAX_FEE_PER_GAS = 100_000_000_000
+# A tempo tx that writes new storage (DEX orders, token deploys) needs extra TIP-1060 state gas.
+STATE_WRITE_GAS = 8_000_000
+
+# Minimal EVM fixtures: init code that deploys runtime returning 42, and the ERC-20 Transfer topic.
+RETURN_42_INIT = "600a600c600039600a6000f3602a60005260206000f3"
+RETURN_42_RUNTIME = bytes.fromhex("602a60005260206000f3")
+TRANSFER_TOPIC = HexBytes("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
 
 def new_account():
     return Account.create()
+
+
+def transfer_call(to: str, amount: int, token: str = PATH_USD) -> dict:
+    """A TIP-20 ``transfer(to, amount)`` call for a tempo tx (``{to, data}``)."""
+    return {"to": token, "data": ERC20.fns.transfer(to, amount).data}
 
 
 async def suggested_max_fee(w3: AsyncWeb3, priority_fee: int = DEFAULT_MAX_PRIORITY_FEE_PER_GAS) -> int:

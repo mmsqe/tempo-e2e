@@ -2,22 +2,14 @@
 
 import asyncio
 
-from eth_contract.erc20 import ERC20
-from hexbytes import HexBytes
 from tempo.constants import PATH_USD
 
-from .utils import new_account, send_calls
-
-# keccak256("Transfer(address,address,uint256)")
-TRANSFER_TOPIC = HexBytes("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+from .utils import TRANSFER_TOPIC, new_account, send_calls, transfer_call
 
 
 async def test_transfer_emits_transfer_log(w3, chain_id, funded_account):
     receipt = await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=funded_account.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 5).data}],
+        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 5)]
     )
     block = receipt["blockNumber"]
     logs = await w3.eth.get_logs({"fromBlock": block, "toBlock": block, "address": PATH_USD})
@@ -34,10 +26,7 @@ async def test_block_filter_reports_new_blocks(w3):
 async def test_log_filter_captures_transfer(w3, chain_id, funded_account):
     log_filter = await w3.eth.filter({"address": PATH_USD, "topics": [TRANSFER_TOPIC]})
     await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=funded_account.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 7).data}],
+        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 7)]
     )
     changes = await w3.eth.get_filter_changes(log_filter.filter_id)
     assert len(changes) >= 1

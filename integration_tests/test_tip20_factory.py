@@ -8,12 +8,11 @@ from tempo.constants import PATH_USD, TIP20_FACTORY_ADDRESS
 from web3 import Web3
 
 from .abi import TIP20_FACTORY, TIP20_ROLES
-from .utils import send_calls
+from .utils import STATE_WRITE_GAS, send_calls
 
 pytestmark = pytest.mark.tempo
 
 ISSUER_ROLE = keccak(text="ISSUER_ROLE")
-FACTORY_GAS = 8_000_000  # deploying a token writes state (TIP-1060 state gas)
 
 
 def _created_token(receipt) -> str:
@@ -30,7 +29,7 @@ async def test_create_token_grant_role_and_mint(w3, chain_id, funded_account):
         w3,
         chain_id=chain_id,
         private_key=admin.key.hex(),
-        gas_limit=FACTORY_GAS,
+        gas_limit=STATE_WRITE_GAS,
         calls=[
             {
                 "to": TIP20_FACTORY_ADDRESS,
@@ -46,7 +45,7 @@ async def test_create_token_grant_role_and_mint(w3, chain_id, funded_account):
         w3,
         chain_id=chain_id,
         private_key=admin.key.hex(),
-        gas_limit=FACTORY_GAS,
+        gas_limit=STATE_WRITE_GAS,
         calls=[
             {"to": token, "data": TIP20_ROLES.fns.grantRole(ISSUER_ROLE, admin.address).data},
             {"to": token, "data": ERC20.fns.mint(admin.address, 5_000_000).data},

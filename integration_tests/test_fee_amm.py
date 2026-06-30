@@ -1,12 +1,11 @@
 """Fee AMM: paying gas in a non-validator stablecoin swaps through the FeeManager pool."""
 
 import pytest
-from eth_contract.erc20 import ERC20
 from hexbytes import HexBytes
 from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD
 
 from .abi import FEE
-from .utils import build_tempo_tx, fund_token, new_account, send_calls, send_tempo_tx, suggested_max_fee
+from .utils import build_tempo_tx, fund_token, new_account, send_calls, send_tempo_tx, suggested_max_fee, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -45,7 +44,7 @@ async def test_fee_in_non_validator_token_moves_pool(w3, chain_id):
         nonce=0,
         fee_token=ALPHA_USD,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": ALPHA_USD, "data": ERC20.fns.transfer(new_account().address, 1).data}],
+        calls=[transfer_call(new_account().address, 1, ALPHA_USD)],
     )
     assert (await send_tempo_tx(w3, tx, user.key.hex()))["status"] == 1
 
