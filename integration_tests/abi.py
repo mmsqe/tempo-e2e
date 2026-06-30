@@ -41,3 +41,15 @@ TIP20_FACTORY = Contract.from_abi(
     ]
 )
 TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
+
+# TIP-403 transfer-policy registry (ITIP403Registry); PolicyType: WHITELIST=0, BLACKLIST=1, COMPOUND=2.
+TIP403 = Contract.from_abi(
+    [
+        "function createPolicy(address admin, uint8 policyType) returns (uint64)",
+        "function modifyPolicyWhitelist(uint64 policyId, address account, bool allowed)",
+        "function modifyPolicyBlacklist(uint64 policyId, address account, bool restricted)",
+        "function isAuthorized(uint64 policyId, address user) view returns (bool)",
+        "function policyIdCounter() view returns (uint64)",
+        "function policyData(uint64 policyId) view returns (uint8 policyType, address admin)",
+    ]
+)
