@@ -42,6 +42,14 @@ TIP20_FACTORY = Contract.from_abi(
 )
 TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
 
+# Tempo TIP-20 extensions beyond ERC-20 (standard ops use eth_contract.erc20.ERC20).
+TIP20 = Contract.from_abi(
+    [
+        "function transferWithMemo(address to, uint256 amount, bytes32 memo)",
+        "function burn(uint256 amount)",
+    ]
+)
+
 # TIP-403 transfer-policy registry (ITIP403Registry); PolicyType: WHITELIST=0, BLACKLIST=1, COMPOUND=2.
 TIP403 = Contract.from_abi(
     [

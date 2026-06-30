@@ -2,11 +2,17 @@
 
 import pytest
 from eth_contract.erc20 import ERC20
+from eth_utils import keccak
+from hexbytes import HexBytes
 from tempo.constants import PATH_USD
 
+from .abi import TIP20
 from .utils import STABLECOINS, fund, gas_cost_in_token, get_nonce, new_account, send_calls, transfer_call
 
 pytestmark = pytest.mark.tempo
+
+# keccak256("TransferWithMemo(address,address,uint256,bytes32)")
+TRANSFER_WITH_MEMO_TOPIC = HexBytes(keccak(text="TransferWithMemo(address,address,uint256,bytes32)"))
 
 
 async def test_standard_tokens_have_supply(w3):
@@ -79,6 +85,21 @@ async def test_batched_transfers_in_one_tx(w3, chain_id, funded_account):
     assert await ERC20.fns.balanceOf(r1).call(w3, to=PATH_USD) == 111
     assert await ERC20.fns.balanceOf(r2).call(w3, to=PATH_USD) == 222
     assert await get_nonce(w3, funded_account.address) == nonce_before + 1
+
+
+async def test_transfer_with_memo_emits_memo(w3, chain_id, funded_account):
+    recipient = new_account().address
+    memo = b"\xab" + b"\x00" * 31
+    receipt = await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=funded_account.key.hex(),
+        calls=[{"to": PATH_USD, "data": TIP20.fns.transferWithMemo(recipient, 777, memo).data}],
+    )
+    assert receipt["status"] == 1
+    assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 777
+    memo_logs = [log for log in receipt["logs"] if log["topics"][0] == TRANSFER_WITH_MEMO_TOPIC]
+    assert memo_logs and memo_logs[0]["topics"][3] == HexBytes(memo)
 
 
 async def test_transfer_exceeding_balance_reverts(w3, chain_id, funded_account):
