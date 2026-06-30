@@ -60,3 +60,31 @@ def test_chain_survives_validator_restart(consensus_net):
     consensus_net.start_one(1)
     rejoined = f"http://127.0.0.1:{consensus_net.http_ports[1]}"
     assert _wait_height(rejoined, progressed) >= progressed, "restarted validator did not catch up"
+
+
+def test_chain_halts_without_quorum_and_recovers(consensus_net):
+    """2 of 4 validators down (below the 3/4 quorum) halts the chain; it recovers on restart"""
+    primary = consensus_net.rpc_url  # validator 0 stays up
+    consensus_net.stop_one(1)
+    consensus_net.stop_one(2)
+    time.sleep(3)  # let any in-flight blocks finalize, then the height should freeze
+    halted = _height(primary)
+    time.sleep(8)
+    assert _height(primary) == halted, "chain advanced without a quorum"
+
+    consensus_net.start_one(1)
+    consensus_net.start_one(2)
+    assert _wait_height(primary, halted + 2) >= halted + 2, "chain did not recover after restart"
+
+
+def test_full_network_failure_and_recovery(consensus_net):
+    """All validators down then restarted: the chain resumes from its persisted state"""
+    primary = consensus_net.rpc_url
+    before = _height(primary)
+
+    for i in range(consensus_net.validators):
+        consensus_net.stop_one(i)
+    for i in range(consensus_net.validators):
+        consensus_net.start_one(i)
+
+    assert _wait_height(primary, before + 2) >= before + 2, "chain did not recover after a full restart"
