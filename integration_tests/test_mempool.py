@@ -1,4 +1,4 @@
-"""txpool RPC namespace."""
+"""txpool & operator RPC namespaces."""
 
 
 async def test_txpool_status_has_pending_and_queued(w3):
@@ -11,3 +11,9 @@ async def test_txpool_content_has_pending_and_queued(w3):
     resp = await w3.provider.make_request("txpool_content", [])
     assert "error" not in resp, resp.get("error")
     assert "pending" in resp["result"] and "queued" in resp["result"]
+
+
+async def test_operator_peers_returns_a_list(w3):
+    resp = await w3.provider.make_request("operator_peers", [])
+    assert "error" not in resp, resp.get("error")
+    assert isinstance(resp["result"], list)  # empty on a single dev node

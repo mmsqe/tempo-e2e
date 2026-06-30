@@ -32,3 +32,16 @@ async def test_struct_logger_responds(w3, chain_id, funded_account):
     trace = await _trace(w3, receipt["transactionHash"].to_0x_hex(), {})
     assert {"gas", "failed", "returnValue", "structLogs"} <= set(trace.keys())
     assert isinstance(trace["structLogs"], list)
+
+
+async def test_trace_block_by_number_covers_its_txs(w3, chain_id, funded_account):
+    receipt = await send_calls(
+        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 1)]
+    )
+    resp = await w3.provider.make_request(
+        "debug_traceBlockByNumber", [hex(receipt["blockNumber"]), {"tracer": "callTracer"}]
+    )
+    assert "error" not in resp, resp.get("error")
+    traces = resp["result"]
+    assert len(traces) >= 1  # the block holds at least the tx we sent
+    assert "result" in traces[0]
