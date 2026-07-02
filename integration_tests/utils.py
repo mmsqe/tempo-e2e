@@ -6,16 +6,27 @@ from typing import Sequence
 
 from eth_account import Account
 from eth_contract.erc20 import ERC20
+from eth_utils import keccak
 from hexbytes import HexBytes
 from tempo import Builder, Signer, serialize, sign_transaction
-from tempo.constants import ALPHA_USD, BETA_USD, FEE_MANAGER_ADDRESS, NONCE_ADDRESS, PATH_USD, THETA_USD
+from tempo.constants import (
+    ALPHA_USD,
+    BETA_USD,
+    FEE_MANAGER_ADDRESS,
+    NONCE_ADDRESS,
+    PATH_USD,
+    THETA_USD,
+    TIP20_FACTORY_ADDRESS,
+)
 from web3 import AsyncWeb3
 
-from .abi import FEE, NONCE
+from .abi import FEE, NONCE, TIP20_FACTORY, TIP20_ROLES
 from .network import FAUCET_PRIVATE_KEY
 
 # The four enshrined TIP-20 stablecoins, by symbol.
 STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_USD, "THETA_USD": THETA_USD}
+
+ISSUER_ROLE = keccak(text="ISSUER_ROLE")  # TIP-20 mint role
 
 DEFAULT_GAS_LIMIT = 2_000_000
 DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
@@ -109,6 +120,21 @@ async def send_tempo_tx(w3: AsyncWeb3, tx, private_key: str, timeout: float = 60
     return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw), timeout=timeout)
 
 
+async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None) -> str:
+    """eth_call that MUST revert; return the joined error message+data for assertions.
+
+    Tempo precompiles surface the custom error name in the message (e.g. "PolicyForbids")
+    and the 4-byte selector in ``data``, so callers can match on either.
+    """
+    tx = {"to": to, "data": data if isinstance(data, str) else "0x" + bytes(data).hex()}
+    if sender is not None:
+        tx["from"] = sender
+    resp = await w3.provider.make_request("eth_call", [tx, "latest"])
+    err = resp.get("error")
+    assert err is not None, f"expected revert, got result={resp.get('result')!r}"
+    return f"{err.get('message', '')} {err.get('data', '') or ''}".strip()
+
+
 async def send_calls(
     w3: AsyncWeb3,
     *,
@@ -134,6 +160,55 @@ async def send_calls(
         calls=calls,
     )
     return await send_tempo_tx(w3, tx, private_key)
+
+
+async def send_call(w3: AsyncWeb3, chain_id: int, signer, to: str, data, *, gas_limit: int = STATE_WRITE_GAS):
+    """Send a single-call tempo tx from ``signer`` (a local account), asserting success."""
+    receipt = await send_calls(
+        w3, chain_id=chain_id, private_key=signer.key.hex(), gas_limit=gas_limit, calls=[{"to": to, "data": data}]
+    )
+    assert receipt["status"] == 1
+    return receipt
+
+
+async def latest_timestamp(w3: AsyncWeb3) -> int:
+    return (await w3.eth.get_block("latest"))["timestamp"]
+
+
+async def create_token(w3: AsyncWeb3, *, chain_id: int, admin, quote: str = PATH_USD, name: str = "TUSD", mint=None):
+    """Create a TIP-20 via the factory; optionally grant issuer and mint ``(holder, amount)``.
+
+    Returns the new token address (read from the factory's TokenCreated event).
+    """
+    created = await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=admin.key.hex(),
+        gas_limit=STATE_WRITE_GAS,
+        calls=[
+            {
+                "to": TIP20_FACTORY_ADDRESS,
+                "data": TIP20_FACTORY.fns.createToken(name, name, "USD", quote, admin.address, bytes(32)).data,
+            }
+        ],
+    )
+    assert created["status"] == 1
+    log = next(lg for lg in created["logs"] if lg["address"].lower() == TIP20_FACTORY_ADDRESS.lower())
+    token = AsyncWeb3.to_checksum_address(HexBytes(log["topics"][1])[-20:])
+    if mint is not None:
+        holder, amount = mint
+        minted = await send_calls(
+            w3,
+            chain_id=chain_id,
+            private_key=admin.key.hex(),
+            gas_limit=STATE_WRITE_GAS,
+            calls=[
+                {"to": token, "data": TIP20_ROLES.fns.grantRole(ISSUER_ROLE, admin.address).data},
+                {"to": token, "data": ERC20.fns.mint(holder, amount).data},
+            ],
+        )
+        assert minted["status"] == 1
+    return token
 
 
 async def fund_token(
