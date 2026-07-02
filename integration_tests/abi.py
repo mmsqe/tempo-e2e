@@ -64,3 +64,33 @@ TIP403 = Contract.from_abi(
         "function policyData(uint64 policyId) view returns (uint8 policyType, address admin)",
     ]
 )
+
+# Validator config precompiles (IValidatorConfig / IValidatorConfigV2); validatorCount is common.
+VALIDATOR_CONFIG = Contract.from_abi(["function validatorCount() view returns (uint64)"])
+
+# Address registry precompile (T3+): virtual-address helpers.
+ADDRESS_REGISTRY = Contract.from_abi(["function isVirtualAddress(address addr) pure returns (bool)"])
+
+# Storage credits precompile (T7+).
+STORAGE_CREDITS = Contract.from_abi(["function balanceOf(address account) view returns (uint64)"])
+
+# TIP-20 payment-channel reserve precompile (TIP-1034, T5+). `descriptor` is the
+# 7-field channel identity; `expiringNonceHash` is assigned at open (read from the
+# ChannelOpened event). settle's signature is an EIP-712 voucher over getVoucherDigest.
+_CR_DESC = (
+    "(address payer,address payee,address operator,address token,bytes32 salt,"
+    "address authorizedSigner,bytes32 expiringNonceHash)"
+)
+_CR_STATE = "(uint96 settled,uint96 deposit,uint32 closeRequestedAt)"
+TIP20_CHANNEL_RESERVE = Contract.from_abi(
+    [
+        "function CLOSE_GRACE_PERIOD() view returns (uint64)",
+        "function domainSeparator() view returns (bytes32)",
+        "function open(address payee, address operator, address token, uint96 deposit, bytes32 salt, address authorizedSigner) returns (bytes32 channelId)",
+        f"function topUp({_CR_DESC} descriptor, uint96 additionalDeposit)",
+        f"function requestClose({_CR_DESC} descriptor)",
+        f"function settle({_CR_DESC} descriptor, uint96 cumulativeAmount, bytes signature)",
+        f"function getChannelState(bytes32 channelId) view returns ({_CR_STATE})",
+        "function getVoucherDigest(bytes32 channelId, uint96 cumulativeAmount) view returns (bytes32)",
+    ]
+)
