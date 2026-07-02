@@ -87,4 +87,6 @@ def test_full_network_failure_and_recovery(consensus_net):
     for i in range(consensus_net.validators):
         consensus_net.start_one(i)
 
-    assert _wait_height(primary, before + 2) >= before + 2, "chain did not recover after a full restart"
+    # A cold 4-node restart re-forms consensus from scratch, which can take
+    # longer than a single-validator rejoin, so allow extra recovery time.
+    assert _wait_height(primary, before + 2, timeout=120) >= before + 2, "chain did not recover after a full restart"

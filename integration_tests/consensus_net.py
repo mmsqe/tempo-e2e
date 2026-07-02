@@ -168,11 +168,14 @@ class ConsensusNetwork:
         if proc and proc.poll() is None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                proc.wait(timeout=15)
+                proc.wait(timeout=20)
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
+                    # Reap so the OS releases the RPC/p2p ports and datadir lock
+                    # before this validator is restarted on the same ports.
+                    proc.wait(timeout=10)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
                     pass
 
     def stop_one(self, i: int) -> None:
