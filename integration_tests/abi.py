@@ -30,6 +30,9 @@ FEE = Contract.from_abi(
         "function validatorTokens(address validator) view returns (address)",
         "function getPool(address userToken, address validatorToken) view returns ((uint128 reserveUserToken, uint128 reserveValidatorToken))",
         "function getPoolId(address userToken, address validatorToken) pure returns (bytes32)",
+        "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
+        "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
+        "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
     ]
 )
 

@@ -3,13 +3,14 @@
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo import Signer, serialize, sign_transaction
-from tempo.constants import ALPHA_USD, PATH_USD
+from tempo.constants import ALPHA_USD, BETA_USD, PATH_USD, THETA_USD
 
 from .utils import (
     build_tempo_tx,
     fund_token,
     gas_cost_in_token,
     new_account,
+    seed_fee_pool,
     send_tempo_tx,
     suggested_max_fee,
     transfer_call,
@@ -18,10 +19,12 @@ from .utils import (
 pytestmark = pytest.mark.tempo
 
 
-# Gas in a non-default fee token is swapped via the FeeAMM, so the token needs
-# genesis pool liquidity. ALPHA_USD has it; PATH_USD is the default fee token.
-@pytest.mark.parametrize("token", [ALPHA_USD])
+# Gas in a non-default fee token is swapped via the FeeAMM, so the token needs a
+# pool. ALPHA_USD is seeded in genesis; BETA/THETA are seeded here via
+# FeeManager.mint. PATH_USD is the default (validator) fee token.
+@pytest.mark.parametrize("token", [ALPHA_USD, BETA_USD, THETA_USD])
 async def test_gas_paid_in_chosen_stablecoin(w3, chain_id, token):
+    await seed_fee_pool(w3, chain_id=chain_id, user_token=token)
     acct = new_account()
     await fund_token(w3, chain_id=chain_id, to=acct.address, token=token, amount=5_000_000)
     before = await ERC20.fns.balanceOf(acct.address).call(w3, to=token)

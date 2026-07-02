@@ -8,10 +8,10 @@ from eth_account import Account
 from eth_contract.erc20 import ERC20
 from hexbytes import HexBytes
 from tempo import Builder, Signer, serialize, sign_transaction
-from tempo.constants import ALPHA_USD, BETA_USD, NONCE_ADDRESS, PATH_USD, THETA_USD
+from tempo.constants import ALPHA_USD, BETA_USD, FEE_MANAGER_ADDRESS, NONCE_ADDRESS, PATH_USD, THETA_USD
 from web3 import AsyncWeb3
 
-from .abi import NONCE
+from .abi import FEE, NONCE
 from .network import FAUCET_PRIVATE_KEY
 
 # The four enshrined TIP-20 stablecoins, by symbol.
@@ -148,6 +148,34 @@ async def fund_token(
         nonce=await get_nonce(w3, funder),
         fee_token=token,
         calls=[{"to": token, "data": ERC20.fns.transfer(to, amount).data}],
+    )
+
+
+async def seed_fee_pool(
+    w3: AsyncWeb3,
+    *,
+    chain_id: int,
+    user_token: str,
+    validator_token: str = PATH_USD,
+    amount: int = 50_000_000_000,
+    funder_pk: str = FAUCET_PRIVATE_KEY,
+):
+    """Mint a FeeAMM pool so gas can be paid in ``user_token``.
+
+    The dev genesis only seeds ``ALPHA_USD``/``PATH_USD``; other stablecoins need
+    a pool first. Gas is paid in ``validator_token`` (needs no pool).
+    """
+    funder = Account.from_key(funder_pk).address
+    return await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=funder_pk,
+        fee_token=validator_token,
+        gas_limit=STATE_WRITE_GAS,
+        calls=[
+            {"to": validator_token, "data": ERC20.fns.approve(FEE_MANAGER_ADDRESS, amount * 4).data},
+            {"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.mint(user_token, validator_token, amount, funder).data},
+        ],
     )
 
 

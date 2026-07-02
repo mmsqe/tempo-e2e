@@ -2,12 +2,28 @@
 
 import pytest
 from hexbytes import HexBytes
-from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD
+from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD, THETA_USD
 
 from .abi import FEE
-from .utils import build_tempo_tx, fund_token, new_account, send_calls, send_tempo_tx, suggested_max_fee, transfer_call
+from .utils import (
+    build_tempo_tx,
+    fund_token,
+    new_account,
+    seed_fee_pool,
+    send_calls,
+    send_tempo_tx,
+    suggested_max_fee,
+    transfer_call,
+)
 
 pytestmark = pytest.mark.tempo
+
+
+async def test_mint_seeds_pool_for_ungenesised_token(w3, chain_id):
+    """A stablecoin the genesis didn't seed (THETA) becomes gas-payable after FeeManager.mint."""
+    await seed_fee_pool(w3, chain_id=chain_id, user_token=THETA_USD)
+    _, reserve_validator = await FEE.fns.getPool(THETA_USD, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS)
+    assert reserve_validator > 0  # validator (PATH) side now funded, enabling THETA->PATH swaps
 
 
 async def test_pool_id_is_deterministic(w3):
