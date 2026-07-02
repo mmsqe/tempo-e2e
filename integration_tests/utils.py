@@ -74,8 +74,14 @@ def build_tempo_tx(
     max_priority_fee_per_gas: int = DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
     valid_before: int | None = None,
     valid_after: int | None = None,
+    awaiting_fee_payer: bool = False,
 ):
-    """Build an unsigned tempo (``0x76``) tx. Each call is ``{to (None=create), value?, data?}``."""
+    """Build an unsigned tempo (``0x76``) tx. Each call is ``{to (None=create), value?, data?}``.
+
+    Set ``awaiting_fee_payer`` when a fee payer will sponsor gas: the sender then
+    signs a payload that omits ``fee_token`` (the node recomputes the sender hash
+    with ``skip_fee_token`` once a fee-payer signature is present).
+    """
     builder = (
         Builder()
         .chain_id(chain_id)
@@ -86,6 +92,8 @@ def build_tempo_tx(
         .nonce_key(nonce_key)
         .fee_token(fee_token)
     )
+    if awaiting_fee_payer:
+        builder.awaiting_fee_payer()
     if valid_before is not None:
         builder.valid_before(valid_before)
     if valid_after is not None:

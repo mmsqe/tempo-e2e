@@ -1,7 +1,4 @@
-"""Fee sponsorship: a fee payer covers gas for another account's tempo tx.
-
-xfail: tempo-py 0.1.0 fee-payer (0x78) signing is not accepted by the current node build.
-"""
+"""Fee sponsorship: a fee payer covers gas for another account's tempo tx."""
 
 import pytest
 from eth_contract.erc20 import ERC20
@@ -13,7 +10,6 @@ from .utils import build_tempo_tx, fund, gas_cost_in_token, get_nonce, new_accou
 pytestmark = pytest.mark.tempo
 
 
-@pytest.mark.xfail(reason="tempo-py 0.1.0 fee-payer encoding not accepted by current node build", strict=False)
 async def test_fee_payer_covers_gas(w3, chain_id):
     sender, payer = new_account(), new_account()
     await fund(w3, sender.address)
@@ -28,6 +24,7 @@ async def test_fee_payer_covers_gas(w3, chain_id):
         fee_token=PATH_USD,
         max_fee_per_gas=await suggested_max_fee(w3),
         calls=[transfer_call(recipient, 1000)],
+        awaiting_fee_payer=True,
     )
     tx = sign_transaction(tx, Signer(sender.key.hex()))
     tx = add_fee_payer_signature(tx, Signer(payer.key.hex()))
