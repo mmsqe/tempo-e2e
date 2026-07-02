@@ -9,7 +9,7 @@ from eth_utils import to_checksum_address
 from tempo.constants import PATH_USD
 
 from .abi import TIP20_CHANNEL_RESERVE as CR
-from .utils import STATE_WRITE_GAS, fund, new_account, send_calls
+from .utils import call_revert, fund, new_account, send_call
 
 pytestmark = pytest.mark.tempo
 
@@ -21,15 +21,7 @@ SALT = bytes(32)
 
 async def _send(w3, chain_id, signer, data):
     """Send one call to the channel reserve, paying gas in PATH_USD."""
-    receipt = await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=signer.key.hex(),
-        gas_limit=STATE_WRITE_GAS,
-        calls=[{"to": CR_ADDR, "data": data}],
-    )
-    assert receipt["status"] == 1
-    return receipt
+    return await send_call(w3, chain_id, signer, CR_ADDR, data)
 
 
 async def _state(w3, channel_id):
@@ -110,4 +102,54 @@ async def test_topup_and_request_close(w3, chain_id):
 
     await _send(w3, chain_id, payer, CR.fns.requestClose(descriptor).data)
     assert (await _state(w3, channel_id))[2] > 0  # closeRequestedAt set
-    # withdraw is skipped: CLOSE_GRACE_PERIOD is 900s, too long for the suite.
+
+
+async def test_partial_settle_is_monotonic(w3, chain_id):
+    payer, operator, payee = new_account(), new_account(), new_account()
+    await fund(w3, payer.address)
+    await fund(w3, operator.address)
+    channel_id, descriptor = await _open(
+        w3, chain_id, payer, payee=payee.address, operator=operator.address, deposit=5000
+    )
+
+    async def settle(cumulative):
+        digest = bytes(await CR.fns.getVoucherDigest(channel_id, cumulative).call(w3, to=CR_ADDR))
+        sig = bytes(payer.unsafe_sign_hash(digest).signature)
+        await _send(w3, chain_id, operator, CR.fns.settle(descriptor, cumulative, sig).data)
+
+    before = await _bal(w3, payee.address)
+    await settle(1000)
+    assert (await _state(w3, channel_id))[0] == 1000 and await _bal(w3, payee.address) == before + 1000
+    await settle(2500)  # cumulative advances; payee receives only the 1500 delta
+    assert (await _state(w3, channel_id))[0] == 2500 and await _bal(w3, payee.address) == before + 2500
+
+    # a non-increasing cumulative reverts (checked before the voucher, so a dummy sig is fine)
+    reason = await call_revert(
+        w3, CR_ADDR, CR.fns.settle(descriptor, 2000, bytes(65)).data, sender=operator.address
+    )
+    assert "AmountNotIncreasing" in reason or "0x32d2c1a3" in reason
+
+
+async def test_payee_close_refunds_payer_and_deletes_channel(w3, chain_id):
+    payer, payee = new_account(), new_account()
+    await fund(w3, payer.address)
+    await fund(w3, payee.address)  # payee submits close and pays its gas
+    channel_id, descriptor = await _open(w3, chain_id, payer, payee=payee.address, deposit=5000)
+    before = await _bal(w3, payer.address)
+
+    # captureAmount == settled (0) means no voucher is needed; close bypasses the grace period
+    await _send(w3, chain_id, payee, CR.fns.close(descriptor, 0, 0, b"").data)
+
+    assert await _state(w3, channel_id) == (0, 0, 0)  # channel deleted
+    assert await _bal(w3, payer.address) == before + 5000  # full deposit refunded (nothing settled)
+
+
+async def test_withdraw_before_grace_reverts(w3, chain_id):
+    payer = new_account()
+    await fund(w3, payer.address)
+    channel_id, descriptor = await _open(w3, chain_id, payer, payee=new_account().address, deposit=5000)
+    await _send(w3, chain_id, payer, CR.fns.requestClose(descriptor).data)
+
+    # withdraw needs block.timestamp >= closeRequestedAt + CLOSE_GRACE_PERIOD (900s)
+    reason = await call_revert(w3, CR_ADDR, CR.fns.withdraw(descriptor).data, sender=payer.address)
+    assert "CloseNotReady" in reason or "0x02b81e29" in reason
