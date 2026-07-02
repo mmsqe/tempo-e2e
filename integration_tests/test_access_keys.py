@@ -1,7 +1,4 @@
-"""Access keys: a delegated key authorized by a root account signs a tempo tx.
-
-xfail: tempo-py 0.1.0 keychain encoding is not accepted by the current node build.
-"""
+"""Access keys: a delegated key authorized by a root account signs a tempo tx."""
 
 import pytest
 from eth_contract.erc20 import ERC20
@@ -14,7 +11,6 @@ from .utils import build_tempo_tx, fund, get_nonce, new_account, suggested_max_f
 pytestmark = pytest.mark.tempo
 
 
-@pytest.mark.xfail(reason="tempo-py 0.1.0 keychain encoding not accepted by current node build", strict=False)
 async def test_admin_access_key_authorizes_transfer(w3, chain_id):
     root = new_account()
     await fund(w3, root.address)
