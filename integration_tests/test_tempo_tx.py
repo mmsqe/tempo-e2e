@@ -5,13 +5,17 @@ from eth_contract.erc20 import ERC20
 from tempo import Signer, serialize, sign_transaction
 from tempo.constants import PATH_USD
 
-from .utils import build_tempo_tx, get_nonce, new_account, send_tempo_tx, suggested_max_fee, transfer_call
+from .utils import (
+    build_tempo_tx,
+    get_nonce,
+    latest_timestamp,
+    new_account,
+    send_tempo_tx,
+    suggested_max_fee,
+    transfer_call,
+)
 
 pytestmark = pytest.mark.tempo
-
-
-async def _now(w3):
-    return (await w3.eth.get_block("latest"))["timestamp"]
 
 
 async def test_serialized_tx_uses_0x76_type(w3, chain_id, funded_account):
@@ -46,7 +50,7 @@ async def test_valid_before_in_past_is_rejected(w3, chain_id, funded_account):
     tx = build_tempo_tx(
         chain_id=chain_id,
         nonce=0,
-        valid_before=await _now(w3) - 100,
+        valid_before=await latest_timestamp(w3) - 100,
         max_fee_per_gas=await suggested_max_fee(w3),
         calls=[transfer_call(new_account().address, 1)],
     )
@@ -59,7 +63,7 @@ async def test_valid_after_in_future_is_rejected(w3, chain_id, funded_account):
     tx = build_tempo_tx(
         chain_id=chain_id,
         nonce=0,
-        valid_after=await _now(w3) + 3600,
+        valid_after=await latest_timestamp(w3) + 3600,
         max_fee_per_gas=await suggested_max_fee(w3),
         calls=[transfer_call(new_account().address, 1)],
     )

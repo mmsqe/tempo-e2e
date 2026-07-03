@@ -6,11 +6,9 @@ from hexbytes import HexBytes
 from tempo.constants import ALPHA_USD, PATH_USD, STABLECOIN_DEX_ADDRESS
 
 from .abi import DEX
-from .utils import STATE_WRITE_GAS, fund, fund_token, new_account, send_calls
+from .utils import MAX_UINT, STATE_WRITE_GAS, fund, fund_token, new_account, send_calls
 
 pytestmark = pytest.mark.tempo
-
-MAX_UINT = 2**256 - 1
 
 
 async def _trader(w3, chain_id, *, token=None, amount=0):

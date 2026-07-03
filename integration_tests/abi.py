@@ -12,6 +12,8 @@ DEX = Contract.from_abi(
         "function placeFlip(address token, uint128 amount, bool isBid, int16 tick, int16 flipTick) returns (uint128 orderId)",
         "function cancel(uint128 orderId)",
         "function createPair(address base) returns (bytes32 key)",
+        "function balanceOf(address user, address token) view returns (uint128)",  # internal (escrow) balance
+        "function withdraw(address token, uint128 amount)",
         "function swapExactAmountIn(address tokenIn, address tokenOut, uint128 amountIn, uint128 minAmountOut) returns (uint128 amountOut)",
         "function quoteSwapExactAmountIn(address tokenIn, address tokenOut, uint128 amountIn) view returns (uint128 amountOut)",
         "function getOrder(uint128 orderId) view returns ((uint128 orderId, address maker, bytes32 key, bool isBid, int16 tick, uint128 amount, uint128 remaining, uint128 prev, uint128 next, bool isFlip, int16 flipTick))",
@@ -42,10 +44,19 @@ FEE = Contract.from_abi(
 TIP20_FACTORY = Contract.from_abi(
     [
         "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt) returns (address)",
+        "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt, string logoURI) returns (address)",
         "function isTIP20(address token) view returns (bool)",
     ]
 )
 TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
+
+# AccountKeychain view used only by tests (not part of the tempo-py bindings).
+KEYCHAIN_VIEWS = Contract.from_abi(
+    [
+        "function getRemainingLimitWithPeriod(address account, address keyId, address token)"
+        " view returns (uint256 remaining, uint64 periodEnd)",
+    ]
+)
 
 # Tempo TIP-20 extensions beyond ERC-20 (standard ops use eth_contract.erc20.ERC20).
 TIP20 = Contract.from_abi(
@@ -54,6 +65,8 @@ TIP20 = Contract.from_abi(
         "function burn(uint256 amount)",
         "function changeTransferPolicyId(uint64 newPolicyId)",
         "function transferPolicyId() view returns (uint64)",
+        "function logoURI() view returns (string)",
+        "function setLogoURI(string newLogoURI)",
     ]
 )
 
@@ -116,6 +129,25 @@ RECEIVE_POLICY_GUARD = Contract.from_abi(
 
 # Validator config precompiles (IValidatorConfig / IValidatorConfigV2); validatorCount is common.
 VALIDATOR_CONFIG = Contract.from_abi(["function validatorCount() view returns (uint64)"])
+
+# ValidatorConfig V2 (TIP-1017, 0xCccC…01): append-only validator registry.
+_VALIDATOR_TUPLE = (
+    "(bytes32 publicKey, address validatorAddress, string ingress, string egress,"
+    " address feeRecipient, uint64 index, uint64 addedAtHeight, uint64 deactivatedAtHeight)"
+)
+VALIDATOR_CONFIG_V2 = Contract.from_abi(
+    [
+        "function owner() view returns (address)",
+        "function isInitialized() view returns (bool)",
+        "function getInitializedAtHeight() view returns (uint64)",
+        "function validatorCount() view returns (uint64)",
+        f"function getActiveValidators() view returns ({_VALIDATOR_TUPLE}[])",
+        "function getNextNetworkIdentityRotationEpoch() view returns (uint64)",
+        "function addValidator(address validatorAddress, bytes32 publicKey, string ingress, string egress,"
+        " address feeRecipient, bytes signature) returns (uint64)",
+        "function transferOwnership(address newOwner)",
+    ]
+)
 
 # Address registry precompile (IAddressRegistry, TIP-1022, T3+): virtual-address forwarding.
 # A master registers with a proof-of-work salt; deposits to a derived virtual address

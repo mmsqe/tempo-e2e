@@ -1,14 +1,17 @@
 import pytest
-from eth_utils import to_checksum_address
 from tempo.constants import (
+    ADDRESS_REGISTRY_ADDRESS,
     ALPHA_USD,
     FEE_MANAGER_ADDRESS,
     NONCE_ADDRESS,
     PATH_USD,
     STABLECOIN_DEX_ADDRESS,
+    STORAGE_CREDITS_ADDRESS,
+    TIP20_CHANNEL_RESERVE_ADDRESS,
     TIP20_FACTORY_ADDRESS,
     TIP403_REGISTRY_ADDRESS,
     VALIDATOR_CONFIG_ADDRESS,
+    VALIDATOR_CONFIG_V2_ADDRESS,
 )
 
 from .abi import (
@@ -28,13 +31,6 @@ pytestmark = pytest.mark.tempo
 
 # Standard EVM identity precompile: echoes its input unchanged.
 IDENTITY_PRECOMPILE = "0x0000000000000000000000000000000000000004"
-
-# Precompile addresses not in the pinned tempo-py release yet (added to
-# tempo.constants upstream; use literals until the git dep updates).
-VALIDATOR_CONFIG_V2_ADDRESS = to_checksum_address("0xCccCcCCC00000000000000000000000000000001")
-ADDRESS_REGISTRY_ADDRESS = to_checksum_address("0xFDC0000000000000000000000000000000000000")
-STORAGE_CREDITS_ADDRESS = to_checksum_address("0x1060000000000000000000000000000000000000")
-TIP20_CHANNEL_RESERVE_ADDRESS = to_checksum_address("0x4D50500000000000000000000000000000000000")
 
 # Reused / long calldatas (kept short for the case table below).
 _VALIDATOR_COUNT = bytes(VALIDATOR_CONFIG.fns.validatorCount().data)

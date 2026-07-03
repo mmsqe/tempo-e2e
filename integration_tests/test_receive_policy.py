@@ -8,6 +8,7 @@ from eth_abi import decode
 from eth_contract.erc20 import ERC20
 from eth_utils import keccak, to_checksum_address
 from tempo.constants import PATH_USD
+from tempo.constants import RECEIVE_POLICY_GUARD_ADDRESS as GUARD_ADDR
 from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
 from .abi import RECEIVE_POLICY_GUARD as GUARD
@@ -25,7 +26,7 @@ from .utils import (
 
 pytestmark = pytest.mark.tempo
 
-GUARD_ADDR = to_checksum_address("0xB10C000000000000000000000000000000000000")
+
 ZERO_ADDR = "0x" + "00" * 20
 REJECT_ALL, ALLOW_ALL = 0, 1  # built-in TIP-403 policy ids
 WHITELIST, BLACKLIST = 0, 1  # PolicyType

@@ -2,23 +2,12 @@
 
 import pytest
 from eth_contract.erc20 import ERC20
-from eth_utils import keccak
-from hexbytes import HexBytes
 from tempo.constants import PATH_USD, TIP20_FACTORY_ADDRESS
-from web3 import Web3
 
 from .abi import TIP20, TIP20_FACTORY, TIP20_ROLES
-from .utils import STATE_WRITE_GAS, send_calls
+from .utils import ISSUER_ROLE, STATE_WRITE_GAS, send_calls, token_from_receipt
 
 pytestmark = pytest.mark.tempo
-
-ISSUER_ROLE = keccak(text="ISSUER_ROLE")
-
-
-def _created_token(receipt) -> str:
-    """The token address from the factory's TokenCreated event (indexed topic 1)."""
-    log = next(log for log in receipt["logs"] if log["address"].lower() == TIP20_FACTORY_ADDRESS.lower())
-    return Web3.to_checksum_address(HexBytes(log["topics"][1])[-20:])
 
 
 async def test_create_token_mint_and_burn(w3, chain_id, funded_account):
@@ -38,7 +27,7 @@ async def test_create_token_mint_and_burn(w3, chain_id, funded_account):
         ],
     )
     assert created["status"] == 1
-    token = _created_token(created)
+    token = token_from_receipt(created)
     assert await TIP20_FACTORY.fns.isTIP20(token).call(w3, to=TIP20_FACTORY_ADDRESS)
 
     minted = await send_calls(

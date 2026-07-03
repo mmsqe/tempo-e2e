@@ -9,15 +9,16 @@ import pytest
 from eth_account import Account
 from eth_contract.erc20 import ERC20
 from eth_utils import to_checksum_address
+from tempo.constants import ADDRESS_REGISTRY_ADDRESS as REG_ADDR
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, STABLECOIN_DEX_ADDRESS
+from tempo.constants import TIP20_CHANNEL_RESERVE_ADDRESS as CHANNEL_RESERVE
 
 from .abi import ADDRESS_REGISTRY as REG
 from .utils import call_revert, create_token, fund, new_account, send_call
 
 pytestmark = pytest.mark.tempo
 
-REG_ADDR = to_checksum_address("0xFDC0000000000000000000000000000000000000")
-CHANNEL_RESERVE = to_checksum_address("0x4D50500000000000000000000000000000000000")
+
 VIRTUAL_MAGIC = b"\xfd" * 10
 
 # Precomputed for MASTER (see scratchpad grind): keccak(master ‖ salt)[:4] == 0x00000000.

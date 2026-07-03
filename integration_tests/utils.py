@@ -28,11 +28,22 @@ STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_US
 
 ISSUER_ROLE = keccak(text="ISSUER_ROLE")  # TIP-20 mint role
 
+MAX_UINT = 2**256 - 1  # unlimited ERC-20 approval
 DEFAULT_GAS_LIMIT = 2_000_000
 DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
 DEFAULT_MAX_FEE_PER_GAS = 100_000_000_000
 # A tempo tx that writes new storage (DEX orders, token deploys) needs extra TIP-1060 state gas.
 STATE_WRITE_GAS = 8_000_000
+
+# Default KeyRestrictions expiry (year ~2096): the on-chain authorizeKey path needs a real
+# timestamp (0 is ExpiryInPast), unlike the inline sign path's never-expire sentinel.
+NEVER_EXPIRES = 4_000_000_000
+
+
+def key_restrictions(*, expiry=NEVER_EXPIRES, enforce_limits=False, limits=(), allow_any_calls=True, allowed_calls=()):
+    """A KeyRestrictions ABI tuple: (expiry, enforceLimits, limits[], allowAnyCalls, allowedCalls[])."""
+    return (expiry, enforce_limits, list(limits), allow_any_calls, list(allowed_calls))
+
 
 # Minimal EVM fixtures: init code that deploys runtime returning 42, and the ERC-20 Transfer topic.
 RETURN_42_INIT = "600a600c600039600a6000f3602a60005260206000f3"
@@ -116,8 +127,29 @@ def build_tempo_tx(
 
 async def send_tempo_tx(w3: AsyncWeb3, tx, private_key: str, timeout: float = 60.0):
     """Sign, broadcast, and await the receipt for a tempo transaction."""
-    raw = serialize(sign_transaction(tx, Signer(private_key)))
+    return await send_signed(w3, sign_transaction(tx, Signer(private_key)), timeout=timeout)
+
+
+async def send_signed(w3: AsyncWeb3, signed, timeout: float = 60.0):
+    """Broadcast an already-signed tempo tx and await its receipt."""
+    raw = serialize(signed)
     return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw), timeout=timeout)
+
+
+async def prepare_tx(w3: AsyncWeb3, chain_id: int, sender, calls: Sequence[dict], *, gas_limit: int = STATE_WRITE_GAS):
+    """An unsigned tempo tx from ``sender`` over ``calls``, with nonce and fee filled (gas in PATH_USD).
+
+    For custom-signature paths (access keys, keychain) that sign and broadcast separately;
+    root-key flows should prefer ``send_calls``/``send_call``.
+    """
+    return build_tempo_tx(
+        chain_id=chain_id,
+        nonce=await get_nonce(w3, sender.address),
+        fee_token=PATH_USD,
+        gas_limit=gas_limit,
+        max_fee_per_gas=await suggested_max_fee(w3),
+        calls=calls,
+    )
 
 
 async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None) -> str:
@@ -175,6 +207,12 @@ async def latest_timestamp(w3: AsyncWeb3) -> int:
     return (await w3.eth.get_block("latest"))["timestamp"]
 
 
+def token_from_receipt(receipt, factory: str = TIP20_FACTORY_ADDRESS) -> str:
+    """The new token address from the factory's TokenCreated event (indexed topic 1)."""
+    log = next(lg for lg in receipt["logs"] if lg["address"].lower() == factory.lower())
+    return AsyncWeb3.to_checksum_address(HexBytes(log["topics"][1])[-20:])
+
+
 async def create_token(w3: AsyncWeb3, *, chain_id: int, admin, quote: str = PATH_USD, name: str = "TUSD", mint=None):
     """Create a TIP-20 via the factory; optionally grant issuer and mint ``(holder, amount)``.
 
@@ -193,8 +231,7 @@ async def create_token(w3: AsyncWeb3, *, chain_id: int, admin, quote: str = PATH
         ],
     )
     assert created["status"] == 1
-    log = next(lg for lg in created["logs"] if lg["address"].lower() == TIP20_FACTORY_ADDRESS.lower())
-    token = AsyncWeb3.to_checksum_address(HexBytes(log["topics"][1])[-20:])
+    token = token_from_receipt(created)
     if mint is not None:
         holder, amount = mint
         minted = await send_calls(

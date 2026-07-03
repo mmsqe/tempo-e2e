@@ -5,8 +5,8 @@ pull the deposit via TIP-1035 implicit approval, so no ERC-20 approve is needed.
 
 import pytest
 from eth_contract.erc20 import ERC20
-from eth_utils import to_checksum_address
 from tempo.constants import PATH_USD
+from tempo.constants import TIP20_CHANNEL_RESERVE_ADDRESS as CR_ADDR
 from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
 from .abi import TIP20, TIP403
@@ -16,7 +16,7 @@ from .utils import STATE_WRITE_GAS, call_revert, create_token, fund, new_account
 pytestmark = pytest.mark.tempo
 
 # TIP20_CHANNEL_RESERVE_ADDRESS
-CR_ADDR = to_checksum_address("0x4D50500000000000000000000000000000000000")
+
 ZERO_ADDR = "0x" + "00" * 20
 SALT = bytes(32)
 BLACKLIST = 1  # ITIP403Registry.PolicyType.BLACKLIST
