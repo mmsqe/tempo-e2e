@@ -4,11 +4,14 @@ witness or a revoked key can't reauthorize, and an admin key can't carry limits.
 """
 
 import pytest
+from eth_contract.erc20 import ERC20
 from tempo import Signer, serialize
 from tempo.constants import PATH_USD
 from tempo.contracts import ACCOUNT_KEYCHAIN as KC
 from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
-from tempo.keychain import TokenLimit, sign_tx_access_key
+from tempo.keychain import KeychainSignature, TokenLimit, sign_tx_access_key
+from tempo.transaction import get_sign_payload
+from tempo.types import as_address
 
 from .utils import (
     STATE_WRITE_GAS,
@@ -41,18 +44,36 @@ def _authorize_admin(key_id):
     return KC.fns.authorizeAdminKey(key_id, SECP256K1, ZERO_WITNESS).data
 
 
-async def _key_sends(w3, chain_id, root, key, data, *, is_admin):
-    """Provision ``key`` inline (admin or not) and use it to send one keychain call; return the receipt."""
-    tx = build_tempo_tx(
+async def _tx(w3, chain_id, root, calls):
+    """An unsigned tempo tx from ``root`` over ``calls``, paying gas in PATH_USD."""
+    return build_tempo_tx(
         chain_id=chain_id,
         nonce=await get_nonce(w3, root.address),
         fee_token=PATH_USD,
         gas_limit=STATE_WRITE_GAS,
         max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[{"to": KC_ADDR, "data": data}],
+        calls=calls,
     )
-    signed = sign_tx_access_key(tx, key.key.hex(), Signer(root.key.hex()), is_admin=is_admin)
+
+
+async def _send_signed(w3, signed):
     return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(serialize(signed)))
+
+
+async def _key_sends(w3, chain_id, root, key, data, *, is_admin):
+    """Provision ``key`` inline (admin or not) and use it to send one keychain call; return the receipt."""
+    tx = await _tx(w3, chain_id, root, [{"to": KC_ADDR, "data": data}])
+    signed = sign_tx_access_key(tx, key.key.hex(), Signer(root.key.hex()), is_admin=is_admin)
+    return await _send_signed(w3, signed)
+
+
+def _sign_with_registered_key(tx, key, root):
+    """Sign ``tx`` with an access key already on-chain -- a bare Keychain V2 signature, no inline
+    authorization. The node resolves the key from ``root``'s stored keychain rather than same-tx auth.
+    """
+    root_addr = as_address(root.address)
+    inner = Signer(key.key.hex()).sign(KeychainSignature.signing_hash(get_sign_payload(tx), root_addr))
+    return tx._replace_fields(sender_signature=KeychainSignature.from_inner(inner, root_addr), sender_address=root_addr)
 
 
 async def test_is_admin_key_semantics(w3, chain_id):
@@ -110,6 +131,22 @@ async def test_admin_authorizes_non_admin_key(w3, chain_id):
     assert "KeyAlreadyExists" in await call_revert(w3, KC_ADDR, dup, sender=root.address)
 
 
+async def test_registered_non_admin_key_signs_a_transfer(w3, chain_id):
+    root, k2 = new_account(), new_account()
+    await fund(w3, root.address)
+    recipient = new_account().address
+    restrictions = (4_000_000_000, False, [], True, [])  # permissive non-admin key (allowAnyCalls)
+    await _kc(w3, chain_id, root, KC.fns.authorizeKey(k2.address, SECP256K1, restrictions).data)
+    assert not await _read(w3, KC.fns.isAdminKey(root.address, k2.address))  # a plain access key
+
+    # the on-chain key signs a real transfer with a bare keychain signature (no inline auth);
+    # the node looks k2 up in root's keychain, so root's funds move under k2's authority
+    tx = await _tx(w3, chain_id, root, [transfer_call(recipient, 1234)])
+    receipt = await _send_signed(w3, _sign_with_registered_key(tx, k2, root))
+    assert receipt["status"] == 1
+    assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 1234
+
+
 async def test_admin_key_revokes_another_key(w3, chain_id):
     root, admin_key, k3 = new_account(), new_account(), new_account().address
     await fund(w3, root.address)
@@ -122,13 +159,19 @@ async def test_admin_key_revokes_another_key(w3, chain_id):
     assert not await _read(w3, KC.fns.isAdminKey(root.address, k3))  # revoked by the admin key
 
 
-async def test_cannot_set_spending_limit_on_admin_key(w3, chain_id):
+async def test_admin_key_rejects_limit_and_scope_mutators(w3, chain_id):
     root, k2 = new_account(), new_account().address
     await fund(w3, root.address)
     await _kc(w3, chain_id, root, _authorize_admin(k2))
-    # an admin key must not carry limits, so updateSpendingLimit is rejected on-chain
-    reason = await call_revert(w3, KC_ADDR, KC.fns.updateSpendingLimit(k2, PATH_USD, 100).data, sender=root.address)
-    assert "InvalidKeyId" in reason
+    # an admin key carries no limits or call scopes, so every restriction mutator is rejected on-chain.
+    # the is-admin check precedes each mutator's own validation, so InvalidKeyId is the reason in all cases.
+    scope = (PATH_USD, [])  # CallScope(target, selectorRules=[])
+    for data in (
+        KC.fns.updateSpendingLimit(k2, PATH_USD, 100).data,
+        KC.fns.setAllowedCalls(k2, [scope]).data,
+        KC.fns.removeAllowedCalls(k2, PATH_USD).data,
+    ):
+        assert "InvalidKeyId" in await call_revert(w3, KC_ADDR, data, sender=root.address)
 
 
 async def test_revoked_key_cannot_be_reauthorized(w3, chain_id):
