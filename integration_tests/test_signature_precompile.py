@@ -3,6 +3,8 @@ signature; verifyKeychain / verifyKeychainAdmin (T6+) check an account's keychai
 keys against live AccountKeychain state.
 """
 
+import asyncio
+
 import pytest
 from eth_utils import keccak
 from tempo import Signer
@@ -12,7 +14,7 @@ from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
 from tempo.keychain import build_keychain_signature
 
 from .abi import SIGNATURE_VERIFIER as SIG
-from .utils import call_revert, fund, new_account, send_call
+from .utils import call_revert, fund, latest_timestamp, new_account, send_call
 
 pytestmark = pytest.mark.tempo
 
@@ -30,11 +32,11 @@ def _keychain_blob(inner_signer, account_addr):
     return build_keychain_signature(inner_signer.sign(keccak(b"\x04" + HASH + addr)), addr)
 
 
-async def _authorize(w3, chain_id, account, key_id, *, is_admin):
+async def _authorize(w3, chain_id, account, key_id, *, is_admin, expiry=4_000_000_000):
     if is_admin:
         data = KC.fns.authorizeAdminKey(key_id, 0, bytes(32)).data
     else:  # non-admin key via the ABI path needs a real (future) expiry
-        data = KC.fns.authorizeKey(key_id, 0, (4_000_000_000, False, [], True, [])).data
+        data = KC.fns.authorizeKey(key_id, 0, (expiry, False, [], True, [])).data
     await send_call(w3, chain_id, account, KC_ADDR, data)
 
 
@@ -96,3 +98,35 @@ async def test_verify_keychain_admin_accepts_admin_key(w3, chain_id):
     await _authorize(w3, chain_id, account, key.address, is_admin=True)
     assert await SIG.fns.verifyKeychainAdmin(account.address, HASH, blob).call(w3, to=SV)
     assert await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3, to=SV)  # an admin key is also active
+
+
+async def test_verify_keychain_rejects_account_mismatch(w3, chain_id):
+    account, other, key = new_account(), new_account(), new_account()
+    await fund(w3, account.address)
+    await _authorize(w3, chain_id, account, key.address, is_admin=True)
+    blob = _keychain_blob(Signer(key.key.hex()), account.address)  # the blob embeds `account`
+
+    # recover_keychain_key yields the embedded account, which must equal the passed account:
+    # the same blob verifies for the account it embeds, but not for a different one
+    assert await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3, to=SV)
+    assert await SIG.fns.verifyKeychainAdmin(account.address, HASH, blob).call(w3, to=SV)
+    assert not await SIG.fns.verifyKeychain(other.address, HASH, blob).call(w3, to=SV)
+    assert not await SIG.fns.verifyKeychainAdmin(other.address, HASH, blob).call(w3, to=SV)
+
+
+async def test_verify_keychain_rejects_expired_key(w3, chain_id):
+    account, key = new_account(), new_account()
+    await fund(w3, account.address)
+    blob = _keychain_blob(Signer(key.key.hex()), account.address)
+
+    # authorizeKey rejects a past expiry, so set a near-future one and let the 1s-block
+    # dev chain advance past it -- an expired key is no longer active
+    expiry = await latest_timestamp(w3) + 6
+    await _authorize(w3, chain_id, account, key.address, is_admin=False, expiry=expiry)
+    assert await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3, to=SV)  # active while unexpired
+
+    for _ in range(40):  # bounded poll (~20s cap); the dev node mines every second
+        if await latest_timestamp(w3) >= expiry:
+            break
+        await asyncio.sleep(0.5)
+    assert not await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3, to=SV)  # expired
