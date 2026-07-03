@@ -128,6 +128,7 @@ ADDRESS_REGISTRY = Contract.from_abi(
         "function resolveVirtualAddress(address virtualAddr) view returns (address)",
         "function isVirtualAddress(address addr) pure returns (bool)",
         "function decodeVirtualAddress(address addr) pure returns (bool isVirtual, bytes4 masterId, bytes6 userTag)",
+        "function isImplicitlyApproved(address addr) view returns (bool)",  # TIP-1035 implicit-approval list
     ]
 )
 
