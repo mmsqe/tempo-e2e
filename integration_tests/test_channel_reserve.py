@@ -7,9 +7,11 @@ import pytest
 from eth_contract.erc20 import ERC20
 from eth_utils import to_checksum_address
 from tempo.constants import PATH_USD
+from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
+from .abi import TIP20, TIP403
 from .abi import TIP20_CHANNEL_RESERVE as CR
-from .utils import call_revert, fund, new_account, send_call
+from .utils import STATE_WRITE_GAS, call_revert, create_token, fund, new_account, send_call, send_calls
 
 pytestmark = pytest.mark.tempo
 
@@ -17,6 +19,7 @@ pytestmark = pytest.mark.tempo
 CR_ADDR = to_checksum_address("0x4D50500000000000000000000000000000000000")
 ZERO_ADDR = "0x" + "00" * 20
 SALT = bytes(32)
+BLACKLIST = 1  # ITIP403Registry.PolicyType.BLACKLIST
 
 
 async def _send(w3, chain_id, signer, data):
@@ -33,16 +36,21 @@ async def _bal(w3, addr):
     return await ERC20.fns.balanceOf(addr).call(w3, to=PATH_USD)
 
 
-async def _open(w3, chain_id, payer, *, payee, operator=ZERO_ADDR, deposit):
+async def _voucher(w3, channel_id, cumulative, signer):
+    """A voucher signature over the digest for ``cumulative``, signed by ``signer``."""
+    digest = bytes(await CR.fns.getVoucherDigest(channel_id, cumulative).call(w3, to=CR_ADDR))
+    return bytes(signer.unsafe_sign_hash(digest).signature)
+
+
+async def _open(w3, chain_id, payer, *, payee, operator=ZERO_ADDR, deposit, authorized_signer=ZERO_ADDR, salt=SALT):
     """Open a channel from ``payer``; return (channel_id, descriptor)."""
-    receipt = await _send(
-        w3, chain_id, payer, CR.fns.open(payee, operator, PATH_USD, deposit, SALT, ZERO_ADDR).data
-    )
+    data = CR.fns.open(payee, operator, PATH_USD, deposit, salt, authorized_signer).data
+    receipt = await _send(w3, chain_id, payer, data)
     # ChannelOpened data = [operator, token, authorizedSigner, salt, expiringNonceHash, deposit].
     log = next(lg for lg in receipt["logs"] if lg["address"].lower() == CR_ADDR.lower())
     channel_id = bytes(log["topics"][1])
     expiring = bytes(log["data"])[4 * 32 : 5 * 32]
-    descriptor = (payer.address, payee, operator, PATH_USD, SALT, ZERO_ADDR, expiring)
+    descriptor = (payer.address, payee, operator, PATH_USD, salt, authorized_signer, expiring)
     return channel_id, descriptor
 
 
@@ -66,9 +74,7 @@ async def test_settle_pays_payee_via_voucher(w3, chain_id):
     )
 
     amount = 2000
-    digest = bytes(await CR.fns.getVoucherDigest(channel_id, amount).call(w3, to=CR_ADDR))
-    sig = bytes(payer.unsafe_sign_hash(digest).signature)
-
+    sig = await _voucher(w3, channel_id, amount, payer)
     before = await _bal(w3, payee.address)
     await _send(w3, chain_id, operator, CR.fns.settle(descriptor, amount, sig).data)
 
@@ -83,8 +89,7 @@ async def test_settle_rejects_unauthorized_submitter(w3, chain_id):
     await fund(w3, stranger.address)
     channel_id, descriptor = await _open(w3, chain_id, payer, payee=new_account().address, deposit=4000)
 
-    digest = bytes(await CR.fns.getVoucherDigest(channel_id, 1000).call(w3, to=CR_ADDR))
-    sig = bytes(payer.unsafe_sign_hash(digest).signature)
+    sig = await _voucher(w3, channel_id, 1000, payer)
     data = "0x" + bytes(CR.fns.settle(descriptor, 1000, sig).data).hex()
     resp = await w3.provider.make_request(
         "eth_call", [{"from": stranger.address, "to": CR_ADDR, "data": data}, "latest"]
@@ -113,8 +118,7 @@ async def test_partial_settle_is_monotonic(w3, chain_id):
     )
 
     async def settle(cumulative):
-        digest = bytes(await CR.fns.getVoucherDigest(channel_id, cumulative).call(w3, to=CR_ADDR))
-        sig = bytes(payer.unsafe_sign_hash(digest).signature)
+        sig = await _voucher(w3, channel_id, cumulative, payer)
         await _send(w3, chain_id, operator, CR.fns.settle(descriptor, cumulative, sig).data)
 
     before = await _bal(w3, payee.address)
@@ -124,9 +128,7 @@ async def test_partial_settle_is_monotonic(w3, chain_id):
     assert (await _state(w3, channel_id))[0] == 2500 and await _bal(w3, payee.address) == before + 2500
 
     # a non-increasing cumulative reverts (checked before the voucher, so a dummy sig is fine)
-    reason = await call_revert(
-        w3, CR_ADDR, CR.fns.settle(descriptor, 2000, bytes(65)).data, sender=operator.address
-    )
+    reason = await call_revert(w3, CR_ADDR, CR.fns.settle(descriptor, 2000, bytes(65)).data, sender=operator.address)
     assert "AmountNotIncreasing" in reason or "0x32d2c1a3" in reason
 
 
@@ -153,3 +155,125 @@ async def test_withdraw_before_grace_reverts(w3, chain_id):
     # withdraw needs block.timestamp >= closeRequestedAt + CLOSE_GRACE_PERIOD (900s)
     reason = await call_revert(w3, CR_ADDR, CR.fns.withdraw(descriptor).data, sender=payer.address)
     assert "CloseNotReady" in reason or "0x02b81e29" in reason
+
+
+async def test_settle_exceeding_deposit_reverts(w3, chain_id):
+    payer, operator = new_account(), new_account()
+    await fund(w3, payer.address)
+    await fund(w3, operator.address)
+    channel_id, descriptor = await _open(
+        w3, chain_id, payer, payee=new_account().address, operator=operator.address, deposit=5000
+    )
+    # cumulative > deposit is checked before the voucher, so a dummy signature is fine
+    reason = await call_revert(w3, CR_ADDR, CR.fns.settle(descriptor, 6000, bytes(65)).data, sender=operator.address)
+    assert "AmountExceedsDeposit" in reason
+
+
+async def test_settle_rejects_invalid_voucher_signature(w3, chain_id):
+    payer, operator, stranger = new_account(), new_account(), new_account()
+    await fund(w3, payer.address)
+    await fund(w3, operator.address)
+    channel_id, descriptor = await _open(
+        w3, chain_id, payer, payee=new_account().address, operator=operator.address, deposit=5000
+    )
+    # a voucher signed by someone other than the expected signer (the payer) recovers wrong
+    bad_sig = await _voucher(w3, channel_id, 1000, stranger)
+    reason = await call_revert(w3, CR_ADDR, CR.fns.settle(descriptor, 1000, bad_sig).data, sender=operator.address)
+    assert "InvalidSignature" in reason
+
+
+async def test_authorized_signer_signs_the_voucher(w3, chain_id):
+    payer, operator, payee, signer = new_account(), new_account(), new_account(), new_account()
+    await fund(w3, payer.address)
+    await fund(w3, operator.address)
+    channel_id, descriptor = await _open(
+        w3,
+        chain_id,
+        payer,
+        payee=payee.address,
+        operator=operator.address,
+        deposit=5000,
+        authorized_signer=signer.address,
+    )
+
+    # with authorizedSigner set, the voucher must be signed by it -- not the payer
+    sig = await _voucher(w3, channel_id, 2000, signer)
+    before = await _bal(w3, payee.address)
+    await _send(w3, chain_id, operator, CR.fns.settle(descriptor, 2000, sig).data)
+    assert (await _state(w3, channel_id))[0] == 2000 and await _bal(w3, payee.address) == before + 2000
+
+    # the payer's own signature is now rejected for this channel
+    payer_sig = await _voucher(w3, channel_id, 3000, payer)
+    reason = await call_revert(w3, CR_ADDR, CR.fns.settle(descriptor, 3000, payer_sig).data, sender=operator.address)
+    assert "InvalidSignature" in reason
+
+
+async def test_close_with_capture_pays_payee_and_refunds_payer(w3, chain_id):
+    payer, operator, payee = new_account(), new_account(), new_account()
+    await fund(w3, payer.address)
+    await fund(w3, operator.address)  # operator submits close and pays its gas
+    channel_id, descriptor = await _open(
+        w3, chain_id, payer, payee=payee.address, operator=operator.address, deposit=5000
+    )
+    payer_before, payee_before = await _bal(w3, payer.address), await _bal(w3, payee.address)
+
+    # capturing 2000 (> settled 0) requires a payer voucher over the cumulative amount
+    sig = await _voucher(w3, channel_id, 2000, payer)
+    await _send(w3, chain_id, operator, CR.fns.close(descriptor, 2000, 2000, sig).data)
+
+    assert await _state(w3, channel_id) == (0, 0, 0)  # channel deleted
+    assert await _bal(w3, payee.address) == payee_before + 2000  # captured to the payee
+    assert await _bal(w3, payer.address) == payer_before + 3000  # deposit - capture refunded
+
+
+async def test_multiple_open_in_one_tx(w3, chain_id):
+    payer = new_account()
+    await fund(w3, payer.address)
+    payee1, payee2 = new_account().address, new_account().address
+    salt2 = b"\x01" + bytes(31)
+
+    receipt = await send_calls(  # two channels opened atomically in one tx
+        w3,
+        chain_id=chain_id,
+        private_key=payer.key.hex(),
+        gas_limit=STATE_WRITE_GAS,
+        calls=[
+            {"to": CR_ADDR, "data": CR.fns.open(payee1, ZERO_ADDR, PATH_USD, 3000, SALT, ZERO_ADDR).data},
+            {"to": CR_ADDR, "data": CR.fns.open(payee2, ZERO_ADDR, PATH_USD, 2000, salt2, ZERO_ADDR).data},
+        ],
+    )
+    assert receipt["status"] == 1
+    ids = [bytes(lg["topics"][1]) for lg in receipt["logs"] if lg["address"].lower() == CR_ADDR.lower()]
+    assert len(ids) == 2  # one ChannelOpened per open
+    states = [await _state(w3, cid) for cid in ids]
+    assert sorted(s[1] for s in states) == [2000, 3000]  # both deposits locked
+
+
+async def test_open_respects_token_transfer_policy(w3, chain_id, funded_account):
+    admin = funded_account
+    payer = new_account()
+    await fund(w3, payer.address)
+    blocked, allowed = new_account().address, new_account().address
+    token = await create_token(w3, chain_id=chain_id, admin=admin, mint=(payer.address, 20_000))
+
+    # bind the token to a policy that blacklists `blocked`
+    pid = await TIP403.fns.policyIdCounter().call(w3, to=REGISTRY)
+    await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=admin.key.hex(),
+        gas_limit=STATE_WRITE_GAS,
+        calls=[
+            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, BLACKLIST).data},
+            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyBlacklist(pid, blocked, True).data},
+            {"to": token, "data": TIP20.fns.changeTransferPolicyId(pid).data},
+        ],
+    )
+
+    # opening to a policy-blocked payee fails the recipient admission check
+    blocked_open = CR.fns.open(blocked, ZERO_ADDR, token, 5000, SALT, ZERO_ADDR).data
+    assert "PolicyForbids" in await call_revert(w3, CR_ADDR, blocked_open, sender=payer.address)
+
+    # ...while opening to an allowed payee on the same token succeeds
+    allowed_open = CR.fns.open(allowed, ZERO_ADDR, token, 5000, SALT, ZERO_ADDR).data
+    assert (await _send(w3, chain_id, payer, allowed_open))["status"] == 1
