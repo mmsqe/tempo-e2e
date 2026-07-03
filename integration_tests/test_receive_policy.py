@@ -72,6 +72,23 @@ async def _whitelist_policy(w3, chain_id, admin, member):
     return pid
 
 
+async def _blacklist_on_token(w3, chain_id, admin, token, blocked):
+    """Bind ``token``'s transfer policy to a fresh BLACKLIST policy that rejects ``blocked``."""
+    pid = await TIP403.fns.policyIdCounter().call(w3, to=REGISTRY)
+    await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=admin.key.hex(),
+        gas_limit=STATE_WRITE_GAS,
+        calls=[
+            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, BLACKLIST).data},
+            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyBlacklist(pid, blocked, True).data},
+            {"to": token, "data": TIP20.fns.changeTransferPolicyId(pid).data},
+        ],
+    )
+    return pid
+
+
 async def _claim(w3, chain_id, receiver, witness):
     return await send_call(w3, chain_id, receiver, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data)
 
@@ -143,18 +160,7 @@ async def test_burn_blocked_receipt(w3, chain_id, funded_account):
 
     # bind the token to a policy that makes the subject (receiver) unauthorized as a sender,
     # a precondition for burning the escrowed funds
-    pid = await TIP403.fns.policyIdCounter().call(w3, to=REGISTRY)
-    await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=admin.key.hex(),
-        gas_limit=STATE_WRITE_GAS,
-        calls=[
-            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, BLACKLIST).data},
-            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyBlacklist(pid, receiver.address, True).data},
-            {"to": token, "data": TIP20.fns.changeTransferPolicyId(pid).data},
-        ],
-    )
+    await _blacklist_on_token(w3, chain_id, admin, token, receiver.address)
 
     supply_before = await ERC20.fns.totalSupply().call(w3, to=token)
     await send_call(w3, chain_id, admin, GUARD_ADDR, GUARD.fns.burnBlockedReceipt(witness).data)
@@ -276,3 +282,45 @@ async def test_double_claim_reverts(w3, chain_id):
     await _claim(w3, chain_id, receiver, witness)  # first claim consumes the receipt
     reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data, sender=receiver.address)
     assert "InvalidReceipt" in reason or "0xc0098aac" in reason
+
+
+async def test_direct_transfer_to_guard_reverts(w3):
+    sender = new_account()
+    await fund(w3, sender.address)
+    # the guard is a reserved address -- a direct transfer to it reverts (funds only arrive via escrow)
+    reason = await call_revert(w3, PATH_USD, ERC20.fns.transfer(GUARD_ADDR, 1).data, sender=sender.address)
+    assert "AddressReserved" in reason
+
+
+async def test_set_receive_policy_rejects_compound_and_virtual(w3, chain_id, funded_account):
+    admin = funded_account
+    receiver = new_account().address
+
+    # a COMPOUND policy cannot be used as a receive-policy filter (only simple / built-in ids)
+    compound = await TIP403.fns.policyIdCounter().call(w3, to=REGISTRY)
+    await send_call(
+        w3, chain_id, admin, REGISTRY, TIP403.fns.createCompoundPolicy(ALLOW_ALL, ALLOW_ALL, ALLOW_ALL).data
+    )
+    compound_data = TIP403.fns.setReceivePolicy(compound, ALLOW_ALL, receiver).data
+    assert "InvalidReceivePolicyType" in await call_revert(w3, REGISTRY, compound_data, sender=receiver)
+
+    # a virtual address may not set a receive policy
+    virtual = to_checksum_address(b"\xaa\xbb\xcc\xdd" + b"\xfd" * 10 + b"\x00" * 6)
+    data = TIP403.fns.setReceivePolicy(ALLOW_ALL, ALLOW_ALL, receiver).data
+    assert "VirtualAddressNotAllowed" in await call_revert(w3, REGISTRY, data, sender=virtual)
+
+
+async def test_resume_claim_enforces_token_transfer_policy(w3, chain_id, funded_account):
+    admin = funded_account
+    sender, receiver = new_account(), new_account()
+    await fund(w3, sender.address)
+    await fund(w3, receiver.address)
+    token = await create_token(w3, chain_id=chain_id, admin=admin, mint=(sender.address, 10_000))
+    await _reject_all_senders(w3, chain_id, receiver)  # recoveryAuthority = receiver -> claim is a resume
+    _amount, witness = await _block_transfer(w3, chain_id, sender, receiver, 6000, token)
+
+    # after escrow, bind the token to a policy that blocks the receiver as a recipient
+    await _blacklist_on_token(w3, chain_id, admin, token, receiver.address)
+    # resume skips the receive-policy recheck but still enforces the token's TIP-403 destination check
+    reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data, sender=receiver.address)
+    assert "PolicyForbids" in reason
