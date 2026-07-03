@@ -1,13 +1,27 @@
 """TIP-1049 admin keys + TIP-1053 authorization witnesses on AccountKeychain
 (0xaAAA…, T6/T5): the root EOA is its own admin key and can register more admin
-keys directly; witnesses can be burned, and a burned witness can't reauthorize.
+keys (directly or via another admin key); a burned witness or a revoked key
+cannot reauthorize, and an admin key may not carry limits or scopes.
 """
 
 import pytest
+from tempo import Signer, serialize
+from tempo.constants import PATH_USD
 from tempo.contracts import ACCOUNT_KEYCHAIN as KC
 from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
+from tempo.keychain import TokenLimit, sign_tx_access_key
 
-from .utils import call_revert, fund, new_account, send_call
+from .utils import (
+    STATE_WRITE_GAS,
+    build_tempo_tx,
+    call_revert,
+    fund,
+    get_nonce,
+    new_account,
+    send_call,
+    suggested_max_fee,
+    transfer_call,
+)
 
 pytestmark = pytest.mark.tempo
 
@@ -46,11 +60,51 @@ async def test_authorize_admin_key_rejects_self_and_duplicate(w3, chain_id):
     await _kc(w3, chain_id, root, _authorize_admin(k2))
 
     # keyId == account is rejected
-    self_reason = await call_revert(w3, KC_ADDR, _authorize_admin(root.address), sender=root.address)
-    assert "InvalidKeyId" in self_reason or "0xb0aeb53e" in self_reason
+    assert "InvalidKeyId" in await call_revert(w3, KC_ADDR, _authorize_admin(root.address), sender=root.address)
     # re-authorizing an existing key is rejected
-    dup_reason = await call_revert(w3, KC_ADDR, _authorize_admin(k2), sender=root.address)
-    assert "KeyAlreadyExists" in dup_reason or "0xaa1ba2f8" in dup_reason
+    assert "KeyAlreadyExists" in await call_revert(w3, KC_ADDR, _authorize_admin(k2), sender=root.address)
+
+
+async def test_admin_key_can_authorize_another_admin_key(w3, chain_id):
+    root, provisioned, k3 = new_account(), new_account(), new_account().address
+    await fund(w3, root.address)
+
+    # `provisioned` is registered as an admin key inline and, in the same tx, authorizes k3
+    tx = build_tempo_tx(
+        chain_id=chain_id,
+        nonce=await get_nonce(w3, root.address),
+        fee_token=PATH_USD,
+        gas_limit=STATE_WRITE_GAS,
+        max_fee_per_gas=await suggested_max_fee(w3),
+        calls=[{"to": KC_ADDR, "data": _authorize_admin(k3)}],
+    )
+    signed = sign_tx_access_key(tx, provisioned.key.hex(), Signer(root.key.hex()), is_admin=True)
+    receipt = await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(serialize(signed)))
+    assert receipt["status"] == 1
+    assert await _read(w3, KC.fns.isAdminKey(root.address, provisioned.address))
+    assert await _read(w3, KC.fns.isAdminKey(root.address, k3))  # authorized by a non-root admin key
+
+
+async def test_revoked_key_cannot_be_reauthorized(w3, chain_id):
+    root = new_account()
+    await fund(w3, root.address)
+    k2 = new_account().address
+    await _kc(w3, chain_id, root, _authorize_admin(k2))
+    assert await _read(w3, KC.fns.isAdminKey(root.address, k2))
+
+    await _kc(w3, chain_id, root, KC.fns.revokeKey(k2).data)
+    assert not await _read(w3, KC.fns.isAdminKey(root.address, k2))  # a revoked key is no longer admin
+
+    assert "KeyAlreadyRevoked" in await call_revert(w3, KC_ADDR, _authorize_admin(k2), sender=root.address)
+
+
+def test_admin_key_cannot_carry_a_spending_limit(chain_id):
+    root, k2 = new_account(), new_account()
+    tx = build_tempo_tx(chain_id=chain_id, nonce=0, fee_token=PATH_USD, calls=[transfer_call(new_account().address, 1)])
+    # TIP-1049: an admin key must not carry limits or scoped calls (rejected before signing)
+    limits = (TokenLimit.create(PATH_USD, 100),)
+    with pytest.raises(Exception):
+        sign_tx_access_key(tx, k2.key.hex(), Signer(root.key.hex()), is_admin=True, limits=limits)
 
 
 async def test_witness_burn_round_trip(w3, chain_id):
@@ -63,7 +117,5 @@ async def test_witness_burn_round_trip(w3, chain_id):
     assert await _read(w3, KC.fns.isKeyAuthorizationWitnessBurned(root.address, witness))
 
     # a key authorization carrying a burned witness is rejected
-    reason = await call_revert(
-        w3, KC_ADDR, KC.fns.authorizeAdminKey(new_account().address, SECP256K1, witness).data, sender=root.address
-    )
-    assert "KeyAuthorizationWitnessAlreadyBurned" in reason or "0xc96f8deb" in reason
+    burned = KC.fns.authorizeAdminKey(new_account().address, SECP256K1, witness).data
+    assert "KeyAuthorizationWitnessAlreadyBurned" in await call_revert(w3, KC_ADDR, burned, sender=root.address)
