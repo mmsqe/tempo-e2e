@@ -4,6 +4,7 @@ import asyncio
 import time
 
 import pytest
+from hexbytes import HexBytes
 from web3 import Web3
 
 pytestmark = pytest.mark.consensus
@@ -31,6 +32,31 @@ async def test_get_finalization_latest_certifies_a_block(consensus_w3):
 
 async def test_blocks_are_produced(consensus_w3):
     assert await consensus_w3.eth.block_number >= 1
+
+
+async def test_header_embeds_consensus_context(consensus_w3):
+    """TIP-1031: consensus-produced headers carry consensusContext {epoch, view,
+    parentView, proposer}; genesis omits it and views link parent to child."""
+    n = await consensus_w3.eth.block_number
+    while n < 2:  # need a parent/child pair past genesis
+        await asyncio.sleep(1)
+        n = await consensus_w3.eth.block_number
+
+    parent = await consensus_w3.eth.get_block(n - 1)
+    child = await consensus_w3.eth.get_block(n)
+    ctx = child["consensusContext"]
+
+    assert ctx["view"] >= 1 and ctx["epoch"] >= 0
+    assert len(HexBytes(ctx["proposer"])) == 32  # an ed25519 public key, not an EVM address
+    # the embedded parentView is exactly the parent header's view
+    assert ctx["parentView"] == parent["consensusContext"]["view"]
+    assert ctx["view"] > ctx["parentView"]
+
+    # genesis was not consensus-produced, so the optional field is absent (spec: MUST be None).
+    # Raw request: the localnet genesis packs the validator set into extraData, which
+    # trips web3.py's 32-byte extraData validation middleware on get_block.
+    resp = await consensus_w3.provider.make_request("eth_getBlockByNumber", ["0x0", False])
+    assert "consensusContext" not in resp["result"]
 
 
 def _height(rpc_url: str) -> int:

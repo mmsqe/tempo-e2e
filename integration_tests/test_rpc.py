@@ -34,3 +34,10 @@ async def test_call_with_state_override(w3):
     override = {addr: {"code": "0x" + RETURN_42_RUNTIME.hex()}}
     result = await w3.eth.call({"to": addr}, "latest", override)
     assert int(result.hex(), 16) == 42
+
+
+async def test_dev_blocks_have_no_consensus_context(w3):
+    """TIP-1031: the consensusContext header field is optional and only set by
+    consensus-produced blocks -- a dev-mode block omits it entirely."""
+    block = await w3.eth.get_block("latest")
+    assert block.get("consensusContext") is None
