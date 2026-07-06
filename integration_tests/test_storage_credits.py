@@ -4,18 +4,27 @@ to the slot's owner (a contract, never an EOA); mode 3 is reserved.
 
 import pytest
 from eth_contract.erc20 import ERC20
-from eth_utils import to_checksum_address
 from tempo.constants import ALPHA_USD
 from tempo.constants import STABLECOIN_DEX_ADDRESS as DEX_ADDR
+from tempo.constants import STORAGE_CREDITS_ADDRESS as SC_ADDR
 
 from .abi import DEX
 from .abi import STORAGE_CREDITS as SC
-from .utils import STATE_WRITE_GAS, call_revert, deploy_contract, fund, fund_token, new_account, send_call, send_calls
+from .utils import (
+    MAX_UINT,
+    STATE_WRITE_GAS,
+    call_revert,
+    create_token,
+    deploy_contract,
+    fund,
+    fund_token,
+    new_account,
+    send_call,
+    send_calls,
+)
 
 pytestmark = pytest.mark.tempo
 
-SC_ADDR = to_checksum_address("0x1060000000000000000000000000000000000000")
-MAX_UINT = 2**256 - 1
 
 # Constructor SSTOREs slot0=1 (a creation), then deploys runtime `600060005500`
 # which SSTOREs slot0=0 (a deletion) on any call -> mints a credit to the contract.
@@ -112,3 +121,43 @@ async def test_dex_order_cancel_credits_the_maker(w3, chain_id):
     await send_call(w3, chain_id, maker, DEX_ADDR, DEX.fns.cancel(order_id).data)
     # cancelling frees the order's storage slots, crediting the maker for a future reuse (TIP-1064)
     assert 0 < await DEX.fns.storageCredits(maker.address).call(w3, to=DEX_ADDR) <= 6
+
+
+async def test_dex_replace_consumes_maker_credits(w3, chain_id, funded_account):
+    """TIP-1064 consume side: credits earned by a cancel offset the storage cost of the
+    maker's next placement -- the balance decrements and the identical place is cheaper."""
+    maker = new_account()
+    await fund(w3, maker.address)
+    token = await create_token(w3, chain_id=chain_id, admin=funded_account, mint=(maker.address, 10_000_000_000))
+    await send_call(w3, chain_id, maker, token, ERC20.fns.approve(DEX_ADDR, MAX_UINT).data)
+
+    def _credits():
+        return DEX.fns.storageCredits(maker.address).call(w3, to=DEX_ADDR)
+
+    place = DEX.fns.place(token, 2_000_000_000, False, 0).data
+    order_id = await DEX.fns.nextOrderId().call(w3, to=DEX_ADDR)
+    first = await send_call(w3, chain_id, maker, DEX_ADDR, place)  # no credits: full storage cost
+    await send_call(w3, chain_id, maker, DEX_ADDR, DEX.fns.cancel(order_id).data)
+    earned = await _credits()
+    assert earned > 0
+
+    second = await send_call(w3, chain_id, maker, DEX_ADDR, place)  # reuses the freed slots
+    assert await _credits() < earned  # credits were consumed...
+    assert second["gasUsed"] < first["gasUsed"]  # ...making the identical placement cheaper
+
+
+async def test_mode_and_budget_are_transient(w3, chain_id):
+    """TIP-1060: setMode/setBudget live in transient storage -- they reset between txs."""
+    payer = new_account()
+    await fund(w3, payer.address)
+    receipt = await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=payer.key.hex(),
+        gas_limit=STATE_WRITE_GAS,
+        calls=[{"to": SC_ADDR, "data": SC.fns.setMode(2).data}, {"to": SC_ADDR, "data": SC.fns.setBudget(7).data}],
+    )
+    assert receipt["status"] == 1
+    # the next tx (and eth_call) observes the defaults again: Refund mode, zero budget
+    assert await SC.fns.modeOf(payer.address).call(w3, to=SC_ADDR) == 0
+    assert await SC.fns.budgetOf(payer.address).call(w3, to=SC_ADDR) == 0
