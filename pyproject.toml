@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "End-to-end test suite for the tempo node binary"
 requires-python = ">=3.13"
 dependencies = [
-    "tempo-py",
+    "tempo-py[devnet]",
     "web3>=7.0.0",
     "eth-account>=0.13.0",
     "eth-contract>=0.4.0",

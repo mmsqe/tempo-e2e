@@ -7,10 +7,13 @@ import shutil
 import time
 
 import pytest
+import yaml
+from tempo.devnet.cli import init as devnet_init
+from tempo.devnet.cluster import ClusterCLI
+from tempo.devnet.ports import find_free_base_ports
 from web3 import AsyncWeb3
 
-from .consensus_net import ConsensusNetwork
-from .network import TempoNode, free_port
+from .network import TempoNode, free_port, resolve_tempo_bin, resolve_xtask_bin
 from .utils import fund, new_account
 
 
@@ -69,36 +72,60 @@ async def funded_account(w3):
 
 @pytest.fixture(scope="session")
 def consensus_net(request, tmp_path_factory):
-    """A 4-validator consensus localnet (opt-in via --consensus)."""
+    """A 4-validator consensus localnet (opt-in via --consensus), run by tempo-devnet.
+
+    Yields the ``ClusterCLI`` for the cluster; tests address nodes by moniker.
+    """
     if not request.config.getoption("--consensus"):
         pytest.skip("consensus localnet not requested (pass --consensus)")
     if request.config.getoption("--tempo-bin"):
         os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
 
     base = tmp_path_factory.mktemp("consensus")
-    net = ConsensusNetwork(base_dir=base)
-    net.generate()
+    # Random free base ports (baked into genesis) so runs don't collide with each other or a dev node.
+    config = {
+        "chain_id": 1337,
+        "accounts": 200,
+        "epoch_length": 100,
+        "seed": 0,
+        "tempo_bin": resolve_tempo_bin(),
+        "tempo_xtask_bin": resolve_xtask_bin(),
+        "validators": [
+            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(find_free_base_ports(4))
+        ],
+    }
+    config_path = base / "devnet.yaml"
+    config_path.write_text(yaml.dump(config, default_flow_style=False))
+    data_dir = base / "data"
+    try:
+        devnet_init(data=str(data_dir), config=str(config_path), force=True)
+    except SystemExit as e:  # devnet_init exits on failure; surface it to pytest
+        raise RuntimeError(f"tempo-devnet init failed (exit {e.code}); see {base}") from e
+
+    cluster = ClusterCLI(data_dir)
     try:
         last_err: Exception | None = None
         for _ in range(5):  # retry: a freshly-picked port can be grabbed before launch
             try:
-                net.start().wait_for_finalization()
+                cluster.start_supervisord()
+                cluster.wait_all_running()
+                cluster.wait_for_finalization()
                 break
             except (RuntimeError, TimeoutError) as e:
                 last_err = e
-                net.stop()
+                cluster.shutdown()
                 time.sleep(5)
         else:
             raise last_err
-        yield net
+        yield cluster
     finally:
-        net.stop()
+        cluster.shutdown()
         if not request.config.getoption("--keep-data"):
             shutil.rmtree(base, ignore_errors=True)
 
 
 @pytest.fixture
 async def consensus_w3(consensus_net):
-    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(consensus_net.rpc_url))
+    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(consensus_net.node_rpc_url("node0")))
     yield client
     await client.provider.disconnect()

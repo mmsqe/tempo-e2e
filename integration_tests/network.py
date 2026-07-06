@@ -44,6 +44,26 @@ def resolve_binary() -> list[str]:
     return ["cargo", "run", "--bin", "tempo", "--manifest-path", str(base / "Cargo.toml"), "--"]
 
 
+def resolve_tempo_bin() -> str:
+    """The built tempo binary as a single path (the devnet run scripts exec one path)."""
+    parts = resolve_binary()
+    if len(parts) == 1:
+        return parts[0]
+    raise RuntimeError("the devnet needs a built tempo binary (set TEMPO_BIN or build ../tempo)")
+
+
+def resolve_xtask_bin() -> str:
+    """``$TEMPO_XTASK_BIN``, else a built ``tempo-xtask``."""
+    env_bin = os.environ.get("TEMPO_XTASK_BIN")
+    if env_bin:
+        return env_bin
+    base = tempo_dir()
+    for candidate in (base / "target/release/tempo-xtask", base / "target/debug/tempo-xtask"):
+        if candidate.exists():
+            return str(candidate)
+    raise RuntimeError("the devnet needs a built tempo-xtask (set TEMPO_XTASK_BIN or build ../tempo)")
+
+
 def default_genesis() -> Path:
     """The permissive dev genesis the node's own tests use (override with ``$TEMPO_GENESIS``)."""
     env_genesis = os.environ.get("TEMPO_GENESIS")
