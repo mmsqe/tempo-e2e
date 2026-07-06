@@ -10,7 +10,7 @@ from eth_utils import keccak
 from tempo.constants import PATH_USD
 
 from .abi import TIP20_PERMIT as PERMIT
-from .utils import STATE_WRITE_GAS, call_revert, fund, latest_timestamp, new_account, send_calls
+from .utils import STATE_WRITE_GAS, call_revert, fund, latest_timestamp, new_account, send_call, send_calls
 
 pytestmark = pytest.mark.tempo
 
@@ -26,14 +26,33 @@ PERMIT_TYPES = {
 }
 
 
-def _sign_permit(owner, *, name, chain_id, token, spender, value, nonce, deadline):
+def _sign_permit(owner, *, name, chain_id, token, spender, value, nonce, deadline, key=None):
     signed = Account.sign_typed_data(
-        owner.key,
+        key if key is not None else owner.key,  # `key` forges a signature from someone other than `owner`
         domain_data={"name": name, "version": "1", "chainId": chain_id, "verifyingContract": token},
         message_types=PERMIT_TYPES,
         message_data={"owner": owner.address, "spender": spender, "value": value, "nonce": nonce, "deadline": deadline},
     )
     return signed.v, signed.r.to_bytes(32, "big"), signed.s.to_bytes(32, "big")
+
+
+async def _fresh_permit(w3, chain_id, owner, spender, value, *, key=None, v_shift=0, deadline_offset=3600):
+    """Permit calldata over ``owner``'s current nonce, valid until ``deadline_offset`` seconds from now."""
+    nonce = await PERMIT.fns.nonces(owner.address).call(w3, to=PATH_USD)
+    name = await PERMIT.fns.name().call(w3, to=PATH_USD)
+    deadline = await latest_timestamp(w3) + deadline_offset
+    v, r, s = _sign_permit(
+        owner,
+        name=name,
+        chain_id=chain_id,
+        token=PATH_USD,
+        spender=spender,
+        value=value,
+        nonce=nonce,
+        deadline=deadline,
+        key=key,
+    )
+    return PERMIT.fns.permit(owner.address, spender, value, deadline, v + v_shift, r, s).data
 
 
 async def test_domain_separator_matches_onchain(w3, chain_id):
@@ -55,18 +74,7 @@ async def test_permit_authorizes_transfer_from(w3, chain_id):
 
     value = 1000
     nonce = await PERMIT.fns.nonces(owner.address).call(w3, to=PATH_USD)
-    name = await PERMIT.fns.name().call(w3, to=PATH_USD)
-    deadline = await latest_timestamp(w3) + 3600
-    v, r, s = _sign_permit(
-        owner,
-        name=name,
-        chain_id=chain_id,
-        token=PATH_USD,
-        spender=spender.address,
-        value=value,
-        nonce=nonce,
-        deadline=deadline,
-    )
+    permit = await _fresh_permit(w3, chain_id, owner, spender.address, value)
 
     owner_before = await ERC20.fns.balanceOf(owner.address).call(w3, to=PATH_USD)
     receipt = await send_calls(
@@ -75,7 +83,7 @@ async def test_permit_authorizes_transfer_from(w3, chain_id):
         private_key=spender.key.hex(),
         gas_limit=STATE_WRITE_GAS,
         calls=[
-            {"to": PATH_USD, "data": PERMIT.fns.permit(owner.address, spender.address, value, deadline, v, r, s).data},
+            {"to": PATH_USD, "data": permit},
             {"to": PATH_USD, "data": ERC20.fns.transferFrom(owner.address, recipient, value).data},
         ],
     )
@@ -89,11 +97,41 @@ async def test_expired_permit_reverts(w3, chain_id):
     owner = new_account()
     await fund(w3, owner.address)
     spender = new_account().address
-    nonce = await PERMIT.fns.nonces(owner.address).call(w3, to=PATH_USD)
-    name = await PERMIT.fns.name().call(w3, to=PATH_USD)
-    deadline = await latest_timestamp(w3) - 1  # already past
-    v, r, s = _sign_permit(
-        owner, name=name, chain_id=chain_id, token=PATH_USD, spender=spender, value=1000, nonce=nonce, deadline=deadline
-    )
-    reason = await call_revert(w3, PATH_USD, PERMIT.fns.permit(owner.address, spender, 1000, deadline, v, r, s).data)
+    data = await _fresh_permit(w3, chain_id, owner, spender, 1000, deadline_offset=-1)  # already past
+    reason = await call_revert(w3, PATH_USD, data)
     assert "PermitExpired" in reason or "0x1a15a3cc" in reason
+
+
+async def test_permit_wrong_signer_reverts(w3, chain_id):
+    owner, stranger = new_account(), new_account()
+    await fund(w3, owner.address)
+    spender = new_account().address
+    # a permit naming `owner` but signed by someone else recovers the wrong address
+    data = await _fresh_permit(w3, chain_id, owner, spender, 1000, key=stranger.key)
+    assert "InvalidSignature" in await call_revert(w3, PATH_USD, data)
+
+
+async def test_permit_v_not_normalized(w3, chain_id):
+    owner = new_account()
+    await fund(w3, owner.address)
+    spender = new_account().address
+    # tempo requires v in {27, 28} and does NOT normalize {0, 1} (many signing libs emit the latter)
+    data = await _fresh_permit(w3, chain_id, owner, spender, 1000, v_shift=-27)
+    assert "InvalidSignature" in await call_revert(w3, PATH_USD, data)
+
+
+async def test_permit_replay_and_zero_override(w3, chain_id):
+    owner = new_account()
+    await fund(w3, owner.address)
+    spender = new_account().address
+
+    data = await _fresh_permit(w3, chain_id, owner, spender, 1000)
+    await send_call(w3, chain_id, owner, PATH_USD, data)  # owner relays its own permit
+    assert await ERC20.fns.allowance(owner.address, spender).call(w3, to=PATH_USD) == 1000
+
+    # replaying the same permit fails: the nonce moved, so recovery no longer matches the owner
+    assert "InvalidSignature" in await call_revert(w3, PATH_USD, data)
+
+    # a fresh permit with value=0 overrides the live allowance down to zero
+    await send_call(w3, chain_id, owner, PATH_USD, await _fresh_permit(w3, chain_id, owner, spender, 0))
+    assert await ERC20.fns.allowance(owner.address, spender).call(w3, to=PATH_USD) == 0
