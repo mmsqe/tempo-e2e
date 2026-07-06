@@ -76,43 +76,40 @@ def _wait_height(rpc_url: str, target: int, timeout: float = 60.0) -> int:
 # Runs last (after the RPC tests) and restores the network, since it disrupts the shared localnet.
 def test_chain_survives_validator_restart(consensus_net):
     """Chain keeps finalizing with one validator down (3/4 quorum), and it rejoins (P0-02)."""
-    cluster = consensus_net.cluster
-    primary = consensus_net.rpc_url  # node0 stays up throughout
+    primary = consensus_net.node_rpc_url("node0")  # node0 stays up throughout
     start = _height(primary)
 
-    cluster.stop_node("node1")
+    consensus_net.stop_node("node1")
     assert _wait_height(primary, start + 3) >= start + 3, "chain halted with one validator down"
     progressed = _height(primary)
 
-    cluster.start_node("node1")
-    rejoined = cluster.node_rpc_url("node1")
+    consensus_net.start_node("node1")
+    rejoined = consensus_net.node_rpc_url("node1")
     assert _wait_height(rejoined, progressed) >= progressed, "restarted validator did not catch up"
 
 
 def test_chain_halts_without_quorum_and_recovers(consensus_net):
     """2 of 4 validators down (below the 3/4 quorum) halts the chain; it recovers on restart"""
-    cluster = consensus_net.cluster
-    primary = consensus_net.rpc_url  # node0 stays up
-    cluster.stop_node("node1")
-    cluster.stop_node("node2")
+    primary = consensus_net.node_rpc_url("node0")  # node0 stays up
+    consensus_net.stop_node("node1")
+    consensus_net.stop_node("node2")
     time.sleep(3)  # let any in-flight blocks finalize, then the height should freeze
     halted = _height(primary)
     time.sleep(8)
     assert _height(primary) == halted, "chain advanced without a quorum"
 
-    cluster.start_node("node1")
-    cluster.start_node("node2")
+    consensus_net.start_node("node1")
+    consensus_net.start_node("node2")
     assert _wait_height(primary, halted + 2) >= halted + 2, "chain did not recover after restart"
 
 
 def test_full_network_failure_and_recovery(consensus_net):
     """All validators down then restarted: the chain resumes from its persisted state"""
-    cluster = consensus_net.cluster
-    primary = consensus_net.rpc_url
+    primary = consensus_net.node_rpc_url("node0")
     before = _height(primary)
 
-    cluster.stop_all()
-    cluster.start_all()
+    consensus_net.stop_all()
+    consensus_net.start_all()
 
     # A cold 4-node restart re-forms consensus from scratch, which can take
     # longer than a single-validator rejoin, so allow extra recovery time.
