@@ -1,11 +1,12 @@
 """TIP-403 transfer policies: whitelist/blacklist authorization"""
 
 import pytest
+from eth_utils import to_checksum_address
 from hexbytes import HexBytes
 from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
 from .abi import TIP403
-from .utils import STATE_WRITE_GAS, new_account, send_calls
+from .utils import STATE_WRITE_GAS, call_revert, new_account, send_calls
 
 pytestmark = pytest.mark.tempo
 
@@ -50,3 +51,15 @@ async def test_blacklist_blocks_only_listed_accounts(w3, chain_id, funded_accoun
     # A blacklist authorizes everyone except its restricted accounts.
     assert not await _authorized(w3, policy_id, blocked)
     assert await _authorized(w3, policy_id, allowed)
+
+
+async def test_policy_membership_rejects_virtual_addresses(w3, chain_id, funded_account):
+    """TIP-1022: a virtual address is a forwarding alias, never a valid policy member."""
+    admin = funded_account
+    policy_id = await TIP403.fns.policyIdCounter().call(w3, to=REGISTRY)
+    created = await _registry_tx(w3, chain_id, admin, TIP403.fns.createPolicy(admin.address, WHITELIST).data)
+    assert created["status"] == 1
+
+    virtual = to_checksum_address(b"\xaa\xbb\xcc\xdd" + b"\xfd" * 10 + b"\x00" * 6)
+    data = TIP403.fns.modifyPolicyWhitelist(policy_id, virtual, True).data
+    assert "VirtualAddressNotAllowed" in await call_revert(w3, REGISTRY, data, sender=admin.address)
