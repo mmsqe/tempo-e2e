@@ -17,6 +17,7 @@ from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
 
+from .docker_cluster import DockerCluster
 from .network import TempoNode, free_port, resolve_tempo_bin, resolve_xtask_bin
 from .utils import fund, new_account
 
@@ -34,6 +35,17 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Launch the multi-validator consensus localnet for consensus-marked tests",
+    )
+    group.addoption(
+        "--consensus-docker",
+        action="store_true",
+        default=False,
+        help="Run the consensus localnet in Docker containers (docker compose) instead of supervisord",
+    )
+    group.addoption(
+        "--tempo-image",
+        default=os.environ.get("TEMPO_IMAGE", "tempo:latest"),
+        help="Docker image for validator containers in --consensus-docker mode",
     )
 
 
@@ -105,13 +117,17 @@ def _wait_all_running(cluster: ClusterCLI, timeout: float = 30.0) -> None:
     raise RuntimeError(f"supervisord did not start all nodes; see {cluster.data_dir}")
 
 
-def _wait_for_finalization(cluster: ClusterCLI, timeout: float = 120.0) -> None:
-    """Wait until node0 finalizes a block via consensus (not just produces one)."""
+def _wait_for_finalization(cluster, timeout: float = 120.0) -> None:
+    """Wait until node0 finalizes a block via consensus (not just produces one).
+
+    Works for both the supervisord ``ClusterCLI`` and the ``DockerCluster``:
+    both expose ``node_rpc_url`` and a crash-listing method (``_crashed_nodes``).
+    """
     w3 = Web3(Web3.HTTPProvider(cluster.node_rpc_url("node0")))
     deadline = time.time() + timeout
     last_err: Exception | None = None
     while time.time() < deadline:
-        crashed = [p["name"] for p in cluster.status() if p["statename"] in ("FATAL", "EXITED")]
+        crashed = _crashed_nodes(cluster)
         if crashed:
             raise RuntimeError(f"validators crashed: {crashed}; see {cluster.data_dir}")
         try:
@@ -122,6 +138,13 @@ def _wait_for_finalization(cluster: ClusterCLI, timeout: float = 120.0) -> None:
             last_err = e
         time.sleep(1.0)
     raise TimeoutError(f"consensus did not finalize within {timeout}s (last error: {last_err})")
+
+
+def _crashed_nodes(cluster) -> list[str]:
+    """List nodes that have died, for either cluster backend."""
+    if isinstance(cluster, DockerCluster):
+        return cluster.crashed()
+    return [p["name"] for p in cluster.status() if p["statename"] in ("FATAL", "EXITED")]
 
 
 def _shutdown(cluster: ClusterCLI, proc: subprocess.Popen | None) -> None:
@@ -139,38 +162,74 @@ def _shutdown(cluster: ClusterCLI, proc: subprocess.Popen | None) -> None:
         proc.wait(timeout=10)
 
 
-@pytest.fixture(scope="session")
-def consensus_net(request, tmp_path_factory):
-    """A 4-validator consensus localnet (opt-in via --consensus), run by tempo-devnet.
+def _init_consensus_devnet(request, base, *, docker: bool):
+    """Build a 4-validator devnet config and run ``tempo-devnet init``.
 
-    Yields the ``ClusterCLI`` for the cluster; tests address nodes by moniker.
+    Returns the resolved ``data_dir``.  In Docker mode the node binary lives in
+    the image (``tempo_bin`` stays the in-image name) and a ``docker-compose.yml``
+    is generated; ``tempo-xtask`` always runs on the host to build genesis + keys.
     """
-    if not request.config.getoption("--consensus"):
-        pytest.skip("consensus localnet not requested (pass --consensus)")
-    if request.config.getoption("--tempo-bin"):
-        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
-
-    base = tmp_path_factory.mktemp("consensus")
     # Random free base ports (baked into genesis) so runs don't collide with each other or a dev node.
     config = {
         "chain_id": 1337,
         "accounts": 200,
         "epoch_length": 100,
         "seed": 0,
-        "tempo_bin": resolve_tempo_bin(),
+        # Docker runs the in-image `tempo`; supervisord runs the host binary.
+        "tempo_bin": "tempo" if docker else resolve_tempo_bin(),
         "tempo_xtask_bin": resolve_xtask_bin(),
         "validators": [
             {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(find_free_base_ports(4))
         ],
     }
+    if docker:
+        config["docker"] = {"image": request.config.getoption("--tempo-image"), "network": "tempo-devnet"}
     config_path = base / "devnet.yaml"
     config_path.write_text(yaml.dump(config, default_flow_style=False))
     data_dir = base / "data"
     try:
-        devnet_init(data=str(data_dir), config=str(config_path), force=True)
+        devnet_init(data=str(data_dir), config=str(config_path), force=True, gen_compose_file=docker)
     except SystemExit as e:  # devnet_init exits on failure; surface it to pytest
         raise RuntimeError(f"tempo-devnet init failed (exit {e.code}); see {base}") from e
+    return data_dir
 
+
+@pytest.fixture(scope="session")
+def consensus_net(request, tmp_path_factory):
+    """A 4-validator consensus localnet, run by tempo-devnet.
+
+    Opt-in: ``--consensus`` (supervisord) or ``--consensus-docker`` (containers).
+    Yields a cluster handle (``ClusterCLI`` or ``DockerCluster``); both expose
+    ``node_rpc_url`` plus ``start_node``/``stop_node``/``start_all``/``stop_all``,
+    so the consensus tests are identical across both backends.
+    """
+    docker = request.config.getoption("--consensus-docker")
+    if not (docker or request.config.getoption("--consensus")):
+        pytest.skip("consensus localnet not requested (pass --consensus or --consensus-docker)")
+    if docker:
+        if shutil.which("docker") is None:
+            pytest.skip("--consensus-docker requested but the docker CLI is not available")
+        # Preflight the image before doing any work: docker would otherwise try to
+        # pull an unknown local tag from a registry and fail with an opaque error.
+        image = request.config.getoption("--tempo-image")
+        if not _docker_image_exists(image):
+            pytest.skip(
+                f"--consensus-docker: image {image!r} not found locally. Build it first, e.g. "
+                f"`docker build -t {image} ../tempo` (or point --tempo-image/$TEMPO_IMAGE at an existing image)."
+            )
+    if request.config.getoption("--tempo-bin"):
+        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
+
+    base = tmp_path_factory.mktemp("consensus-docker" if docker else "consensus")
+    data_dir = _init_consensus_devnet(request, base, docker=docker)
+
+    if docker:
+        yield from _consensus_net_docker(request, base, data_dir)
+    else:
+        yield from _consensus_net_supervisord(request, base, data_dir)
+
+
+def _consensus_net_supervisord(request, base, data_dir):
     cluster = ClusterCLI(data_dir)
     proc: subprocess.Popen | None = None
     try:
@@ -190,6 +249,34 @@ def consensus_net(request, tmp_path_factory):
         yield cluster
     finally:
         _shutdown(cluster, proc)
+        if not request.config.getoption("--keep-data"):
+            shutil.rmtree(base, ignore_errors=True)
+
+
+def _docker_image_exists(image: str) -> bool:
+    return subprocess.run(["docker", "image", "inspect", image], capture_output=True, text=True).returncode == 0
+
+
+def _consensus_net_docker(request, base, data_dir):
+    cluster = DockerCluster(data_dir)
+    try:
+        try:
+            cluster.up()
+            _wait_for_finalization(cluster)
+        except (RuntimeError, TimeoutError, subprocess.CalledProcessError) as e:
+            # Surface docker's own stderr (e.g. compose/up failures) and any
+            # container logs — otherwise the real reason is swallowed.
+            detail = ""
+            if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+                detail += f"\n[compose stderr]\n{e.stderr.strip()}"
+            logs = cluster.logs(tail=40)
+            if logs.strip():
+                detail += f"\n[container logs]\n{logs.strip()}"
+            cluster.down()
+            raise RuntimeError(f"docker consensus localnet failed to start/finalize:{detail or ' (no output)'}") from e
+        yield cluster
+    finally:
+        cluster.down()
         if not request.config.getoption("--keep-data"):
             shutil.rmtree(base, ignore_errors=True)
 
