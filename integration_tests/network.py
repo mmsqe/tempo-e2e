@@ -89,7 +89,7 @@ class TempoNode:
         p2p_port: int | None = None,
         genesis: Path | None = None,
         binary: list[str] | None = None,
-        block_time: str = "1sec",
+        block_time: str | None = None,
     ):
         self.datadir = Path(datadir)
         self.log_path = Path(log_path)
@@ -100,7 +100,7 @@ class TempoNode:
         self.auth_port = free_port()
         self.genesis = Path(genesis) if genesis else default_genesis()
         self.binary = binary or resolve_binary()
-        self.block_time = block_time
+        self.block_time = block_time or os.environ.get("TEMPO_BLOCK_TIME", "50ms")
         self.proc: subprocess.Popen | None = None
         self.chain_id: int | None = None
 
