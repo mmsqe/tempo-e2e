@@ -39,7 +39,7 @@ def tempo(request, tmp_path_factory):
         yield node
     finally:
         node.stop()
-        if not request.config.getoption("--keep-data"):
+        if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
 
 
@@ -227,7 +227,7 @@ def _consensus_net_supervisord(request, base, data_dir):
         yield cluster
     finally:
         _shutdown(cluster, proc)
-        if not request.config.getoption("--keep-data"):
+        if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
 
 
@@ -254,8 +254,8 @@ def _consensus_net_docker(request, base, data_dir):
             raise RuntimeError(f"docker consensus localnet failed to start/finalize:{detail or ' (no output)'}") from e
         yield cluster
     finally:
-        cluster.down()
-        if not request.config.getoption("--keep-data"):
+        cluster.down()  # node.log already streamed to each node dir (bind mount)
+        if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
 
 

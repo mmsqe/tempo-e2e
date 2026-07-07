@@ -26,6 +26,9 @@ these tests skip, since a `--dev` node does not serve `consensus_*`.
 tolerates one fault). The fault-tolerance tests derive how many nodes to stop
 from `N` (BFT `N = 3f + 1`) and skip when `N < 4`.
 
+The datadir is kept after each run (pass `--clean-data` to wipe it). Every node
+keeps its chain data and a live `node.log` you can `tail -f` mid-run.
+
 ### Docker mode
 
 `make test-consensus-docker` (or `pytest -m consensus --consensus-docker`) runs

@@ -33,6 +33,18 @@ class DockerCluster:
         self._run("down", "-t", "5", check=False)
 
     def logs(self, tail: int = 80) -> str:
+        # docker-run.sh streams each node's stdout+stderr to <node_dir>/node.log,
+        # so read the tail of those files.
+        chunks = []
+        for val in self._cli.config.validators:
+            log = self.data_dir / val.dir_name / "node.log"
+            if not log.exists():
+                continue
+            tail_lines = log.read_text(errors="replace").splitlines()[-tail:]
+            chunks.append(f"=== {val.moniker} ===\n" + "\n".join(tail_lines))
+        if chunks:
+            return "\n\n".join(chunks)
+        # Fallback for a tempo-py without the node.log redirect: docker's own logs.
         return self._run("logs", "--no-color", "--tail", str(tail), check=False).stdout
 
     def crashed(self) -> list[str]:

@@ -4,7 +4,12 @@ import os
 def pytest_addoption(parser):
     group = parser.getgroup("tempo")
     group.addoption("--tempo-bin", default=None, help="Path to the tempo node binary")
-    group.addoption("--keep-data", action="store_true", default=False, help="Keep the node datadir after the run")
+    group.addoption(
+        "--clean-data",
+        action="store_true",
+        default=False,
+        help="Remove the node datadir after the run (kept by default for inspection)",
+    )
     group.addoption(
         "--consensus",
         action="store_true",
