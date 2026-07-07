@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Download the tempo node binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Newest node release (v-prefixed tag, not the per-crate `tempo-*@x.y.z` tags).
+          tag=$(gh api "repos/tempoxyz/tempo/releases?per_page=40" \
+            -q 'map(select(.tag_name | test("^v[0-9]"))) | .[0].tag_name')
+          target="x86_64-unknown-linux-gnu"
+          asset="tempo-${tag}-${target}.tar.gz"
+          echo "Using tempo ${tag}"
+          gh release download "$tag" --repo tempoxyz/tempo -p "$asset" -D "$RUNNER_TEMP/tempo"
+          tar -xzf "$RUNNER_TEMP/tempo/$asset" -C "$RUNNER_TEMP/tempo"
+          # the archive holds a single file named tempo-<tag>-<target> (the binary)
+          bin=$(find "$RUNNER_TEMP/tempo" -type f -name "tempo-${tag}-${target}" | head -1)
+          chmod +x "$bin"
+          echo "TEMPO_BIN=$bin" >> "$GITHUB_ENV"
+
+      # The dev-node tests only; the consensus localnet needs tempo-xtask, which
+      # is not published in releases (build from source to run those locally).
+      - name: Test
+        run: uv run --all-extras pytest -m "not consensus"
