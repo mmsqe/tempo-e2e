@@ -45,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
-      - name: Download the tempo node binary
+      - name: Download the tempo node binary + genesis
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -62,6 +62,13 @@ jobs:
           bin=$(find "$RUNNER_TEMP/tempo" -type f -name "tempo-${tag}-${target}" | head -1)
           chmod +x "$bin"
           echo "TEMPO_BIN=$bin" >> "$GITHUB_ENV"
+          # The dev genesis matching the binary's release. Not in the release archive and
+          # there's no ../tempo source checkout, so fetch it (self-contained JSON) and point
+          # the harness at it via TEMPO_GENESIS.
+          genesis="$RUNNER_TEMP/tempo/test-genesis.json"
+          curl -fsSL -o "$genesis" \
+            "https://raw.githubusercontent.com/tempoxyz/tempo/${tag}/crates/node/tests/assets/test-genesis.json"
+          echo "TEMPO_GENESIS=$genesis" >> "$GITHUB_ENV"
 
       # The dev-node tests only; the consensus localnet needs tempo-xtask, which
       # is not published in releases (build from source to run those locally).
