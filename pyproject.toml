@@ -29,6 +29,11 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["integration_tests"]
 python_files = ["test_*.py"]
 addopts = "-ra"
+filterwarnings = [
+    # web3's AsyncHTTPProvider passes enable_cleanup_closed=True to aiohttp, a no-op that
+    # warns on Python >= 3.12.7 where the CPython bug it worked around is fixed.
+    "ignore:enable_cleanup_closed ignored:DeprecationWarning",
+]
 markers = [
     "slow: long-running tests",
     "tempo: tempo-native feature tests (TIP-20, AA tx, access keys, fees)",
