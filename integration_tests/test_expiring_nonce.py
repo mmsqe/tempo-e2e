@@ -4,9 +4,18 @@ replay protection is hash-based and the protocol (key 0) nonce is untouched.
 
 import pytest
 from tempo import Signer, serialize, sign_transaction
-from tempo.constants import EXPIRING_NONCE_KEY, PATH_USD
+from tempo.constants import PATH_USD
 
-from .utils import build_tempo_tx, fund, latest_timestamp, new_account, send_tempo_tx, suggested_max_fee, transfer_call
+from .utils import (
+    EXPIRING_NONCE_KEY,
+    build_tempo_tx,
+    fund,
+    latest_timestamp,
+    new_account,
+    send_tempo_tx,
+    suggested_max_fee,
+    transfer_call,
+)
 
 pytestmark = pytest.mark.tempo
 

@@ -9,7 +9,7 @@ from tempo import Signer
 from tempo.constants import PATH_USD
 from tempo.contracts import ACCOUNT_KEYCHAIN as KC
 from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
-from tempo.keychain import TokenLimit, sign_tx_access_key, sign_tx_registered_key
+from tempo.keychain import TokenLimit, sign_tx_access_key
 
 from .utils import (
     build_tempo_tx,
@@ -20,6 +20,7 @@ from .utils import (
     prepare_tx,
     send_call,
     send_signed,
+    sign_tx_registered_key,
     transfer_call,
 )
 

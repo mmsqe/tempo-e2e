@@ -18,6 +18,9 @@ from tempo.constants import (
     THETA_USD,
     TIP20_FACTORY_ADDRESS,
 )
+from tempo.keychain import KeychainSignature
+from tempo.transaction import get_sign_payload
+from tempo.types import as_address
 from web3 import AsyncWeb3
 
 from .abi import FEE, NONCE, TIP20_FACTORY, TIP20_ROLES
@@ -29,6 +32,9 @@ STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_US
 ISSUER_ROLE = keccak(text="ISSUER_ROLE")  # TIP-20 mint role
 
 MAX_UINT = 2**256 - 1  # unlimited ERC-20 approval
+# TIP-1009 expiring nonces: the reserved nonce key (uint256 max). A tx on this key
+# must carry nonce=0 and a valid_before within 30s; replay protection is hash-based.
+EXPIRING_NONCE_KEY = 2**256 - 1
 DEFAULT_GAS_LIMIT = 2_000_000
 DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
 DEFAULT_MAX_FEE_PER_GAS = 100_000_000_000
@@ -134,6 +140,18 @@ async def send_signed(w3: AsyncWeb3, signed, timeout: float = 60.0):
     """Broadcast an already-signed tempo tx and await its receipt."""
     raw = serialize(signed)
     return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw), timeout=timeout)
+
+
+def sign_tx_registered_key(tx, access_key_sk: str, account):
+    """Sign ``tx`` with an access key already authorized on-chain.
+
+    A bare Keychain V2 signature with no inline authorization: the node resolves
+    the key from ``account``'s stored keychain, so only the root's address is
+    needed, not its private key.
+    """
+    root_addr = as_address(account)
+    inner = Signer(access_key_sk).sign(KeychainSignature.signing_hash(get_sign_payload(tx), root_addr))
+    return tx._replace_fields(sender_signature=KeychainSignature.from_inner(inner, root_addr), sender_address=root_addr)
 
 
 async def prepare_tx(w3: AsyncWeb3, chain_id: int, sender, calls: Sequence[dict], *, gas_limit: int = STATE_WRITE_GAS):
