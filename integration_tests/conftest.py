@@ -240,6 +240,7 @@ def _consensus_net_docker(request, base, data_dir):
     try:
         try:
             cluster.up()
+            cluster.start_log_followers()  # stream each container's logs to <node>/node.log
             _wait_for_finalization(cluster)
         except (RuntimeError, TimeoutError, subprocess.CalledProcessError) as e:
             # Surface docker's own stderr (e.g. compose/up failures) and any
@@ -250,11 +251,11 @@ def _consensus_net_docker(request, base, data_dir):
             logs = cluster.logs(tail=40)
             if logs.strip():
                 detail += f"\n[container logs]\n{logs.strip()}"
-            cluster.down()
             raise RuntimeError(f"docker consensus localnet failed to start/finalize:{detail or ' (no output)'}") from e
         yield cluster
     finally:
-        cluster.down()  # node.log already streamed to each node dir (bind mount)
+        cluster.stop_log_followers()
+        cluster.down()
         if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
 

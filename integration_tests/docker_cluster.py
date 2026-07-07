@@ -21,10 +21,13 @@ class DockerCluster:
         # basename ("data") and ``ps -a`` reports a prior run's exited containers.
         digest = hashlib.sha1(str(self.data_dir).encode()).hexdigest()[:8]
         self.project = f"tempo-devnet-{digest}"
+        self._log_followers: list[tuple[subprocess.Popen, object]] = []
+
+    def _cmd(self, *args: str) -> list[str]:
+        return ["docker", "compose", "-p", self.project, "-f", str(self.compose_file), *args]
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        cmd = ["docker", "compose", "-p", self.project, "-f", str(self.compose_file), *args]
-        return subprocess.run(cmd, capture_output=True, text=True, check=check)
+        return subprocess.run(self._cmd(*args), capture_output=True, text=True, check=check)
 
     def up(self) -> None:
         self._run("up", "-d")
@@ -33,19 +36,30 @@ class DockerCluster:
         self._run("down", "-t", "5", check=False)
 
     def logs(self, tail: int = 80) -> str:
-        # docker-run.sh streams each node's stdout+stderr to <node_dir>/node.log,
-        # so read the tail of those files.
-        chunks = []
-        for val in self._cli.config.validators:
-            log = self.data_dir / val.dir_name / "node.log"
-            if not log.exists():
-                continue
-            tail_lines = log.read_text(errors="replace").splitlines()[-tail:]
-            chunks.append(f"=== {val.moniker} ===\n" + "\n".join(tail_lines))
-        if chunks:
-            return "\n\n".join(chunks)
-        # Fallback for a tempo-py without the node.log redirect: docker's own logs.
         return self._run("logs", "--no-color", "--tail", str(tail), check=False).stdout
+
+    def start_log_followers(self) -> None:
+        for val in self._cli.config.validators:
+            node_dir = self.data_dir / val.dir_name
+            if not node_dir.is_dir():
+                continue
+            handle = open(node_dir / "node.log", "w")
+            proc = subprocess.Popen(
+                self._cmd("logs", "-f", "--no-color", "--no-log-prefix", val.moniker),
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+            )
+            self._log_followers.append((proc, handle))
+
+    def stop_log_followers(self) -> None:
+        for proc, handle in self._log_followers:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            handle.close()
+        self._log_followers = []
 
     def crashed(self) -> list[str]:
         """Services whose container has exited."""

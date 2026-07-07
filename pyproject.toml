@@ -21,7 +21,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-tempo-py = { git = "https://github.com/yihuang/tempo-py.git", branch = "docker_log" }
+tempo-py = { git = "https://github.com/yihuang/tempo-py.git", branch = "main" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
