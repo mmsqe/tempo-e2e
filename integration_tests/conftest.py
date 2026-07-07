@@ -26,29 +26,6 @@ if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     tempfile.tempdir = "/tmp"
 
 
-def pytest_addoption(parser):
-    group = parser.getgroup("tempo")
-    group.addoption("--tempo-bin", default=None, help="Path to the tempo node binary")
-    group.addoption("--keep-data", action="store_true", default=False, help="Keep the node datadir after the run")
-    group.addoption(
-        "--consensus",
-        action="store_true",
-        default=False,
-        help="Launch the multi-validator consensus localnet for consensus-marked tests",
-    )
-    group.addoption(
-        "--consensus-docker",
-        action="store_true",
-        default=False,
-        help="Run the consensus localnet in Docker containers (docker compose) instead of supervisord",
-    )
-    group.addoption(
-        "--tempo-image",
-        default=os.environ.get("TEMPO_IMAGE", "tempo:latest"),
-        help="Docker image for validator containers in --consensus-docker mode",
-    )
-
-
 @pytest.fixture(scope="session")
 def tempo(request, tmp_path_factory):
     """A locally launched tempo dev node, torn down at the end of the session."""
@@ -169,6 +146,7 @@ def _init_consensus_devnet(request, base, *, docker: bool):
     the image (``tempo_bin`` stays the in-image name) and a ``docker-compose.yml``
     is generated; ``tempo-xtask`` always runs on the host to build genesis + keys.
     """
+    n = request.config.getoption("--consensus-validators")
     # Random free base ports (baked into genesis) so runs don't collide with each other or a dev node.
     config = {
         "chain_id": 1337,
@@ -179,7 +157,7 @@ def _init_consensus_devnet(request, base, *, docker: bool):
         "tempo_bin": "tempo" if docker else resolve_tempo_bin(),
         "tempo_xtask_bin": resolve_xtask_bin(),
         "validators": [
-            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(find_free_base_ports(4))
+            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(find_free_base_ports(n))
         ],
     }
     if docker:
@@ -279,6 +257,12 @@ def _consensus_net_docker(request, base, data_dir):
         cluster.down()
         if not request.config.getoption("--keep-data"):
             shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def num_validators(request) -> int:
+    """Validator count of the consensus localnet (see ``--consensus-validators``)."""
+    return request.config.getoption("--consensus-validators")
 
 
 @pytest.fixture

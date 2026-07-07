@@ -22,6 +22,10 @@ distinct ports (`--consensus.bypass-ip-check`, no loopback aliases needed). It
 needs `tempo-xtask` built (`cargo build -p tempo-xtask`). Without `--consensus`
 these tests skip, since a `--dev` node does not serve `consensus_*`.
 
+`--consensus-validators N` sets the validator count (default 4, the minimum that
+tolerates one fault). The fault-tolerance tests derive how many nodes to stop
+from `N` (BFT `N = 3f + 1`) and skip when `N < 4`.
+
 ### Docker mode
 
 `make test-consensus-docker` (or `pytest -m consensus --consensus-docker`) runs

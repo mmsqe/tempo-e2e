@@ -73,33 +73,48 @@ def _wait_height(rpc_url: str, target: int, timeout: float = 60.0) -> int:
     return _height(rpc_url)
 
 
+def _max_faults(n: int) -> int:
+    """Validators that can be offline while consensus keeps quorum (BFT: n = 3f + 1)."""
+    return (n - 1) // 3
+
+
 # Runs last (after the RPC tests) and restores the network, since it disrupts the shared localnet.
-def test_chain_survives_validator_restart(consensus_net):
-    """Chain keeps finalizing with one validator down (3/4 quorum), and it rejoins (P0-02)."""
-    primary = consensus_net.node_rpc_url("node0")  # node0 stays up throughout
+def test_chain_survives_validator_restart(consensus_net, num_validators):
+    """Chain keeps finalizing with the max tolerable validators down, then they rejoin (P0-02)."""
+    f = _max_faults(num_validators)
+    if f < 1:
+        pytest.skip(f"need >=4 validators to tolerate a fault (have {num_validators})")
+    victims = [f"node{i}" for i in range(1, f + 1)]  # node0 stays up as the observer
+    primary = consensus_net.node_rpc_url("node0")
     start = _height(primary)
 
-    consensus_net.stop_node("node1")
-    assert _wait_height(primary, start + 3) >= start + 3, "chain halted with one validator down"
+    for v in victims:
+        consensus_net.stop_node(v)
+    assert _wait_height(primary, start + 3) >= start + 3, f"chain halted with {f} validator(s) down"
     progressed = _height(primary)
 
-    consensus_net.start_node("node1")
-    rejoined = consensus_net.node_rpc_url("node1")
+    for v in victims:
+        consensus_net.start_node(v)
+    rejoined = consensus_net.node_rpc_url(victims[-1])
     assert _wait_height(rejoined, progressed) >= progressed, "restarted validator did not catch up"
 
 
-def test_chain_halts_without_quorum_and_recovers(consensus_net):
-    """2 of 4 validators down (below the 3/4 quorum) halts the chain; it recovers on restart"""
-    primary = consensus_net.node_rpc_url("node0")  # node0 stays up
-    consensus_net.stop_node("node1")
-    consensus_net.stop_node("node2")
+def test_chain_halts_without_quorum_and_recovers(consensus_net, num_validators):
+    """One validator past the fault threshold halts the chain; it recovers on restart."""
+    f = _max_faults(num_validators)
+    if f < 1:
+        pytest.skip(f"need >=4 validators to lose quorum meaningfully (have {num_validators})")
+    victims = [f"node{i}" for i in range(1, f + 2)]  # f+1 down → below quorum; node0 stays
+    primary = consensus_net.node_rpc_url("node0")
+    for v in victims:
+        consensus_net.stop_node(v)
     time.sleep(3)  # let any in-flight blocks finalize, then the height should freeze
     halted = _height(primary)
     time.sleep(8)
     assert _height(primary) == halted, "chain advanced without a quorum"
 
-    consensus_net.start_node("node1")
-    consensus_net.start_node("node2")
+    for v in victims:
+        consensus_net.start_node(v)
     assert _wait_height(primary, halted + 2) >= halted + 2, "chain did not recover after restart"
 
 
@@ -111,6 +126,6 @@ def test_full_network_failure_and_recovery(consensus_net):
     consensus_net.stop_all()
     consensus_net.start_all()
 
-    # A cold 4-node restart re-forms consensus from scratch, which can take
-    # longer than a single-validator rejoin, so allow extra recovery time.
+    # A cold restart re-forms consensus from scratch, which can take longer than
+    # a single-validator rejoin, so allow extra recovery time.
     assert _wait_height(primary, before + 2, timeout=120) >= before + 2, "chain did not recover after a full restart"
