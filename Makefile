@@ -1,4 +1,4 @@
-.PHONY: install test test-tempo test-consensus lint fmt node-up node-down
+.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down
 
 BIN := .venv/bin
 
@@ -16,6 +16,11 @@ test-tempo:
 # Consensus RPC tests against a 4-validator localnet (needs tempo-xtask built).
 test-consensus:
 	$(BIN)/pytest -m consensus --consensus -vv
+
+# Same consensus tests, but the validators run in Docker (needs tempo-xtask built
+# on the host and a `tempo:latest` image; override with TEMPO_IMAGE=...).
+test-consensus-docker:
+	$(BIN)/pytest -m consensus --consensus-docker -vv
 
 lint:
 	$(BIN)/ruff check integration_tests
