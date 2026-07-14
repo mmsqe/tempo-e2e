@@ -46,31 +46,26 @@ jobs:
         run: uv sync --all-extras
 
       - name: Download the tempo node binary + genesis
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Newest node release (v-prefixed tag, not the per-crate `tempo-*@x.y.z` tags).
-          tag=$(gh api "repos/tempoxyz/tempo/releases?per_page=40" \
-            -q 'map(select(.tag_name | test("^v[0-9]"))) | .[0].tag_name')
-          target="x86_64-unknown-linux-gnu"
-          asset="tempo-${tag}-${target}.tar.gz"
-          echo "Using tempo ${tag}"
-          gh release download "$tag" --repo tempoxyz/tempo -p "$asset" -D "$RUNNER_TEMP/tempo"
-          tar -xzf "$RUNNER_TEMP/tempo/$asset" -C "$RUNNER_TEMP/tempo"
-          # the archive holds a single file named tempo-<tag>-<target> (the binary)
-          bin=$(find "$RUNNER_TEMP/tempo" -type f -name "tempo-${tag}-${target}" | head -1)
-          chmod +x "$bin"
-          echo "TEMPO_BIN=$bin" >> "$GITHUB_ENV"
-          # The dev genesis matching the binary's release. Not in the release archive and
-          # there's no ../tempo source checkout, so fetch it (self-contained JSON) and point
-          # the harness at it via TEMPO_GENESIS.
-          genesis="$RUNNER_TEMP/tempo/test-genesis.json"
+          # Track main, same image as --consensus-docker.
+          image="ghcr.io/tempoxyz/tempo:latest"
+          dir="$RUNNER_TEMP/tempo"
+          mkdir -p "$dir"
+          docker pull -q "$image"
+          cid=$(docker create "$image")  # the binary only ships inside the image
+          docker cp "$cid:/usr/local/bin/tempo" "$dir/tempo"
+          docker rm -v "$cid" > /dev/null
+          chmod +x "$dir/tempo"
+          "$dir/tempo" --version
+          echo "TEMPO_BIN=$dir/tempo" >> "$GITHUB_ENV"
+          # The matching dev genesis (every hardfork at block 0); not shipped in the image.
+          genesis="$dir/test-genesis.json"
           curl -fsSL -o "$genesis" \
-            "https://raw.githubusercontent.com/tempoxyz/tempo/${tag}/crates/node/tests/assets/test-genesis.json"
+            "https://raw.githubusercontent.com/tempoxyz/tempo/main/crates/node/tests/assets/test-genesis.json"
           echo "TEMPO_GENESIS=$genesis" >> "$GITHUB_ENV"
 
-      # The dev-node tests only; the consensus localnet needs tempo-xtask, which
-      # is not published in releases (build from source to run those locally).
+      # The dev-node tests only; the consensus localnet also needs tempo-xtask, which
+      # this image does not ship (build from source to run those locally).
       - name: Test
         run: uv run --all-extras pytest -m "not consensus"
