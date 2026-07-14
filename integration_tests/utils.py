@@ -246,8 +246,20 @@ def token_from_receipt(receipt, factory: str = TIP20_FACTORY_ADDRESS) -> str:
     return AsyncWeb3.to_checksum_address(HexBytes(log["topics"][1])[-20:])
 
 
-async def create_token(w3: AsyncWeb3, *, chain_id: int, admin, quote: str = PATH_USD, name: str = "TUSD", mint=None):
+async def create_token(
+    w3: AsyncWeb3,
+    *,
+    chain_id: int,
+    admin,
+    quote: str = PATH_USD,
+    name: str = "TUSD",
+    mint=None,
+    salt: bytes = bytes(32),
+):
     """Create a TIP-20 via the factory; optionally grant issuer and mint ``(holder, amount)``.
+
+    The address is derived from ``admin`` and ``salt``, so creating more than one token from
+    the same admin needs distinct salts.
 
     Returns the new token address (read from the factory's TokenCreated event).
     """
@@ -259,7 +271,7 @@ async def create_token(w3: AsyncWeb3, *, chain_id: int, admin, quote: str = PATH
         calls=[
             {
                 "to": TIP20_FACTORY_ADDRESS,
-                "data": TIP20_FACTORY.fns.createToken(name, name, "USD", quote, admin.address, bytes(32)).data,
+                "data": TIP20_FACTORY.fns.createToken(name, name, "USD", quote, admin.address, salt).data,
             }
         ],
     )

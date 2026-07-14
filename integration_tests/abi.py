@@ -24,6 +24,11 @@ DEX = Contract.from_abi(
         "function priceToTick(uint32 price) pure returns (int16)",
         "function MIN_ORDER_AMOUNT() pure returns (uint128)",
         "function storageCredits(address user) view returns (uint64)",  # TIP-1064 reusable-order credits
+        # TIP-1087 (T8+): a book carries a compact index into the append-only book_keys vector,
+        # so orders can store the 4-byte index instead of the 32-byte key.
+        "function bookIndexForKey(bytes32 bookKey) view returns (bool set, uint32 index)",
+        "function bookKeyForIndex(uint32 index) view returns (bytes32 bookKey)",
+        "function setBookIndex(uint32 index)",
     ]
 )
 
