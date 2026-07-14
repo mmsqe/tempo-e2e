@@ -38,13 +38,18 @@ host; the node binary comes from the image (default `tempo:latest`, override wit
 `TEMPO_IMAGE` / `--tempo-image`). RPC ports are published to the host, so the
 tests are backend-agnostic. Skips if `docker` is missing or the image is absent.
 
-The image must match the host `tempo-xtask` version, so pull a matching tag
-instead of building — e.g. for a `v1.10.1` checkout:
+The image must match the host `tempo-xtask` version. Pull it from
+[ghcr.io/tempoxyz/tempo](https://github.com/tempoxyz/tempo/pkgs/container/tempo)
+instead of building — `latest` tracks the newest `main` build, so it pairs with a
+`tempo-xtask` built from an up-to-date checkout:
 
 ```bash
-docker pull tempoxyz/tempo:1.10.1 && docker tag tempoxyz/tempo:1.10.1 tempo:latest
+docker pull ghcr.io/tempoxyz/tempo:latest && docker tag ghcr.io/tempoxyz/tempo:latest tempo:latest
 make test-consensus-docker
 ```
+
+If your `tempo-xtask` comes from an older checkout, pull that release's tag
+(e.g. `ghcr.io/tempoxyz/tempo:1.10.1`) rather than `latest`.
 
 ## Markers
 

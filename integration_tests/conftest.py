@@ -192,8 +192,9 @@ def consensus_net(request, tmp_path_factory):
         image = request.config.getoption("--tempo-image")
         if not _docker_image_exists(image):
             pytest.skip(
-                f"--consensus-docker: image {image!r} not found locally. Build it first, e.g. "
-                f"`docker build -t {image} ../tempo` (or point --tempo-image/$TEMPO_IMAGE at an existing image)."
+                f"--consensus-docker: image {image!r} not found locally. Pull it first, e.g. "
+                f"`docker pull ghcr.io/tempoxyz/tempo:latest && docker tag ghcr.io/tempoxyz/tempo:latest {image}` "
+                f"(or point --tempo-image/$TEMPO_IMAGE at an existing image)."
             )
     if request.config.getoption("--tempo-bin"):
         os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
