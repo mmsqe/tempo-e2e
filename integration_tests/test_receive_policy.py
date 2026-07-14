@@ -12,9 +12,11 @@ from tempo.constants import RECEIVE_POLICY_GUARD_ADDRESS as GUARD_ADDR
 from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
 from .abi import RECEIVE_POLICY_GUARD as GUARD
-from .abi import TIP20, TIP20_ROLES, TIP403
+from .abi import TIP20_ROLES, TIP403
 from .utils import (
     STATE_WRITE_GAS,
+    WHITELIST,
+    blacklist_token,
     call_revert,
     create_token,
     fund,
@@ -29,7 +31,6 @@ pytestmark = pytest.mark.tempo
 
 ZERO_ADDR = "0x" + "00" * 20
 REJECT_ALL, ALLOW_ALL = 0, 1  # built-in TIP-403 policy ids
-WHITELIST, BLACKLIST = 0, 1  # PolicyType
 TOKEN_FILTER, RECEIVE_POLICY = 1, 2  # BlockedReason
 BURN_BLOCKED_ROLE = keccak(text="BURN_BLOCKED_ROLE")
 
@@ -68,23 +69,6 @@ async def _whitelist_policy(w3, chain_id, admin, member):
         calls=[
             {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, WHITELIST).data},
             {"to": REGISTRY, "data": TIP403.fns.modifyPolicyWhitelist(pid, member, True).data},
-        ],
-    )
-    return pid
-
-
-async def _blacklist_on_token(w3, chain_id, admin, token, blocked):
-    """Bind ``token``'s transfer policy to a fresh BLACKLIST policy that rejects ``blocked``."""
-    pid = await TIP403.fns.policyIdCounter().call(w3, to=REGISTRY)
-    await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=admin.key.hex(),
-        gas_limit=STATE_WRITE_GAS,
-        calls=[
-            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, BLACKLIST).data},
-            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyBlacklist(pid, blocked, True).data},
-            {"to": token, "data": TIP20.fns.changeTransferPolicyId(pid).data},
         ],
     )
     return pid
@@ -161,7 +145,7 @@ async def test_burn_blocked_receipt(w3, chain_id, funded_account):
 
     # bind the token to a policy that makes the subject (receiver) unauthorized as a sender,
     # a precondition for burning the escrowed funds
-    await _blacklist_on_token(w3, chain_id, admin, token, receiver.address)
+    await blacklist_token(w3, chain_id=chain_id, admin=admin, token=token, blocked=receiver.address)
 
     supply_before = await ERC20.fns.totalSupply().call(w3, to=token)
     await send_call(w3, chain_id, admin, GUARD_ADDR, GUARD.fns.burnBlockedReceipt(witness).data)
@@ -321,7 +305,7 @@ async def test_resume_claim_enforces_token_transfer_policy(w3, chain_id, funded_
     _amount, witness = await _block_transfer(w3, chain_id, sender, receiver, 6000, token)
 
     # after escrow, bind the token to a policy that blocks the receiver as a recipient
-    await _blacklist_on_token(w3, chain_id, admin, token, receiver.address)
+    await blacklist_token(w3, chain_id=chain_id, admin=admin, token=token, blocked=receiver.address)
     # resume skips the receive-policy recheck but still enforces the token's TIP-403 destination check
     reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data, sender=receiver.address)
     assert "PolicyForbids" in reason

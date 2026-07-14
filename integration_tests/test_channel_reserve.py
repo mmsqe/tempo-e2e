@@ -7,11 +7,18 @@ import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 from tempo.constants import TIP20_CHANNEL_RESERVE_ADDRESS as CR_ADDR
-from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
-from .abi import TIP20, TIP403
 from .abi import TIP20_CHANNEL_RESERVE as CR
-from .utils import STATE_WRITE_GAS, call_revert, create_token, fund, new_account, send_call, send_calls
+from .utils import (
+    STATE_WRITE_GAS,
+    blacklist_token,
+    call_revert,
+    create_token,
+    fund,
+    new_account,
+    send_call,
+    send_calls,
+)
 
 pytestmark = pytest.mark.tempo
 
@@ -19,7 +26,6 @@ pytestmark = pytest.mark.tempo
 
 ZERO_ADDR = "0x" + "00" * 20
 SALT = bytes(32)
-BLACKLIST = 1  # ITIP403Registry.PolicyType.BLACKLIST
 
 
 async def _send(w3, chain_id, signer, data):
@@ -256,19 +262,7 @@ async def test_open_respects_token_transfer_policy(w3, chain_id, funded_account)
     blocked, allowed = new_account().address, new_account().address
     token = await create_token(w3, chain_id=chain_id, admin=admin, mint=(payer.address, 20_000))
 
-    # bind the token to a policy that blacklists `blocked`
-    pid = await TIP403.fns.policyIdCounter().call(w3, to=REGISTRY)
-    await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=admin.key.hex(),
-        gas_limit=STATE_WRITE_GAS,
-        calls=[
-            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, BLACKLIST).data},
-            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyBlacklist(pid, blocked, True).data},
-            {"to": token, "data": TIP20.fns.changeTransferPolicyId(pid).data},
-        ],
-    )
+    await blacklist_token(w3, chain_id=chain_id, admin=admin, token=token, blocked=blocked)
 
     # opening to a policy-blocked payee fails the recipient admission check
     blocked_open = CR.fns.open(blocked, ZERO_ADDR, token, 5000, SALT, ZERO_ADDR).data

@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from tempo.devnet.cluster import ClusterCLI
+from tempo.devnet.config import DevnetConfig
 from tempo.devnet.supervisor import DOCKER_CONFIG_FILE
 
 
@@ -75,6 +76,10 @@ class DockerCluster:
             return parsed if isinstance(parsed, list) else [parsed]
         except json.JSONDecodeError:
             return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+    @property
+    def config(self) -> DevnetConfig:
+        return self._cli.config
 
     def node_rpc_url(self, moniker: str) -> str:
         return self._cli.node_rpc_url(moniker)

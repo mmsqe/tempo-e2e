@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Sequence
 
 from eth_account import Account
@@ -17,17 +18,22 @@ from tempo.constants import (
     PATH_USD,
     THETA_USD,
     TIP20_FACTORY_ADDRESS,
+    TIP403_REGISTRY_ADDRESS,
 )
 from tempo.keychain import KeychainSignature
 from tempo.transaction import get_sign_payload
 from tempo.types import as_address
 from web3 import AsyncWeb3
 
-from .abi import FEE, NONCE, TIP20_FACTORY, TIP20_ROLES
+from .abi import FEE, NONCE, TIP20, TIP20_FACTORY, TIP20_ROLES, TIP403
 from .network import FAUCET_PRIVATE_KEY
 
 # The four enshrined TIP-20 stablecoins, by symbol.
 STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_USD, "THETA_USD": THETA_USD}
+
+# ITIP403Registry.PolicyType. A whitelist authorizes only its members; a blacklist
+# authorizes everyone except its members.
+WHITELIST, BLACKLIST = 0, 1
 
 ISSUER_ROLE = keccak(text="ISSUER_ROLE")  # TIP-20 mint role
 
@@ -225,6 +231,15 @@ async def latest_timestamp(w3: AsyncWeb3) -> int:
     return (await w3.eth.get_block("latest"))["timestamp"]
 
 
+async def wait_for_block(w3: AsyncWeb3, number: int, *, timeout: float = 300.0, poll: float = 0.5) -> int:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while (height := await w3.eth.block_number) < number:
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError(f"chain stalled at block {height} after {timeout}s, waiting for {number}")
+        await asyncio.sleep(poll)
+    return height
+
+
 def token_from_receipt(receipt, factory: str = TIP20_FACTORY_ADDRESS) -> str:
     """The new token address from the factory's TokenCreated event (indexed topic 1)."""
     log = next(lg for lg in receipt["logs"] if lg["address"].lower() == factory.lower())
@@ -264,6 +279,28 @@ async def create_token(w3: AsyncWeb3, *, chain_id: int, admin, quote: str = PATH
         )
         assert minted["status"] == 1
     return token
+
+
+async def blacklist_token(w3: AsyncWeb3, *, chain_id: int, admin, token: str, blocked: str) -> int:
+    """Bind ``token``'s transfer policy to a fresh BLACKLIST policy that rejects ``blocked``."""
+    policy_id = await TIP403.fns.policyIdCounter().call(w3, to=TIP403_REGISTRY_ADDRESS)
+    await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=admin.key.hex(),
+        gas_limit=STATE_WRITE_GAS,
+        calls=[
+            {"to": TIP403_REGISTRY_ADDRESS, "data": TIP403.fns.createPolicy(admin.address, BLACKLIST).data},
+            {
+                "to": TIP403_REGISTRY_ADDRESS,
+                "data": TIP403.fns.modifyPolicyBlacklist(policy_id, blocked, True).data,
+            },
+            {"to": token, "data": TIP20.fns.changeTransferPolicyId(policy_id).data},
+        ],
+    )
+    assert await TIP20.fns.transferPolicyId().call(w3, to=token) == policy_id
+    assert not await TIP403.fns.isAuthorized(policy_id, blocked).call(w3, to=TIP403_REGISTRY_ADDRESS)
+    return policy_id
 
 
 async def fund_token(

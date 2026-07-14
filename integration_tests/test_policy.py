@@ -6,11 +6,9 @@ from hexbytes import HexBytes
 from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
 from .abi import TIP403
-from .utils import STATE_WRITE_GAS, call_revert, new_account, send_calls
+from .utils import BLACKLIST, STATE_WRITE_GAS, WHITELIST, call_revert, new_account, send_calls
 
 pytestmark = pytest.mark.tempo
-
-WHITELIST, BLACKLIST = 0, 1  # ITIP403Registry.PolicyType
 
 
 async def _registry_tx(w3, chain_id, account, data):

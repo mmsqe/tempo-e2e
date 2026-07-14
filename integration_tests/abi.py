@@ -1,6 +1,7 @@
 """ABIs for tempo precompiles. Standard token ops reuse ``eth_contract.erc20.ERC20``."""
 
 from eth_contract import Contract
+from eth_utils import to_checksum_address
 
 # 2D nonce precompile (INonce). Nonce key 0 is the protocol nonce and reverts here.
 NONCE = Contract.from_abi(["function getNonce(address account, uint256 nonceKey) view returns (uint64)"])
@@ -146,6 +147,16 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         "function addValidator(address validatorAddress, bytes32 publicKey, string ingress, string egress,"
         " address feeRecipient, bytes signature) returns (uint64)",
         "function transferOwnership(address newOwner)",
+    ]
+)
+
+# Current committee precompile (ICurrentCommittee, TIP-1070, T8+): the committee picked by
+# the epoch-boundary DKG outcome, written by a system call.
+CURRENT_COMMITTEE_ADDRESS = to_checksum_address("0xC077E00000000000000000000000000000000000")
+CURRENT_COMMITTEE = Contract.from_abi(
+    [
+        "function getCommitteeMembers() view returns (uint64 epoch, bytes32[] publicKeys)",
+        "function setCommitteeMembers(uint64 epoch, bytes32[] publicKeys)",  # system-only: msg.sender must be 0x0
     ]
 )
 

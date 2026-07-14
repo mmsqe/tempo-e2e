@@ -7,6 +7,8 @@ import pytest
 from hexbytes import HexBytes
 from web3 import Web3
 
+from .utils import wait_for_block
+
 pytestmark = pytest.mark.consensus
 
 
@@ -37,13 +39,12 @@ async def test_blocks_are_produced(consensus_w3):
 async def test_header_embeds_consensus_context(consensus_w3):
     """TIP-1031: consensus-produced headers carry consensusContext {epoch, view,
     parentView, proposer}; genesis omits it and views link parent to child."""
-    n = await consensus_w3.eth.block_number
-    while n < 2:  # need a parent/child pair past genesis
-        await asyncio.sleep(1)
-        n = await consensus_w3.eth.block_number
+    # Blocks 1 and 2, not the head pair: an epoch-boundary block carries the DKG outcome in
+    # extraData (hundreds of bytes), which trips web3.py's 32-byte validation middleware.
+    await wait_for_block(consensus_w3, 2)
 
-    parent = await consensus_w3.eth.get_block(n - 1)
-    child = await consensus_w3.eth.get_block(n)
+    parent = await consensus_w3.eth.get_block(1)
+    child = await consensus_w3.eth.get_block(2)
     ctx = child["consensusContext"]
 
     assert ctx["view"] >= 1 and ctx["epoch"] >= 0

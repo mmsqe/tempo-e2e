@@ -9,7 +9,7 @@ import pytest
 from web3 import AsyncWeb3
 
 from .network import TempoNode, free_port
-from .utils import STATE_WRITE_GAS, fund, new_account, send_calls, transfer_call
+from .utils import STATE_WRITE_GAS, fund, new_account, send_calls, transfer_call, wait_for_block
 
 pytestmark = pytest.mark.tempo
 
@@ -54,11 +54,6 @@ def _next_base_fee(fee: int, gas: int) -> int:
     return min(max(nxt, BASE_FEE_FLOOR), BASE_FEE_CAP)
 
 
-async def _wait_for_block(w3, n):
-    while await w3.eth.block_number < n:
-        await asyncio.sleep(0.2)
-
-
 async def _load_window(w3, chain_id, *, senders, transfers, gas_limit, tail=8):
     """Fire one batched tx per sender (each ``transfers`` fresh-account creations), then
     return the contiguous blocks from just before the first load block through ``tail``
@@ -81,7 +76,7 @@ async def _load_window(w3, chain_id, *, senders, transfers, gas_limit, tail=8):
     )
     lo = min(r["blockNumber"] for r in receipts) - 1  # one block before the load, for the transition in
     hi = max(r["blockNumber"] for r in receipts) + tail
-    await _wait_for_block(w3, hi)
+    await wait_for_block(w3, hi)
     return [await w3.eth.get_block(n) for n in range(lo, hi + 1)]
 
 
