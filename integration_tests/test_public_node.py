@@ -1,14 +1,14 @@
-"""Public-node topology against the two-network localnet (--consensus-docker).
+"""Public-node topology (--consensus-docker).
 
-    validators --WS--> follower0 --WS--> public0
-
-Public node syncs by following follower, these tests assert it receives finalized chain and stays on same fork.
+validators --WS--> follower0 --WS--> public0 --P2P--> proxy0
 """
+
+import time
 
 import pytest
 from web3 import Web3
 
-from .conftest import TWO_NET_FOLLOWER, TWO_NET_PUBLIC
+from .conftest import TWO_NET_FOLLOWER, TWO_NET_PROXY, TWO_NET_PUBLIC
 from .utils import poll_height, wait_height
 
 pytestmark = pytest.mark.consensus
@@ -16,6 +16,14 @@ pytestmark = pytest.mark.consensus
 
 def _block_hash(rpc_url: str, number: int) -> str:
     return Web3(Web3.HTTPProvider(rpc_url)).eth.get_block(number)["hash"].to_0x_hex()
+
+
+def _peer_count(rpc_url: str) -> int:
+    try:
+        r = Web3(Web3.HTTPProvider(rpc_url)).provider.make_request("net_peerCount", [])
+        return int(r["result"], 16) if "result" in r else -1
+    except Exception:
+        return -1
 
 
 def test_public_node_syncs_blocks(two_network_net):
@@ -42,4 +50,21 @@ def test_public_node_matches_follower_chain(two_network_net):
 
     assert _block_hash(public, target) == _block_hash(follower, target), (
         f"public node and follower disagree on block {target} (different fork)"
+    )
+
+
+def test_public_node_peers_with_proxy(two_network_net):
+    """The public node peers with the P2P proxy (its only trusted peer, by enode)."""
+    public = two_network_net.node_rpc_url(TWO_NET_PUBLIC)
+
+    deadline = time.time() + 60.0
+    while _peer_count(public) < 1 and time.time() < deadline:
+        time.sleep(1.0)
+    assert _peer_count(public) >= 1, "public node did not establish a P2P peer (proxy)"
+
+    # Single trusted peer must be the proxy — match its enode identity.
+    proxy_id = (two_network_net.data_dir / TWO_NET_PROXY / "enode.identity").read_text().strip()
+    peers = Web3(Web3.HTTPProvider(public)).provider.make_request("admin_peers", [])["result"] or []
+    assert any(proxy_id in p.get("enode", "") for p in peers), (
+        f"public node's peer is not proxy {TWO_NET_PROXY!r} (enode {proxy_id[:16]}…)"
     )

@@ -288,20 +288,20 @@ async def consensus_w3(consensus_net):
 
 
 TWO_NET_FOLLOWER = "follower0"
+TWO_NET_PROXY = "proxy0"
 TWO_NET_PUBLIC = "public0"
 
 
 def _init_two_network_devnet(request, base):
-    """Init a two-network devnet: validators --WS--> follower0 --WS--> public0.
+    """Init a two-network devnet (validators + follower + P2P proxy + public node).
 
-    The follower is dual-homed; the public node is on the public network only.
     Docker-only (needs the two bridge networks).  Returns the resolved ``data_dir``.
     """
     n = request.config.getoption("--consensus-validators")
-    # n validator port-blocks + 2 more for the follower's and public node's
-    # host-published RPC/WS ports (each service needs a full 6-port block).
-    ports = find_free_base_ports(n + 2)
-    val_ports, follow_port, public_port = ports[:n], ports[n], ports[n + 1]
+    # n validator port-blocks + 3 more for the follower, proxy, and public node
+    # host-published ports (each service needs a full 6-port block).
+    ports = find_free_base_ports(n + 3)
+    val_ports, follow_port, proxy_port, public_port = ports[:n], ports[n], ports[n + 1], ports[n + 2]
     config = {
         "chain_id": 1337,
         "accounts": 200,
@@ -315,6 +315,7 @@ def _init_two_network_devnet(request, base):
             "validator_network": {"name": "tempo-2net-validators", "subnet": "10.90.0.0/24"},
             "public_network": {"name": "tempo-2net-public", "subnet": "10.91.0.0/24"},
             "follow_nodes": [{"moniker": TWO_NET_FOLLOWER, "port": follow_port}],
+            "p2p_proxies": [{"moniker": TWO_NET_PROXY, "port": proxy_port}],
             "public_nodes": [{"moniker": TWO_NET_PUBLIC, "port": public_port}],
         },
     }
@@ -346,10 +347,9 @@ def _wait_public_node_synced(cluster, timeout: float = 150.0) -> None:
 
 @pytest.fixture(scope="session")
 def two_network_net(request, tmp_path_factory):
-    """Two-network devnet with a follower and a public node (Docker only).
+    """Two-network devnet: follower + P2P proxy + public node (Docker only).
 
-    The public node is on the public network only and syncs by WS-following the
-    follower. Reach any node from the host via ``cluster.node_rpc_url(<moniker>)``.
+    Reach any node from the host via ``cluster.node_rpc_url(<moniker>)``.
     """
     if not request.config.getoption("--consensus-docker"):
         pytest.skip("two-network topology requires --consensus-docker")

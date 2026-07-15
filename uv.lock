@@ -1354,7 +1354,7 @@ dev = [
 [[package]]
 name = "tempo-py"
 version = "0.1.0"
-source = { git = "https://github.com/yihuang/tempo-py.git?branch=main#452e3c2e507f6bd6bd0cab127f98dd0ca5868d73" }
+source = { git = "https://github.com/yihuang/tempo-py.git?branch=main#d92858682e9f535c2a9d9280de0593529a93117c" }
 dependencies = [
     { name = "attrs" },
     { name = "eth-account" },
