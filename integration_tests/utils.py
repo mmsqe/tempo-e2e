@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Sequence
 
 from eth_account import Account
@@ -23,7 +24,7 @@ from tempo.constants import (
 from tempo.keychain import KeychainSignature
 from tempo.transaction import get_sign_payload
 from tempo.types import as_address
-from web3 import AsyncWeb3
+from web3 import AsyncWeb3, Web3
 
 from .abi import FEE, NONCE, TIP20, TIP20_FACTORY, TIP20_ROLES, TIP403
 from .network import FAUCET_PRIVATE_KEY
@@ -238,6 +239,20 @@ async def wait_for_block(w3: AsyncWeb3, number: int, *, timeout: float = 300.0, 
             raise TimeoutError(f"chain stalled at block {height} after {timeout}s, waiting for {number}")
         await asyncio.sleep(poll)
     return height
+
+
+def poll_height(rpc_url: str) -> int:
+    try:
+        return Web3(Web3.HTTPProvider(rpc_url)).eth.block_number
+    except Exception:
+        return -1
+
+
+def wait_height(rpc_url: str, target: int, timeout: float = 90.0) -> int:
+    deadline = time.time() + timeout
+    while poll_height(rpc_url) < target and time.time() < deadline:
+        time.sleep(1.0)
+    return poll_height(rpc_url)
 
 
 def token_from_receipt(receipt, factory: str = TIP20_FACTORY_ADDRESS) -> str:

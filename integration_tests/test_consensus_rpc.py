@@ -5,9 +5,8 @@ import time
 
 import pytest
 from hexbytes import HexBytes
-from web3 import Web3
 
-from .utils import wait_for_block
+from .utils import poll_height, wait_for_block, wait_height
 
 pytestmark = pytest.mark.consensus
 
@@ -60,20 +59,6 @@ async def test_header_embeds_consensus_context(consensus_w3):
     assert "consensusContext" not in resp["result"]
 
 
-def _height(rpc_url: str) -> int:
-    try:
-        return Web3(Web3.HTTPProvider(rpc_url)).eth.block_number
-    except Exception:  # noqa: BLE001 - node may be momentarily unreachable
-        return -1
-
-
-def _wait_height(rpc_url: str, target: int, timeout: float = 60.0) -> int:
-    deadline = time.time() + timeout
-    while _height(rpc_url) < target and time.time() < deadline:
-        time.sleep(1.0)
-    return _height(rpc_url)
-
-
 def _max_faults(n: int) -> int:
     """Validators that can be offline while consensus keeps quorum (BFT: n = 3f + 1)."""
     return (n - 1) // 3
@@ -87,17 +72,17 @@ def test_chain_survives_validator_restart(consensus_net, num_validators):
         pytest.skip(f"need >=4 validators to tolerate a fault (have {num_validators})")
     victims = [f"node{i}" for i in range(1, f + 1)]  # node0 stays up as the observer
     primary = consensus_net.node_rpc_url("node0")
-    start = _height(primary)
+    start = poll_height(primary)
 
     for v in victims:
         consensus_net.stop_node(v)
-    assert _wait_height(primary, start + 3) >= start + 3, f"chain halted with {f} validator(s) down"
-    progressed = _height(primary)
+    assert wait_height(primary, start + 3) >= start + 3, f"chain halted with {f} validator(s) down"
+    progressed = poll_height(primary)
 
     for v in victims:
         consensus_net.start_node(v)
     rejoined = consensus_net.node_rpc_url(victims[-1])
-    assert _wait_height(rejoined, progressed) >= progressed, "restarted validator did not catch up"
+    assert wait_height(rejoined, progressed) >= progressed, "restarted validator did not catch up"
 
 
 def test_chain_halts_without_quorum_and_recovers(consensus_net, num_validators):
@@ -110,23 +95,23 @@ def test_chain_halts_without_quorum_and_recovers(consensus_net, num_validators):
     for v in victims:
         consensus_net.stop_node(v)
     time.sleep(3)  # let any in-flight blocks finalize, then the height should freeze
-    halted = _height(primary)
+    halted = poll_height(primary)
     time.sleep(8)
-    assert _height(primary) == halted, "chain advanced without a quorum"
+    assert poll_height(primary) == halted, "chain advanced without a quorum"
 
     for v in victims:
         consensus_net.start_node(v)
-    assert _wait_height(primary, halted + 2) >= halted + 2, "chain did not recover after restart"
+    assert wait_height(primary, halted + 2) >= halted + 2, "chain did not recover after restart"
 
 
 def test_full_network_failure_and_recovery(consensus_net):
     """All validators down then restarted: the chain resumes from its persisted state"""
     primary = consensus_net.node_rpc_url("node0")
-    before = _height(primary)
+    before = poll_height(primary)
 
     consensus_net.stop_all()
     consensus_net.start_all()
 
     # A cold restart re-forms consensus from scratch, which can take longer than
     # a single-validator rejoin, so allow extra recovery time.
-    assert _wait_height(primary, before + 2, timeout=120) >= before + 2, "chain did not recover after a full restart"
+    assert wait_height(primary, before + 2, timeout=120) >= before + 2, "chain did not recover after a full restart"
