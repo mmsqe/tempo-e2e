@@ -53,18 +53,28 @@ def test_public_node_matches_follower_chain(two_network_net):
     )
 
 
-def test_public_node_peers_with_proxy(two_network_net):
-    """The public node peers with the P2P proxy (its only trusted peer, by enode)."""
-    public = two_network_net.node_rpc_url(TWO_NET_PUBLIC)
+def _assert_peers_with_proxy(cluster, moniker: str) -> None:
+    """Assert ``moniker`` joins devp2p and its peer is the P2P proxy (by enode)."""
+    rpc = cluster.node_rpc_url(moniker)
 
     deadline = time.time() + 60.0
-    while _peer_count(public) < 1 and time.time() < deadline:
+    while _peer_count(rpc) < 1 and time.time() < deadline:
         time.sleep(1.0)
-    assert _peer_count(public) >= 1, "public node did not establish a P2P peer (proxy)"
+    assert _peer_count(rpc) >= 1, f"{moniker} did not establish a P2P peer (proxy)"
 
-    # Single trusted peer must be the proxy — match its enode identity.
-    proxy_id = (two_network_net.data_dir / TWO_NET_PROXY / "enode.identity").read_text().strip()
-    peers = Web3(Web3.HTTPProvider(public)).provider.make_request("admin_peers", [])["result"] or []
+    # The proxy is the only configured trusted peer — match its enode identity.
+    proxy_id = (cluster.data_dir / TWO_NET_PROXY / "enode.identity").read_text().strip()
+    peers = Web3(Web3.HTTPProvider(rpc)).provider.make_request("admin_peers", [])["result"] or []
     assert any(proxy_id in p.get("enode", "") for p in peers), (
-        f"public node's peer is not proxy {TWO_NET_PROXY!r} (enode {proxy_id[:16]}…)"
+        f"{moniker}'s peer is not proxy {TWO_NET_PROXY!r} (enode {proxy_id[:16]}…)"
     )
+
+
+def test_public_node_peers_with_proxy(two_network_net):
+    """The public node peers with the P2P proxy (its only trusted peer, by enode)."""
+    _assert_peers_with_proxy(two_network_net, TWO_NET_PUBLIC)
+
+
+def test_follower_peers_with_proxy(two_network_net):
+    """The follower joins devp2p and peers with the P2P proxy by enode."""
+    _assert_peers_with_proxy(two_network_net, TWO_NET_FOLLOWER)
