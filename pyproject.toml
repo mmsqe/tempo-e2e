@@ -21,7 +21,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-tempo-py = { git = "https://github.com/yihuang/tempo-py.git", branch = "main" }
+tempo-py = { git = "https://github.com/yihuang/tempo-py.git", branch = "topology" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
