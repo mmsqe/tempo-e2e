@@ -12,6 +12,7 @@ from eth_account import Account
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 from web3 import Web3
+from web3.exceptions import TimeExhausted
 
 from .conftest import TWO_NET_FOLLOWER, TWO_NET_PROXY, TWO_NET_PUBLIC
 from .network import FAUCET_PRIVATE_KEY
@@ -111,17 +112,6 @@ def _send_stablecoin_transfer(rpc_url: str, recipient: str, amount: int = 4321):
     return w3.eth.send_raw_transaction(Account.sign_transaction(tx, acct.key).raw_transaction)
 
 
-def _wait_receipt(rpc_url: str, tx_hash, timeout: float = 90.0):
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            return w3.eth.get_transaction_receipt(tx_hash)
-        except Exception:
-            time.sleep(1.0)
-    return None
-
-
 def test_send_tx_via_public_node(two_network_net):
     """A tx submitted to the public node's RPC gossips to a validator and is mined.
 
@@ -131,14 +121,14 @@ def test_send_tx_via_public_node(two_network_net):
     public = two_network_net.node_rpc_url(TWO_NET_PUBLIC)
 
     # Need a devp2p peer (the follower) before the tx has a gossip path upstream.
-    deadline = time.time() + 60.0
-    while _peer_count(public) < 1 and time.time() < deadline:
-        time.sleep(1.0)
-    assert _peer_count(public) >= 1, "public node has no devp2p peer to gossip the tx to"
+    assert _wait_for_peers(public) >= 1, "public node has no devp2p peer to gossip the tx to"
 
     recipient = Account.create().address
     tx_hash = _send_stablecoin_transfer(public, recipient)
 
-    receipt = _wait_receipt(public, tx_hash)
+    try:
+        receipt = Web3(Web3.HTTPProvider(public)).eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+    except TimeExhausted:
+        receipt = None
     assert receipt is not None, "tx submitted to the public node was never mined (no gossip path to validators)"
     assert receipt["status"] == 1, f"tx reverted: {receipt}"
