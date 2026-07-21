@@ -2,11 +2,13 @@
 
 import pytest
 from hexbytes import HexBytes
+from tempo import Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD, THETA_USD
 
 from .abi import FEE
 from .utils import (
     build_tempo_tx,
+    create_token,
     fund_token,
     new_account,
     seed_fee_pool,
@@ -67,3 +69,25 @@ async def test_fee_in_non_validator_token_moves_pool(w3, chain_id):
     after = await FEE.fns.getPool(ALPHA_USD, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS)
     assert after[0] > before[0]  # ALPHA (user token) reserve grew
     assert after[1] < before[1]  # PATH (validator token) reserve shrank
+
+
+async def test_insufficient_liquidity_names_the_fee_token(w3, chain_id, funded_account):
+    """Paying gas in a no-pool token is rejected with an error that names the fee token (#6698)."""
+    payer = new_account()
+    # A fresh USD TIP-20 with no fee pool, payer holds enough that the swap, not the balance, is what fails.
+    token = await create_token(w3, chain_id=chain_id, admin=funded_account, mint=(payer.address, 10_000_000_000))
+
+    tx = build_tempo_tx(
+        chain_id=chain_id,
+        nonce=0,
+        fee_token=token,
+        max_fee_per_gas=await suggested_max_fee(w3),
+        calls=[transfer_call(new_account().address, 1, token)],
+    )
+    raw = serialize(sign_transaction(tx, Signer(payer.key.hex())))
+    resp = await w3.provider.make_request("eth_sendRawTransaction", [raw])
+
+    msg = (resp.get("error") or {}).get("message", "")
+    assert "insufficient liquidity in FeeAMM pool to swap fee tokens" in msg, resp
+    assert "(required:" in msg, resp  # required amount
+    assert token.lower() in msg.lower(), msg  # identifies the offending fee token

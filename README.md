@@ -115,7 +115,7 @@ If your `tempo-xtask` comes from an older checkout, pull that release's tag
 
 | File | TIP(s) | Covers |
 |---|---|---|
-| `test_fee_amm.py` | — | gas paid in a non-validator stablecoin via the FeeManager AMM pool |
+| `test_fee_amm.py` | — | gas paid in a non-validator stablecoin via the FeeManager AMM pool, no-pool token rejected naming the fee token |
 | `test_fee_routing.py` | TIP-1033 | two-hop FeeAMM routing X→ALPHA→PATH; direct-pool preference; m² haircut |
 | `test_fee_token.py` | — | pay gas in a chosen stablecoin via the `fee_token` field (FeeAMM) |
 | `test_fee_sponsor.py` | — | a fee payer covers gas for another account; unfunded payer rejected |
