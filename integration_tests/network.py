@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -33,10 +34,18 @@ def tempo_dir() -> Path:
 
 
 def resolve_binary() -> list[str]:
-    """``$TEMPO_BIN``, else a release/debug build, else a ``cargo run`` fallback."""
+    """``$TEMPO_BIN``, else ``tempo`` on PATH, else a local build, else ``cargo run``.
+
+    Prefers the installed binary (``which tempo`` → ``~/.cargo/bin/tempo``) so an
+    installed toolchain is used by default; set ``$TEMPO_BIN`` (or ``--tempo-bin``)
+    to point at a specific build instead.
+    """
     env_bin = os.environ.get("TEMPO_BIN")
     if env_bin:
         return [env_bin]
+    on_path = shutil.which("tempo")
+    if on_path:
+        return [on_path]
     base = tempo_dir()
     for candidate in (base / "target/release/tempo", base / "target/debug/tempo"):
         if candidate.exists():
@@ -53,15 +62,39 @@ def resolve_tempo_bin() -> str:
 
 
 def resolve_xtask_bin() -> str:
-    """``$TEMPO_XTASK_BIN``, else a built ``tempo-xtask``."""
+    """``$TEMPO_XTASK_BIN``, else ``tempo-xtask`` on PATH, else a built ``tempo-xtask``."""
     env_bin = os.environ.get("TEMPO_XTASK_BIN")
     if env_bin:
         return env_bin
+    on_path = shutil.which("tempo-xtask")
+    if on_path:
+        return on_path
     base = tempo_dir()
     for candidate in (base / "target/release/tempo-xtask", base / "target/debug/tempo-xtask"):
         if candidate.exists():
             return str(candidate)
-    raise RuntimeError("the devnet needs a built tempo-xtask (set TEMPO_XTASK_BIN or build ../tempo)")
+    raise RuntimeError("the devnet needs tempo-xtask (set TEMPO_XTASK_BIN, put it on PATH, or build ../tempo)")
+
+
+def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None) -> int:
+    """Poll ``rpc_url`` until it reports ``block >= want_block``; return its chain id.
+
+    ``check_alive`` (if given) is called each tick and should raise if the node
+    process has died, so a crash surfaces at once instead of after ``timeout``.
+    """
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    deadline = time.time() + timeout
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        if check_alive:
+            check_alive()
+        try:
+            if w3.is_connected() and w3.eth.block_number >= want_block:
+                return w3.eth.chain_id
+        except Exception as e:  # noqa: BLE001 - RPC not up yet
+            last_err = e
+        time.sleep(0.5)
+    raise TimeoutError(f"tempo RPC {rpc_url} not ready after {timeout}s (last error: {last_err})")
 
 
 def default_genesis() -> Path:
@@ -168,20 +201,13 @@ class TempoNode:
 
     def wait_for_rpc(self, timeout: float = 180.0, want_block: int = 1) -> "TempoNode":
         """Poll the HTTP RPC until it answers with ``block >= want_block``; cache the chain id."""
-        w3 = Web3(Web3.HTTPProvider(self.rpc_url))
-        deadline = time.time() + timeout
-        last_err: Exception | None = None
-        while time.time() < deadline:
+
+        def check_alive():
             if self.proc is not None and self.proc.poll() is not None:
                 raise RuntimeError(f"tempo node exited early (code {self.proc.returncode}); see {self.log_path}")
-            try:
-                if w3.is_connected() and w3.eth.block_number >= want_block:
-                    self.chain_id = w3.eth.chain_id
-                    return self
-            except Exception as e:  # noqa: BLE001 - RPC not up yet
-                last_err = e
-            time.sleep(0.5)
-        raise TimeoutError(f"tempo RPC not ready after {timeout}s (last error: {last_err}); see {self.log_path}")
+
+        self.chain_id = _poll_rpc(self.rpc_url, timeout=timeout, want_block=want_block, check_alive=check_alive)
+        return self
 
     def stop(self) -> None:
         if self.proc is None:
@@ -204,3 +230,25 @@ class TempoNode:
     @property
     def ws_url(self) -> str:
         return f"ws://127.0.0.1:{self.ws_port}"
+
+
+class ExternalNode:
+    """A handle to an already-running node (``--tempo-rpc`` / ``$TEMPO_RPC``).
+
+    Lets the suite attach to a node it does not own and leave it running:
+    ``stop()`` is a no-op. ``ws_url`` is None unless supplied (only the
+    eth_subscribe tests need it).
+    """
+
+    def __init__(self, rpc_url: str, ws_url: str | None = None):
+        self.rpc_url = rpc_url
+        self.ws_url = ws_url
+        self.chain_id: int | None = None
+
+    def wait_for_rpc(self, timeout: float = 60.0, want_block: int = 1) -> "ExternalNode":
+        """Poll the RPC until it answers with ``block >= want_block``; cache the chain id."""
+        self.chain_id = _poll_rpc(self.rpc_url, timeout=timeout, want_block=want_block)
+        return self
+
+    def stop(self) -> None:  # not ours — leave it running
+        pass

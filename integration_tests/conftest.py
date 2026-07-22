@@ -18,7 +18,7 @@ from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
 
 from .docker_cluster import DockerCluster
-from .network import TempoNode, free_port, resolve_tempo_bin, resolve_xtask_bin
+from .network import ExternalNode, TempoNode, free_port, resolve_tempo_bin, resolve_xtask_bin
 from .utils import fund, new_account
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
@@ -28,7 +28,18 @@ if not os.environ.get("TMPDIR", "").startswith("/tmp"):
 
 @pytest.fixture(scope="session")
 def tempo(request, tmp_path_factory):
-    """A locally launched tempo dev node, torn down at the end of the session."""
+    """A tempo dev node for the session.
+
+    By default launches a fresh ``tempo node --dev`` and tears it down at the
+    end. With ``--tempo-rpc URL`` (or ``$TEMPO_RPC``) it instead attaches to an
+    already-running node and leaves it running; ``--tempo-ws`` supplies that
+    node's WebSocket URL for the eth_subscribe tests.
+    """
+    rpc_url = request.config.getoption("--tempo-rpc")
+    if rpc_url:
+        yield ExternalNode(rpc_url, request.config.getoption("--tempo-ws")).wait_for_rpc()
+        return
+
     if request.config.getoption("--tempo-bin"):
         os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
 

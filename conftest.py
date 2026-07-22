@@ -5,6 +5,18 @@ def pytest_addoption(parser):
     group = parser.getgroup("tempo")
     group.addoption("--tempo-bin", default=None, help="Path to the tempo node binary")
     group.addoption(
+        "--tempo-rpc",
+        default=os.environ.get("TEMPO_RPC"),
+        help="Attach to an already-running node at this RPC URL instead of launching one, "
+        "and leave it running (also $TEMPO_RPC).",
+    )
+    group.addoption(
+        "--tempo-ws",
+        default=os.environ.get("TEMPO_WS"),
+        help="WebSocket URL of the --tempo-rpc node (also $TEMPO_WS); only the "
+        "eth_subscribe tests need it, and they skip when it is unset.",
+    )
+    group.addoption(
         "--clean-data",
         action="store_true",
         default=False,
