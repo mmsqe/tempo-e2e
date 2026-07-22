@@ -3,7 +3,6 @@ to the slot's owner (a contract, never an EOA); mode 3 is reserved.
 """
 
 import pytest
-from eth_contract.erc20 import ERC20
 from tempo.constants import ALPHA_USD
 from tempo.constants import STABLECOIN_DEX_ADDRESS as DEX_ADDR
 from tempo.constants import STORAGE_CREDITS_ADDRESS as SC_ADDR
@@ -11,8 +10,8 @@ from tempo.constants import STORAGE_CREDITS_ADDRESS as SC_ADDR
 from .abi import DEX
 from .abi import STORAGE_CREDITS as SC
 from .utils import (
-    MAX_UINT,
     STATE_WRITE_GAS,
+    approve_call,
     call_revert,
     create_token,
     deploy_contract,
@@ -111,7 +110,7 @@ async def test_dex_order_cancel_credits_the_maker(w3, chain_id):
         private_key=maker.key.hex(),
         gas_limit=STATE_WRITE_GAS,
         calls=[
-            {"to": ALPHA_USD, "data": ERC20.fns.approve(DEX_ADDR, MAX_UINT).data},
+            approve_call(DEX_ADDR, ALPHA_USD),
             {"to": DEX_ADDR, "data": DEX.fns.place(ALPHA_USD, 2_000_000_000, False, 0).data},
         ],
     )
@@ -129,7 +128,7 @@ async def test_dex_replace_consumes_maker_credits(w3, chain_id, funded_account):
     maker = new_account()
     await fund(w3, maker.address)
     token = await create_token(w3, chain_id=chain_id, admin=funded_account, mint=(maker.address, 10_000_000_000))
-    await send_call(w3, chain_id, maker, token, ERC20.fns.approve(DEX_ADDR, MAX_UINT).data)
+    await send_call(w3, chain_id, maker, **approve_call(DEX_ADDR, token))
 
     def _credits():
         return DEX.fns.storageCredits(maker.address).call(w3, to=DEX_ADDR)

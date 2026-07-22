@@ -129,9 +129,7 @@ If your `tempo-xtask` comes from an older checkout, pull that release's tag
 
 | File | TIP(s) | Covers |
 |---|---|---|
-| `test_dex.py` | — | stablecoin DEX limit orders and swaps against PATH_USD |
-| `test_dex_flip.py` | TIP-1030, TIP-1056 | same-tick flip orders + flip-in-place: re-rest under same id, cancel refund (T5+) |
-| `test_dex_book_index.py` | TIP-1087 | DEX book index (T8+): create-pair round-trip, auto-index, unknown-book rejection |
+| `test_dex.py` | TIP-1030, TIP-1056, TIP-1087 | stablecoin DEX against PATH_USD: limit orders & swaps, same-tick flip orders (flip-in-place, cancel refund; T5+), book index (T8+) |
 
 ### Precompiles & on-chain config
 

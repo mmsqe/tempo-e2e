@@ -15,8 +15,8 @@ from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 
 from .abi import FEE
 from .utils import (
-    MAX_UINT,
     STATE_WRITE_GAS,
+    approve_call,
     blacklist_token,
     build_tempo_tx,
     call_revert,
@@ -106,7 +106,7 @@ async def test_burn_requires_an_authorized_sender(w3, chain_id, funded_account):
         private_key=lp.key.hex(),
         gas_limit=STATE_WRITE_GAS,
         calls=[
-            {"to": PATH_USD, "data": ERC20.fns.approve(FEE_MANAGER_ADDRESS, MAX_UINT).data},
+            approve_call(FEE_MANAGER_ADDRESS),
             {"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.mint(token, PATH_USD, POOL_SEED, lp.address).data},
         ],
     )

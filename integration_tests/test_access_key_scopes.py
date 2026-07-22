@@ -16,6 +16,7 @@ from tempo.keychain import CallScope, SelectorRule, TokenLimit, sign_tx_access_k
 from .abi import KEYCHAIN_VIEWS
 from .utils import (
     RETURN_42_INIT,
+    approve_call,
     fund,
     fund_token,
     key_restrictions,
@@ -54,7 +55,7 @@ async def test_scoped_key_rejects_out_of_scope_call(w3, chain_id):
     spender = new_account().address
 
     # the key may only transfer PATH_USD; an approve is out of scope -> CallNotAllowed
-    tx = await prepare_tx(w3, chain_id, root, [{"to": PATH_USD, "data": ERC20.fns.approve(spender, 1).data}])
+    tx = await prepare_tx(w3, chain_id, root, [approve_call(spender, amount=1)])
     signed = _scoped(root, tx, allowed_calls=(CallScope.transfer(PATH_USD),))
     assert (await send_signed(w3, signed))["status"] == 0  # batch fails atomically before any call runs
     assert await ERC20.fns.allowance(root.address, spender).call(w3, to=PATH_USD) == 0

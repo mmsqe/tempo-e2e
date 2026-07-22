@@ -73,6 +73,11 @@ def transfer_call(to: str, amount: int, token: str = PATH_USD) -> dict:
     return {"to": token, "data": ERC20.fns.transfer(to, amount).data}
 
 
+def approve_call(spender: str, token: str = PATH_USD, amount: int = MAX_UINT) -> dict:
+    """A TIP-20 ``approve(spender, amount)`` call for a tempo tx (``{to, data}``)."""
+    return {"to": token, "data": ERC20.fns.approve(spender, amount).data}
+
+
 async def suggested_max_fee(w3: AsyncWeb3, priority_fee: int = DEFAULT_MAX_PRIORITY_FEE_PER_GAS) -> int:
     """max_fee_per_gas comfortably above the current base fee (2x + priority)."""
     base_fee = (await w3.eth.get_block("latest")).get("baseFeePerGas") or 0
@@ -367,7 +372,7 @@ async def seed_fee_pool(
         fee_token=validator_token,
         gas_limit=STATE_WRITE_GAS,
         calls=[
-            {"to": validator_token, "data": ERC20.fns.approve(FEE_MANAGER_ADDRESS, amount * 4).data},
+            approve_call(FEE_MANAGER_ADDRESS, validator_token, amount * 4),
             {"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.mint(user_token, validator_token, amount, funder).data},
         ],
     )

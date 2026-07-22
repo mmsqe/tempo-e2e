@@ -7,7 +7,7 @@ from hexbytes import HexBytes
 from tempo.constants import PATH_USD
 
 from .abi import TIP20
-from .utils import STABLECOINS, fund, gas_cost_in_token, get_nonce, new_account, send_calls, transfer_call
+from .utils import STABLECOINS, approve_call, fund, gas_cost_in_token, get_nonce, new_account, send_calls, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -40,7 +40,7 @@ async def test_approve_and_allowance(w3, chain_id, funded_account):
         w3,
         chain_id=chain_id,
         private_key=funded_account.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.approve(spender, 50_000).data}],
+        calls=[approve_call(spender, amount=50_000)],
     )
     assert receipt["status"] == 1
     assert await ERC20.fns.allowance(funded_account.address, spender).call(w3, to=PATH_USD) == 50_000
@@ -56,7 +56,7 @@ async def test_transfer_from_spends_allowance(w3, chain_id):
         w3,
         chain_id=chain_id,
         private_key=owner.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.approve(spender.address, 40_000).data}],
+        calls=[approve_call(spender.address, amount=40_000)],
     )
     receipt = await send_calls(
         w3,

@@ -14,7 +14,7 @@ from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, STABLECOIN_DEX_ADDRES
 from tempo.constants import TIP20_CHANNEL_RESERVE_ADDRESS as CHANNEL_RESERVE
 
 from .abi import ADDRESS_REGISTRY as REG
-from .utils import call_revert, create_token, fund, new_account, send_call
+from .utils import approve_call, call_revert, create_token, fund, new_account, send_call
 
 pytestmark = pytest.mark.tempo
 
@@ -86,7 +86,7 @@ async def test_mint_and_transfer_from_forward_to_master(w3, chain_id, funded_acc
     # transferFrom to a virtual address forwards too
     spender = new_account()
     await fund(w3, spender.address)
-    await send_call(w3, chain_id, admin, token, ERC20.fns.approve(spender.address, 2000).data)
+    await send_call(w3, chain_id, admin, **approve_call(spender.address, token, 2000))
     await send_call(w3, chain_id, spender, token, ERC20.fns.transferFrom(admin.address, virtual, 2000).data)
     assert await _master_bal(w3, token) == before + 5000
     assert await ERC20.fns.balanceOf(virtual).call(w3, to=token) == 0

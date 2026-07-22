@@ -16,6 +16,7 @@ from .abi import TIP20_ROLES, TIP403
 from .utils import (
     STATE_WRITE_GAS,
     WHITELIST,
+    approve_call,
     blacklist_token,
     call_revert,
     create_token,
@@ -243,7 +244,7 @@ async def test_transfer_from_blocked_still_consumes_allowance(w3, chain_id):
         await fund(w3, acct.address)
     await _reject_all_senders(w3, chain_id, receiver)
 
-    await send_call(w3, chain_id, owner, PATH_USD, ERC20.fns.approve(spender.address, 3000).data)
+    await send_call(w3, chain_id, owner, **approve_call(spender.address, amount=3000))
     owner_before = await ERC20.fns.balanceOf(owner.address).call(w3, to=PATH_USD)
     receiver_before = await ERC20.fns.balanceOf(receiver.address).call(w3, to=PATH_USD)
     # the spender pulls the owner's funds toward the receiver -> blocked, but the allowance is consumed
