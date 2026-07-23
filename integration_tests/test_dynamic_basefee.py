@@ -8,7 +8,7 @@ import asyncio
 import pytest
 from web3 import AsyncWeb3
 
-from .network import TempoNode, free_port
+from .network import dev_node
 from .utils import STATE_WRITE_GAS, fund, new_account, send_calls, transfer_call, wait_for_block
 
 pytestmark = pytest.mark.tempo
@@ -24,7 +24,7 @@ BASE_FEE_CAP = 12_000_000_000
 @pytest.fixture(scope="module")
 def basefee_node(tmp_path_factory):
     base = tmp_path_factory.mktemp("basefee")
-    node = TempoNode(datadir=base / "data", log_path=base / "node.log", http_port=free_port(), block_time="1sec")
+    node = dev_node(base, block_time="1sec")
     try:
         node.start().wait_for_rpc()
         yield node

@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 from web3 import Web3
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TEMPO_DIR = REPO_ROOT.parent / "tempo"
+# Accounts prefunded in the generated dev genesis. --dev ignores baked-in validator,
+# which is only there to satisfy the generator.
+DEV_GENESIS_ACCOUNTS = 20
 
 # Prefunded dev key the faucet sends from, and the TIP-20 stablecoin it funds.
 FAUCET_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
@@ -29,51 +32,20 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def tempo_dir() -> Path:
-    return Path(os.environ.get("TEMPO_DIR", DEFAULT_TEMPO_DIR)).resolve()
-
-
-def resolve_binary() -> list[str]:
-    """``$TEMPO_BIN``, else ``tempo`` on PATH, else a local build, else ``cargo run``.
-
-    Prefers the installed binary (``which tempo`` → ``~/.cargo/bin/tempo``) so an
-    installed toolchain is used by default; set ``$TEMPO_BIN`` (or ``--tempo-bin``)
-    to point at a specific build instead.
-    """
-    env_bin = os.environ.get("TEMPO_BIN")
-    if env_bin:
-        return [env_bin]
-    on_path = shutil.which("tempo")
-    if on_path:
-        return [on_path]
-    base = tempo_dir()
-    for candidate in (base / "target/release/tempo", base / "target/debug/tempo"):
-        if candidate.exists():
-            return [str(candidate)]
-    return ["cargo", "run", "--bin", "tempo", "--manifest-path", str(base / "Cargo.toml"), "--"]
+def _resolve_bin(name: str, env_var: str) -> str:
+    """``$<env_var>``, else ``name`` on PATH, else raise."""
+    path = os.environ.get(env_var) or shutil.which(name)
+    if not path:
+        raise RuntimeError(f"the devnet needs {name} (set ${env_var}, put it on PATH, or build ../tempo)")
+    return path
 
 
 def resolve_tempo_bin() -> str:
-    """The built tempo binary as a single path (the devnet run scripts exec one path)."""
-    parts = resolve_binary()
-    if len(parts) == 1:
-        return parts[0]
-    raise RuntimeError("the devnet needs a built tempo binary (set TEMPO_BIN or build ../tempo)")
+    return _resolve_bin("tempo", "TEMPO_BIN")
 
 
 def resolve_xtask_bin() -> str:
-    """``$TEMPO_XTASK_BIN``, else ``tempo-xtask`` on PATH, else a built ``tempo-xtask``."""
-    env_bin = os.environ.get("TEMPO_XTASK_BIN")
-    if env_bin:
-        return env_bin
-    on_path = shutil.which("tempo-xtask")
-    if on_path:
-        return on_path
-    base = tempo_dir()
-    for candidate in (base / "target/release/tempo-xtask", base / "target/debug/tempo-xtask"):
-        if candidate.exists():
-            return str(candidate)
-    raise RuntimeError("the devnet needs tempo-xtask (set TEMPO_XTASK_BIN, put it on PATH, or build ../tempo)")
+    return _resolve_bin("tempo-xtask", "TEMPO_XTASK_BIN")
 
 
 def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None) -> int:
@@ -97,16 +69,45 @@ def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None
     raise TimeoutError(f"tempo RPC {rpc_url} not ready after {timeout}s (last error: {last_err})")
 
 
-def default_genesis() -> Path:
-    """The permissive dev genesis the node's own tests use (override with ``$TEMPO_GENESIS``)."""
+def generate_dev_genesis(output_dir: Path) -> Path:
+    """The dev genesis: ``$TEMPO_GENESIS`` if set, else generated in ``output_dir`` via ``tempo-xtask``.
+
+    An already-generated ``genesis.json`` is reused (deterministic ``--seed 0``), so a node
+    can restart on the same dir and CI can supply a prebuilt genesis without needing xtask.
+    """
     env_genesis = os.environ.get("TEMPO_GENESIS")
     if env_genesis:
         return Path(env_genesis).resolve()
-    base = tempo_dir()
-    test_genesis = base / "crates" / "node" / "tests" / "assets" / "test-genesis.json"
-    if test_genesis.exists():
-        return test_genesis
-    return base / "scripts" / "genesis" / "staccato.json"
+    genesis = output_dir / "genesis.json"
+    if genesis.exists():
+        return genesis
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            resolve_xtask_bin(),
+            "generate-genesis",
+            "--output",
+            str(output_dir),
+            "--accounts",
+            str(DEV_GENESIS_ACCOUNTS),
+            "--seed",
+            "0",
+            "--validators",
+            "127.0.0.1:30303",
+            "--no-dkg-in-genesis",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not genesis.exists():
+        raise RuntimeError(f"tempo-xtask generate-genesis failed (exit {result.returncode}):\n{result.stderr}")
+    return genesis
+
+
+@functools.lru_cache(maxsize=1)
+def default_genesis() -> Path:
+    """A dev genesis for a node built without an explicit one, once per process (see generate_dev_genesis)."""
+    return generate_dev_genesis(Path(tempfile.mkdtemp(prefix="tempo-genesis-")))
 
 
 class TempoNode:
@@ -121,7 +122,7 @@ class TempoNode:
         ws_port: int | None = None,
         p2p_port: int | None = None,
         genesis: Path | None = None,
-        binary: list[str] | None = None,
+        binary: str | None = None,
         block_time: str | None = None,
     ):
         self.datadir = Path(datadir)
@@ -132,14 +133,14 @@ class TempoNode:
         self.p2p_port = p2p_port or free_port()
         self.auth_port = free_port()
         self.genesis = Path(genesis) if genesis else default_genesis()
-        self.binary = binary or resolve_binary()
+        self.binary = binary or resolve_tempo_bin()
         self.block_time = block_time or os.environ.get("TEMPO_BLOCK_TIME", "50ms")
         self.proc: subprocess.Popen | None = None
         self.chain_id: int | None = None
 
     def command(self) -> list[str]:
         return [
-            *self.binary,
+            self.binary,
             "node",
             "--chain",
             str(self.genesis),
@@ -230,6 +231,19 @@ class TempoNode:
     @property
     def ws_url(self) -> str:
         return f"ws://127.0.0.1:{self.ws_port}"
+
+
+def dev_node(base: Path, *, log_name: str = "node.log", **kwargs) -> TempoNode:
+    """A ``--dev`` node with a fresh ``genesis.json`` beside its datadir.
+
+    Lays out ``base/devnet/{genesis.json, node0}`` — the self-contained shape the
+    session fixture uses. ``http_port`` defaults to a free port; extra keyword args
+    (``block_time``, ...) pass through to ``TempoNode``.
+    """
+    devnet = base / "devnet"
+    genesis = generate_dev_genesis(devnet)
+    kwargs.setdefault("http_port", free_port())
+    return TempoNode(datadir=devnet / "node0", log_path=devnet / log_name, genesis=genesis, **kwargs)
 
 
 class ExternalNode:

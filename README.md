@@ -73,6 +73,7 @@ If your `tempo-xtask` comes from an older checkout, pull that release's tag
 | `test_tracing.py` | — | `debug_traceTransaction` (callTracer, struct logger), `trace_block_by_number` |
 | `test_contract.py` | — | EVM contract deploy + call via tempo (0x76) txs |
 | `test_native_token.py` | — | `BALANCE` opcode is 0 for a stablecoin-funded account |
+| `test_block_hashes.py` | EIP-2935 | history-storage predeploy: present at genesis, in-window hash read, out-of-window revert |
 | `test_mempool.py` | — | `txpool_status`/`content` and `operator_peers` RPCs |
 | `test_faucet.py` | — | `tempo_fundAddress` faucet RPC |
 | `test_validation.py` | — | malformed / unfunded tx rejection |

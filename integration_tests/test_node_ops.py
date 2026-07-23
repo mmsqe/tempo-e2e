@@ -5,15 +5,9 @@ import time
 import pytest
 from web3 import Web3
 
-from .network import TempoNode, free_port
+from .network import dev_node
 
 pytestmark = pytest.mark.slow
-
-
-def _node(datadir, log_path) -> TempoNode:
-    return TempoNode(
-        datadir=datadir, log_path=log_path, http_port=free_port(), ws_port=free_port(), p2p_port=free_port()
-    )
 
 
 def _wait_height(rpc_url: str, target: int, timeout: float = 60.0) -> int:
@@ -30,8 +24,7 @@ def _wait_height(rpc_url: str, target: int, timeout: float = 60.0) -> int:
 
 
 def test_restart_resumes_from_persisted_state(tmp_path):
-    datadir = tmp_path / "data"
-    node = _node(datadir, tmp_path / "run1.log")
+    node = dev_node(tmp_path, log_name="run1.log")
     node.start().wait_for_rpc()
     _wait_height(node.rpc_url, 5)
     w3 = Web3(Web3.HTTPProvider(node.rpc_url))
@@ -41,7 +34,7 @@ def test_restart_resumes_from_persisted_state(tmp_path):
 
     # Restart on the same datadir: the chain resumes past the persisted tip with
     # identical history, rather than resetting to genesis.
-    node2 = _node(datadir, tmp_path / "run2.log")
+    node2 = dev_node(tmp_path, log_name="run2.log")
     node2.start().wait_for_rpc(want_block=height)
     try:
         w3b = Web3(Web3.HTTPProvider(node2.rpc_url))

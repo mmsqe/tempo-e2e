@@ -18,7 +18,7 @@ from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
 
 from .docker_cluster import DockerCluster
-from .network import ExternalNode, TempoNode, free_port, resolve_tempo_bin, resolve_xtask_bin
+from .network import ExternalNode, dev_node, resolve_tempo_bin, resolve_xtask_bin
 from .utils import fund, new_account
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
@@ -44,7 +44,7 @@ def tempo(request, tmp_path_factory):
         os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
 
     base = tmp_path_factory.mktemp("tempo")
-    node = TempoNode(datadir=base / "data", log_path=base / "tempo.log", http_port=free_port())
+    node = dev_node(base, log_name="tempo.log")
     try:
         node.start().wait_for_rpc()
         yield node

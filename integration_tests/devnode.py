@@ -13,10 +13,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .network import DEFAULT_HTTP_PORT, TempoNode
+from .network import DEFAULT_HTTP_PORT, TempoNode, generate_dev_genesis
 
 
 def _up(datadir: Path, log_path: Path, http_port: int, genesis: Path | None) -> int:
+    # Genesis sits beside the datadir (reused on resume); --genesis / $TEMPO_GENESIS override.
+    genesis = genesis or generate_dev_genesis(datadir.parent)
     node = TempoNode(datadir=datadir, log_path=log_path, http_port=http_port, genesis=genesis)
     node.start()
     print(f"tempo dev node starting (pid {node.proc.pid}); RPC at {node.rpc_url}")
