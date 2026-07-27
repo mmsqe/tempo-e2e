@@ -229,9 +229,8 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
 )
 
 
-# AnchoringRegistry (upgradeable app contract, NOT a precompile): document anchoring —
-# named registries hold checksum records, versioned per checksum, with RBAC. Roles:
-# ADMIN=1, REGISTRAR=2, STATUS_UPDATER=3. Deployed behind an ERC-1967 proxy.
+# AnchoringRegistry (upgradeable app contract, NOT a precompile): named registries hold checksum
+# records, versioned per checksum, with RBAC. Roles: ADMIN=1, REGISTRAR=2, STATUS_UPDATER=3.
 _RECORD = (
     "(uint256 registryId, string uri, string checksum, string checksumAlgo, string metadata, "
     "uint256 timestamp, string status, uint256 recordId, uint256 index, bool isLatest)"
@@ -242,20 +241,14 @@ ANCHORING = Contract.from_abi(
         "function addRecord(string registry, string uri, string checksum, string checksumAlgo, string metadata) returns (uint256 recordId, uint256 index)",
         "function updateRecordStatus(uint256 registryId, uint256 recordId, uint256 index, string status)",
         "function grantRole(address holder, uint256 role)",
-        "function revokeRole(address holder, uint256 role)",
         "function hasRole(address holder, uint256 role) view returns (bool)",
-        "function roleHolderCount(uint256 role) view returns (uint256)",
         "function registryCount() view returns (uint256)",
         "function registryIdByName(string name) view returns (uint256)",
         "function recordIdForChecksum(uint256 registryId, string checksum) view returns (uint256)",
         "function versionCount(uint256 registryId, uint256 recordId) view returns (uint256)",
         "function checksumRefCount(string checksum) view returns (uint256)",
         f"function getRecord(uint256 registryId, uint256 recordId, uint256 index) view returns ({_RECORD})",
-        f"function getLatestRecord(uint256 registryId, uint256 recordId) view returns ({_RECORD})",
         "function queryByChecksum(string checksum, uint256 limit) view returns ((uint256 registryId, uint256 recordId)[])",
-        "event RegistryAdded(uint256 indexed id, string name, address indexed creator)",
-        "event RecordAdded(uint256 indexed registryId, uint256 indexed recordId, uint256 index, string checksum, address indexed by)",
-        "event RecordStatusUpdated(uint256 indexed registryId, uint256 indexed recordId, uint256 index, string status, address indexed by)",
     ]
 )
 

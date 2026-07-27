@@ -12,8 +12,11 @@ install:
 # Rebuild the vendored AnchoringDeployer initcode from the tempo repo's Foundry sources.
 anchoring-artifacts:
 	rm -rf $(TEMPO_WORK)
-	git clone --depth 1 --branch $(TEMPO_REF) $(TEMPO_REPO) $(TEMPO_WORK)
-	cd $(TEMPO_WORK) && git submodule update --init --depth 1 contracts/lib/solady contracts/lib/forge-std
+	# init+fetch instead of clone --branch so TEMPO_REF may be a branch, tag, or commit SHA.
+	git init -q $(TEMPO_WORK)
+	cd $(TEMPO_WORK) && git remote add origin $(TEMPO_REPO) && \
+	  git fetch -q --depth 1 origin $(TEMPO_REF) && git checkout -q FETCH_HEAD && \
+	  git submodule update --init --depth 1 contracts/lib/solady contracts/lib/forge-std
 	cd $(TEMPO_WORK)/contracts && forge build
 	jq -n \
 	  --arg bc "$$(jq -r '.bytecode.object' $(TEMPO_WORK)/contracts/out/AnchoringDeployer.sol/AnchoringDeployer.json)" \
