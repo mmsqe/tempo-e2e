@@ -1,16 +1,26 @@
-.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down anchoring-artifacts
+.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down contract-artifacts
 
 BIN := .venv/bin
-# The AnchoringRegistry contracts live in the tempo repo; fetch + build them from git.
+# The app contracts (AnchoringRegistry, NVNMStaking) live in the tempo repo; fetch + build from git.
 TEMPO_REPO ?= https://github.com/mmsqe/tempo
 TEMPO_REF ?= nvm
 TEMPO_WORK := .cache/tempo
 
+# _artifact,<Deployer contract>,<output json> — vendor one deployer's initcode + provenance.
+define _artifact
+	jq -n \
+	  --arg bc "$$(jq -r '.bytecode.object' $(TEMPO_WORK)/contracts/out/$(1).sol/$(1).json)" \
+	  --arg repo "$(TEMPO_REPO)" --arg ref "$(TEMPO_REF)" --arg commit "$$(git -C $(TEMPO_WORK) rev-parse HEAD)" \
+	  '{source:$$repo, ref:$$ref, commit:$$commit, note:"Regenerate with: make contract-artifacts", deployer_bytecode:$$bc}' \
+	  > integration_tests/artifacts/$(2)
+	@echo "wrote integration_tests/artifacts/$(2) (tempo $$(git -C $(TEMPO_WORK) rev-parse --short HEAD))"
+endef
+
 install:
 	uv sync
 
-# Rebuild the vendored AnchoringDeployer initcode from the tempo repo's Foundry sources.
-anchoring-artifacts:
+# Rebuild the vendored deployer initcodes from the tempo repo's Foundry sources.
+contract-artifacts:
 	rm -rf $(TEMPO_WORK)
 	# init+fetch instead of clone --branch so TEMPO_REF may be a branch, tag, or commit SHA.
 	git init -q $(TEMPO_WORK)
@@ -18,12 +28,8 @@ anchoring-artifacts:
 	  git fetch -q --depth 1 origin $(TEMPO_REF) && git checkout -q FETCH_HEAD && \
 	  git submodule update --init --depth 1 contracts/lib/solady contracts/lib/forge-std
 	cd $(TEMPO_WORK)/contracts && forge build
-	jq -n \
-	  --arg bc "$$(jq -r '.bytecode.object' $(TEMPO_WORK)/contracts/out/AnchoringDeployer.sol/AnchoringDeployer.json)" \
-	  --arg repo "$(TEMPO_REPO)" --arg ref "$(TEMPO_REF)" --arg commit "$$(git -C $(TEMPO_WORK) rev-parse HEAD)" \
-	  '{source:$$repo, ref:$$ref, commit:$$commit, note:"Regenerate with: make anchoring-artifacts", deployer_bytecode:$$bc}' \
-	  > integration_tests/artifacts/anchoring.json
-	@echo "wrote integration_tests/artifacts/anchoring.json (tempo $$(git -C $(TEMPO_WORK) rev-parse --short HEAD))"
+	$(call _artifact,AnchoringDeployer,anchoring.json)
+	$(call _artifact,StakingDeployer,staking.json)
 
 # Full suite (launches a local dev node).
 test:
