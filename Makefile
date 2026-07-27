@@ -1,9 +1,26 @@
-.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down
+.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down anchoring-artifacts
 
 BIN := .venv/bin
+# The AnchoringRegistry contracts live in the tempo repo; fetch + build them from git.
+TEMPO_REPO ?= https://github.com/mmsqe/tempo
+TEMPO_REF ?= nvm
+TEMPO_WORK := .cache/tempo
 
 install:
 	uv sync
+
+# Rebuild the vendored AnchoringDeployer initcode from the tempo repo's Foundry sources.
+anchoring-artifacts:
+	rm -rf $(TEMPO_WORK)
+	git clone --depth 1 --branch $(TEMPO_REF) $(TEMPO_REPO) $(TEMPO_WORK)
+	cd $(TEMPO_WORK) && git submodule update --init --depth 1 contracts/lib/solady contracts/lib/forge-std
+	cd $(TEMPO_WORK)/contracts && forge build
+	jq -n \
+	  --arg bc "$$(jq -r '.bytecode.object' $(TEMPO_WORK)/contracts/out/AnchoringDeployer.sol/AnchoringDeployer.json)" \
+	  --arg repo "$(TEMPO_REPO)" --arg ref "$(TEMPO_REF)" --arg commit "$$(git -C $(TEMPO_WORK) rev-parse HEAD)" \
+	  '{source:$$repo, ref:$$ref, commit:$$commit, note:"Regenerate with: make anchoring-artifacts", deployer_bytecode:$$bc}' \
+	  > integration_tests/artifacts/anchoring.json
+	@echo "wrote integration_tests/artifacts/anchoring.json (tempo $$(git -C $(TEMPO_WORK) rev-parse --short HEAD))"
 
 # Full suite (launches a local dev node).
 test:
