@@ -206,19 +206,27 @@ async def send_calls(
     nonce: int | None = None,
     fee_token: str = PATH_USD,
     gas_limit: int = DEFAULT_GAS_LIMIT,
+    max_priority_fee_per_gas: int = DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+    max_fee_per_gas: int | None = None,
 ):
-    """Build, sign, and send a tempo tx from ``calls``, filling nonce and fees."""
+    """Build, sign, and send a tempo tx from ``calls``, filling nonce and fees.
+
+    ``max_fee_per_gas`` defaults to a comfortable multiple of the current base fee
+    plus the tip; pass it together with ``max_priority_fee_per_gas`` to drive the
+    fee market explicitly (e.g. EIP-1559 / priority-fee tests).
+    """
     sender = Account.from_key(private_key).address
     if nonce is None:
         nonce = await get_nonce(w3, sender)
-    priority = DEFAULT_MAX_PRIORITY_FEE_PER_GAS
+    if max_fee_per_gas is None:
+        max_fee_per_gas = await suggested_max_fee(w3, max_priority_fee_per_gas)
     tx = build_tempo_tx(
         chain_id=chain_id,
         nonce=nonce,
         fee_token=fee_token,
         gas_limit=gas_limit,
-        max_priority_fee_per_gas=priority,
-        max_fee_per_gas=await suggested_max_fee(w3, priority),
+        max_priority_fee_per_gas=max_priority_fee_per_gas,
+        max_fee_per_gas=max_fee_per_gas,
         calls=calls,
     )
     return await send_tempo_tx(w3, tx, private_key)
