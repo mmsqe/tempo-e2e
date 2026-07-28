@@ -6,15 +6,24 @@ mock by default or a real address passed as the constructor arg.
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
+import rlp
 from eth_abi.abi import encode
+from eth_account import Account
+from eth_contract import Contract
 from eth_contract.erc20 import ERC20
+from eth_utils import keccak, to_checksum_address
 from tempo.constants import PATH_USD
-from web3 import Web3
+from tempo.devnet.ports import find_free_base_ports
+from web3 import AsyncWeb3, Web3
 
-from .abi import STAKING, STAKING_DEPLOYER
+from .abi import CURRENT_COMMITTEE, CURRENT_COMMITTEE_ADDRESS, STAKING, STAKING_DEPLOYER
+from .conftest import _consensus_net_supervisord, _run_devnet_init
+from .network import FAUCET_PRIVATE_KEY, resolve_tempo_bin, resolve_xtask_bin
 from .utils import fund, gas_cost_in_token, new_account, send_calls
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
@@ -260,3 +269,113 @@ async def test_rewards_paid_in_real_fee_stablecoin(w3, chain_id, funded_account)
     receipt = await staking.send(funded_account, STAKING.fns.claim(val))
     # The claim tx's own gas is also paid in PATH_USD, so net it out of the delta.
     assert await staking.call(ERC20.fns.balanceOf(me), to=PATH_USD) - before == reward - gas_cost_in_token(receipt)
+
+
+# -- native epoch feed (opt-in: --consensus + a feed-capable binary) -----------------------------
+# Genesis carries the precomputed proxy address; once 4 of 5 validators are staked,
+# CurrentCommittee must shrink to those 4. A binary without the feed keeps all 5 and fails here.
+
+V2_ADDRESS = to_checksum_address("0xcccccccc00000000000000000000000000000001")
+_V2_VALIDATOR = (
+    "(bytes32 publicKey, address validatorAddress, string ingress, string egress, "
+    "address feeRecipient, uint64 index, uint64 addedAtHeight, uint64 deactivatedAtHeight)"
+)
+VALIDATOR_CONFIG_V2 = Contract.from_abi([f"function getActiveValidators() view returns ({_V2_VALIDATOR}[])"])
+
+N_ELECTION_VALIDATORS = 5  # elect 4 of 5: passes the node's min(4, registry) floor
+
+
+def _create_address(sender: str, nonce: int) -> str:
+    """The address of a CREATE from ``sender`` at ``nonce``."""
+    return to_checksum_address(keccak(rlp.encode([bytes.fromhex(sender[2:]), nonce]))[12:])
+
+
+def _staking_genesis_address() -> str:
+    """Faucet EOA nonce 0 deploys StakingDeployer; its constructor's 3rd CREATE is the proxy."""
+    deployer_contract = _create_address(Account.from_key(FAUCET_PRIVATE_KEY).address, 0)
+    return _create_address(deployer_contract, 3)
+
+
+@pytest.fixture(scope="module")
+def election_net(request, tmp_path_factory):
+    """A 5-validator supervisord localnet whose genesis carries `stakingElection`."""
+    if not request.config.getoption("--consensus"):
+        pytest.skip("staking-election feed test needs --consensus")
+    if request.config.getoption("--tempo-bin"):
+        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
+
+    base = tmp_path_factory.mktemp("staking-election")
+    config = {
+        "chain_id": 1337,
+        "accounts": 200,
+        "epoch_length": 100,
+        "seed": 0,
+        "tempo_bin": resolve_tempo_bin(),
+        "tempo_xtask_bin": resolve_xtask_bin(),
+        "validators": [
+            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"}
+            for i, port in enumerate(find_free_base_ports(N_ELECTION_VALIDATORS))
+        ],
+        "patch_genesis": {"config": {"stakingElection": _staking_genesis_address()}},
+    }
+    data_dir = _run_devnet_init(base, config, gen_compose_file=False)
+    yield from _consensus_net_supervisord(request, base, data_dir)
+
+
+@pytest.mark.consensus
+@pytest.mark.slow
+async def test_epoch_committee_follows_staking_election(election_net):
+    w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(election_net.node_rpc_url("node0")))
+    try:
+        faucet = Account.from_key(FAUCET_PRIVATE_KEY)
+        assert await w3.eth.get_transaction_count(faucet.address) == 0, (
+            "faucet nonce must be 0: the genesis stakingElection address assumes it deploys first"
+        )
+
+        # Deploy the staking bundle; the proxy must land exactly on the genesis-patched address.
+        arg = encode(["address"], [PATH_USD]).hex()
+        receipt = await send_calls(
+            w3,
+            chain_id=1337,
+            private_key=faucet.key.hex(),
+            calls=[{"to": None, "data": DEPLOYER_BYTECODE + arg}],
+            gas_limit=25_000_000,
+        )
+        assert receipt["status"] == 1
+        d = receipt["contractAddress"]
+        cs = Web3.to_checksum_address
+        staking_addr = cs(await STAKING_DEPLOYER.fns.staking().call(w3, to=d))
+        assert staking_addr == _staking_genesis_address(), (
+            "deployed proxy does not match the genesis stakingElection address (StakingDeployer CREATE order changed?)"
+        )
+        nvnm = cs(await STAKING_DEPLOYER.fns.nvnm().call(w3, to=d))
+        staking = Staking(w3, 1337, staking_addr, nvnm, PATH_USD)
+
+        # Elect 4 of the 5 genesis validators (by their ValidatorConfigV2 validatorAddress).
+        active = await VALIDATOR_CONFIG_V2.fns.getActiveValidators().call(w3, to=V2_ADDRESS)
+        assert len(active) == N_ELECTION_VALIDATORS
+        key_by_addr = {cs(v[1]): bytes(v[0]) for v in active}
+        elected = sorted(key_by_addr)[: N_ELECTION_VALIDATORS - 1]
+        for v in elected:
+            await staking.send(faucet, STAKING.fns.setCandidate(v, True))
+        await staking.send(faucet, STAKING.fns.setSeatConfig(100 * ETHER, 10, 5))
+        for v in elected:
+            await staking.stake(faucet, v, 100 * ETHER)
+        expected = {key_by_addr[v] for v in elected}
+
+        # The DKG for a later epoch must pick up the election: CurrentCommittee shrinks to the 4.
+        deadline = time.time() + 360
+        last = None
+        while time.time() < deadline:
+            epoch, keys = await CURRENT_COMMITTEE.fns.getCommitteeMembers().call(w3, to=CURRENT_COMMITTEE_ADDRESS)
+            last = (epoch, {bytes(k) for k in keys})
+            if last[1] == expected:
+                return
+            await asyncio.sleep(3)
+        block = await w3.eth.block_number
+        pytest.fail(
+            f"committee never matched the election (block {block}, epoch {last[0]}, "
+            f"{len(last[1])} members; expected the {len(expected)} elected)"
+        )
+    finally:
+        await w3.provider.disconnect()
