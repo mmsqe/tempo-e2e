@@ -43,6 +43,8 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
+        "function distributeFees(address validator, address token)",  # permissionless payout to the fee recipient
+        "function collectedFees(address validator, address token) view returns (uint256)",
     ]
 )
 
@@ -288,6 +290,16 @@ STAKING = Contract.from_abi(
         "function setUnbondingPeriod(uint256 period)",
         "function withdraw(address validator) returns (uint256 amount)",
         "function pendingUnstakeOf(address validator, address user) view returns (uint256 amount, uint256 releaseAt)",
+    ]
+)
+
+# FeeRouter (app contract): per-validator fee splitter — commission to the operator, remainder
+# deposited into the staking pool. `flush` is permissionless.
+FEE_ROUTER = Contract.from_abi(
+    [
+        "function flush() returns (uint256 deposited)",
+        "function validator() view returns (address)",
+        "function commissionBps() view returns (uint256)",
     ]
 )
 

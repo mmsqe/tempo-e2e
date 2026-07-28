@@ -17,11 +17,11 @@ from eth_account import Account
 from eth_contract import Contract
 from eth_contract.erc20 import ERC20
 from eth_utils import keccak, to_checksum_address
-from tempo.constants import PATH_USD
+from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 from tempo.devnet.ports import find_free_base_ports
 from web3 import AsyncWeb3, Web3
 
-from .abi import CURRENT_COMMITTEE, CURRENT_COMMITTEE_ADDRESS, STAKING, STAKING_DEPLOYER
+from .abi import CURRENT_COMMITTEE, CURRENT_COMMITTEE_ADDRESS, FEE, FEE_ROUTER, STAKING, STAKING_DEPLOYER
 from .conftest import _consensus_net_supervisord, _run_devnet_init
 from .network import FAUCET_PRIVATE_KEY, resolve_tempo_bin, resolve_xtask_bin
 from .utils import fund, gas_cost_in_token, new_account, send_calls
@@ -30,8 +30,25 @@ pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
 
 ETHER = 10**18
 
-_ARTIFACT = json.loads((Path(__file__).parent / "artifacts" / "staking.json").read_text())
-DEPLOYER_BYTECODE = _ARTIFACT["deployer_bytecode"]
+
+def _bytecode(name):
+    return json.loads((Path(__file__).parent / "artifacts" / f"{name}.json").read_text())["deployer_bytecode"]
+
+
+DEPLOYER_BYTECODE = _bytecode("staking")
+ROUTER_BYTECODE = _bytecode("feerouter")
+
+
+async def _send(w3, chain_id, signer, to, fn):
+    receipt = await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=signer.key.hex(),
+        calls=[{"to": to, "data": fn.data}],
+        gas_limit=8_000_000,
+    )
+    assert receipt["status"] == 1
+    return receipt
 
 
 class Staking:
@@ -42,15 +59,7 @@ class Staking:
         self.address, self.nvnm, self.usd = address, nvnm, usd
 
     async def send(self, signer, fn, to=None):
-        receipt = await send_calls(
-            self.w3,
-            chain_id=self.chain_id,
-            private_key=signer.key.hex(),
-            calls=[{"to": to or self.address, "data": fn.data}],
-            gas_limit=8_000_000,
-        )
-        assert receipt["status"] == 1
-        return receipt
+        return await _send(self.w3, self.chain_id, signer, to or self.address, fn)
 
     async def call(self, fn, to=None, **kwargs):
         return await fn.call(self.w3, to=to or self.address, **kwargs)
@@ -64,18 +73,23 @@ class Staking:
         await self.send(signer, STAKING.fns.depositReward(validator, amount))
 
 
-async def _deploy(w3, chain_id, deployer, reward_token=None):
-    """Deploy via StakingDeployer; ``deployer`` owns and is pre-funded. ``reward_token=None`` → mock."""
-    arg = encode(["address"], [reward_token or "0x" + "00" * 20]).hex()
+async def _create(w3, chain_id, deployer, data):
+    """Send a create tx and return the new contract's address."""
     receipt = await send_calls(
         w3,
         chain_id=chain_id,
         private_key=deployer.key.hex(),
-        calls=[{"to": None, "data": DEPLOYER_BYTECODE + arg}],
-        gas_limit=25_000_000,  # deploys token(s) + impl + proxy
+        calls=[{"to": None, "data": data}],
+        gas_limit=25_000_000,
     )
-    assert receipt["status"] == 1, "deployer create reverted"
-    d = receipt["contractAddress"]
+    assert receipt["status"] == 1, "create reverted"
+    return Web3.to_checksum_address(receipt["contractAddress"])
+
+
+async def _deploy(w3, chain_id, deployer, reward_token=None):
+    """Deploy via StakingDeployer; ``deployer`` owns and is pre-funded. ``reward_token=None`` → mock."""
+    arg = encode(["address"], [reward_token or "0x" + "00" * 20]).hex()
+    d = await _create(w3, chain_id, deployer, DEPLOYER_BYTECODE + arg)
     cs = Web3.to_checksum_address
     addr, nvnm, usd = (
         cs(await STAKING_DEPLOYER.fns.staking().call(w3, to=d)),
@@ -271,6 +285,34 @@ async def test_rewards_paid_in_real_fee_stablecoin(w3, chain_id, funded_account)
     assert await staking.call(ERC20.fns.balanceOf(me), to=PATH_USD) - before == reward - gas_cost_in_token(receipt)
 
 
+async def test_fee_router_splits_fees_to_operator_and_stakers(w3, chain_id, funded_account):
+    """PATH_USD landing on the router is split: operator commission + staking-pool deposit."""
+    staking = await _deploy(w3, chain_id, funded_account, reward_token=PATH_USD)
+    me, val, operator = funded_account.address, new_account().address, new_account().address
+
+    arg = encode(["address", "address", "address", "uint256"], [val, operator, staking.address, 1_000]).hex()
+    router = await _create(w3, chain_id, funded_account, ROUTER_BYTECODE + arg)  # 10% commission
+    await staking.stake(funded_account, val, 100 * ETHER)
+
+    # Fees arrive on the router (FeeManager's distributeFees payout is exactly this transfer).
+    fees = 200 * 10**6
+    await staking.send(funded_account, ERC20.fns.transfer(router, fees), to=PATH_USD)
+
+    keeper = new_account()
+    await fund(w3, keeper.address)
+    await staking.send(keeper, FEE_ROUTER.fns.flush(), to=router)
+
+    assert await staking.call(ERC20.fns.balanceOf(operator), to=PATH_USD) == fees // 10
+    assert await staking.call(STAKING.fns.earned(val, me)) == fees - fees // 10
+    assert await staking.call(ERC20.fns.balanceOf(router), to=PATH_USD) == 0
+
+
+async def test_distribute_fees_is_permissionless(w3, chain_id, funded_account):
+    """Anyone may trigger the FeeManager's payout for any fee recipient (a router included)."""
+    recipient = new_account().address  # nothing collected: succeeds as a no-op, no auth gate
+    await _send(w3, chain_id, funded_account, FEE_MANAGER_ADDRESS, FEE.fns.distributeFees(recipient, PATH_USD))
+
+
 # -- native epoch feed (opt-in: --consensus + a feed-capable binary) -----------------------------
 # Genesis carries the precomputed proxy address; once 4 of 5 validators are staked,
 # CurrentCommittee must shrink to those 4. A binary without the feed keeps all 5 and fails here.
@@ -290,10 +332,12 @@ def _create_address(sender: str, nonce: int) -> str:
     return to_checksum_address(keccak(rlp.encode([bytes.fromhex(sender[2:]), nonce]))[12:])
 
 
+# Dedicated key: its nonce-0 StakingDeployer create yields the genesis-patched proxy (3rd CREATE).
+ELECTION_DEPLOYER = Account.from_key(keccak(b"nvm-election-deployer"))
+
+
 def _staking_genesis_address() -> str:
-    """Faucet EOA nonce 0 deploys StakingDeployer; its constructor's 3rd CREATE is the proxy."""
-    deployer_contract = _create_address(Account.from_key(FAUCET_PRIVATE_KEY).address, 0)
-    return _create_address(deployer_contract, 3)
+    return _create_address(_create_address(ELECTION_DEPLOYER.address, 0), 3)
 
 
 @pytest.fixture(scope="module")
@@ -324,43 +368,61 @@ def election_net(request, tmp_path_factory):
 
 @pytest.mark.consensus
 @pytest.mark.slow
-async def test_epoch_committee_follows_staking_election(election_net):
+async def test_distribute_fees_pays_the_collected_amount(election_net):
+    """Tx fees accrue under block proposers' fee recipients; distributeFees pays them out."""
     w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(election_net.node_rpc_url("node0")))
     try:
         faucet = Account.from_key(FAUCET_PRIVATE_KEY)
-        assert await w3.eth.get_transaction_count(faucet.address) == 0, (
-            "faucet nonce must be 0: the genesis stakingElection address assumes it deploys first"
-        )
+        active = await VALIDATOR_CONFIG_V2.fns.getActiveValidators().call(w3, to=V2_ADDRESS)
+        recipients = [Web3.to_checksum_address(v[4]) for v in active if int(v[4], 16) != 0]
+        assert recipients, "localnet validators have no fee recipients"
 
-        # Deploy the staking bundle; the proxy must land exactly on the genesis-patched address.
-        arg = encode(["address"], [PATH_USD]).hex()
-        receipt = await send_calls(
-            w3,
-            chain_id=1337,
-            private_key=faucet.key.hex(),
-            calls=[{"to": None, "data": DEPLOYER_BYTECODE + arg}],
-            gas_limit=25_000_000,
-        )
-        assert receipt["status"] == 1
-        d = receipt["contractAddress"]
+        # Generate fees until some recipient has a nonzero collected balance.
+        pick = collected = None
+        for _ in range(10):
+            await _send(w3, 1337, faucet, PATH_USD, ERC20.fns.transfer(faucet.address, 1))
+            for cand in recipients:
+                if c := await FEE.fns.collectedFees(cand, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS):
+                    pick, collected = cand, c
+                    break
+            if pick:
+                break
+        assert pick, f"no fees accrued to any of {recipients}"
+
+        before = await ERC20.fns.balanceOf(pick).call(w3, to=PATH_USD)
+        await _send(w3, 1337, faucet, FEE_MANAGER_ADDRESS, FEE.fns.distributeFees(pick, PATH_USD))
+        # More fees may accrue for `pick` between the read and the payout, so >=.
+        assert await ERC20.fns.balanceOf(pick).call(w3, to=PATH_USD) - before >= collected
+    finally:
+        await w3.provider.disconnect()
+
+
+@pytest.mark.consensus
+@pytest.mark.slow
+async def test_epoch_committee_follows_staking_election(election_net):
+    w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(election_net.node_rpc_url("node0")))
+    try:
+        deployer, faucet = ELECTION_DEPLOYER, Account.from_key(FAUCET_PRIVATE_KEY)
+        # Fund fresh deployer, its nonce-0 create must land on the genesis-patched address.
+        await _send(w3, 1337, faucet, PATH_USD, ERC20.fns.transfer(deployer.address, 10**14))
+        assert await w3.eth.get_transaction_count(deployer.address) == 0, "election deployer must be fresh"
+        d = await _create(w3, 1337, deployer, DEPLOYER_BYTECODE + encode(["address"], [PATH_USD]).hex())
         cs = Web3.to_checksum_address
         staking_addr = cs(await STAKING_DEPLOYER.fns.staking().call(w3, to=d))
-        assert staking_addr == _staking_genesis_address(), (
-            "deployed proxy does not match the genesis stakingElection address (StakingDeployer CREATE order changed?)"
-        )
+        assert staking_addr == _staking_genesis_address(), "proxy != genesis stakingElection address"
         nvnm = cs(await STAKING_DEPLOYER.fns.nvnm().call(w3, to=d))
         staking = Staking(w3, 1337, staking_addr, nvnm, PATH_USD)
 
-        # Elect 4 of the 5 genesis validators (by their ValidatorConfigV2 validatorAddress).
+        # Elect 4 of the 5 validators by their registry validatorAddress.
         active = await VALIDATOR_CONFIG_V2.fns.getActiveValidators().call(w3, to=V2_ADDRESS)
         assert len(active) == N_ELECTION_VALIDATORS
         key_by_addr = {cs(v[1]): bytes(v[0]) for v in active}
         elected = sorted(key_by_addr)[: N_ELECTION_VALIDATORS - 1]
         for v in elected:
-            await staking.send(faucet, STAKING.fns.setCandidate(v, True))
-        await staking.send(faucet, STAKING.fns.setSeatConfig(100 * ETHER, 10, 5))
+            await staking.send(deployer, STAKING.fns.setCandidate(v, True))
+        await staking.send(deployer, STAKING.fns.setSeatConfig(100 * ETHER, 10, 5))
         for v in elected:
-            await staking.stake(faucet, v, 100 * ETHER)
+            await staking.stake(deployer, v, 100 * ETHER)
         expected = {key_by_addr[v] for v in elected}
 
         # The DKG for a later epoch must pick up the election: CurrentCommittee shrinks to the 4.

@@ -30,6 +30,7 @@ contract-artifacts:
 	cd $(TEMPO_WORK)/contracts && forge build
 	$(call _artifact,AnchoringDeployer,anchoring.json)
 	$(call _artifact,StakingDeployer,staking.json)
+	$(call _artifact,FeeRouter,feerouter.json)
 
 # Full suite (launches a local dev node).
 test:
