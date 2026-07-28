@@ -255,3 +255,48 @@ ANCHORING = Contract.from_abi(
 # The one-shot deployer helper (tempo/contracts AnchoringDeployer.sol): its create tx stands up
 # impl + proxy + init and exposes the proxy address.
 ANCHORING_DEPLOYER = Contract.from_abi(["function registry() view returns (address)"])
+
+
+# NVNMStaking (upgradeable app contract): delegated staking that shares chain fees with stakers.
+# Stake NVNM toward a validator, deposited reward-token (nvmnUSD) is split pro-rata per validator.
+STAKING = Contract.from_abi(
+    [
+        "function stake(address validator, uint256 amount)",
+        "function unstake(address validator, uint256 amount)",
+        "function depositReward(address validator, uint256 amount)",
+        "function claim(address validator) returns (uint256 amount)",
+        "function earned(address validator, address user) view returns (uint256)",
+        "function stakedOf(address validator, address user) view returns (uint256)",
+        "function totalStaked(address validator) view returns (uint256)",
+        "function stakeToken() view returns (address)",
+        "function rewardToken() view returns (address)",
+        # committee election (quantized multi-seat): seats = min(stake/tokensPerSeat, cap),
+        # ranked by stake, truncated to the maxSeats budget.
+        "function setCandidate(address validator, bool active)",
+        "function setSeatConfig(uint256 tokensPerSeat, uint256 maxSeats, uint256 maxSeatsPerValidator)",
+        "function candidates() view returns (address[])",
+        "function computeCommittee() view returns (address[] vals, uint256[] seats)",
+        # bonded candidacy: self-register against an NVNM bond (refunded on resign/kick).
+        "function setCandidacyBond(uint256 bond)",
+        "function registerCandidate()",
+        "function resignCandidate()",
+        "function bondOf(address validator) view returns (uint256)",
+        # slashing: system caller (address(0)) or owner cuts a validator pool pro-rata in O(1);
+        # pending (unbonding) stake is cut too via the per-validator factor.
+        "function slash(address validator, uint256 bps, address recipient) returns (uint256 seized)",
+        # unbonding: with a period set, unstake parks stake in a pending bucket until withdraw.
+        "function setUnbondingPeriod(uint256 period)",
+        "function withdraw(address validator) returns (uint256 amount)",
+        "function pendingUnstakeOf(address validator, address user) view returns (uint256 amount, uint256 releaseAt)",
+    ]
+)
+
+# The one-shot deployer helper (tempo/contracts StakingDeployer.sol): stands up mock NVNM + reward
+# tokens and the staking proxy, and exposes their addresses.
+STAKING_DEPLOYER = Contract.from_abi(
+    [
+        "function staking() view returns (address)",
+        "function nvnm() view returns (address)",
+        "function usd() view returns (address)",
+    ]
+)
