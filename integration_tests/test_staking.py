@@ -21,7 +21,15 @@ from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 from tempo.devnet.ports import find_free_base_ports
 from web3 import AsyncWeb3, Web3
 
-from .abi import CURRENT_COMMITTEE, CURRENT_COMMITTEE_ADDRESS, FEE, FEE_ROUTER, STAKING, STAKING_DEPLOYER
+from .abi import (
+    CURRENT_COMMITTEE,
+    CURRENT_COMMITTEE_ADDRESS,
+    FEE,
+    FEE_ROUTER,
+    FEE_ROUTER_FACTORY,
+    STAKING,
+    STAKING_DEPLOYER,
+)
 from .conftest import _consensus_net_supervisord, _run_devnet_init
 from .network import FAUCET_PRIVATE_KEY, resolve_tempo_bin, resolve_xtask_bin
 from .utils import fund, gas_cost_in_token, new_account, send_calls
@@ -36,7 +44,8 @@ def _bytecode(name):
 
 
 DEPLOYER_BYTECODE = _bytecode("staking")
-ROUTER_BYTECODE = _bytecode("feerouter")
+FACTORY_BYTECODE = _bytecode("feerouter_factory")
+POOL_BYTECODE = _bytecode("swap_pool")
 
 
 async def _send(w3, chain_id, signer, to, fn):
@@ -141,6 +150,17 @@ async def test_unstake_returns_stake(staking, funded_account):
     await staking.send(funded_account, STAKING.fns.unstake(val, 100 * ETHER))
     assert await staking.call(ERC20.fns.balanceOf(me), to=staking.nvnm) - before == 100 * ETHER
     assert await staking.call(STAKING.fns.stakedOf(val, me)) == 0
+
+
+async def test_compound_reward_grows_stakes_pro_rata(staking, funded_account):
+    """Compounded NVNM (e.g. fee-buyback proceeds) raises every delegator's stake, not shares."""
+    me, val = funded_account.address, new_account().address
+    await staking.stake(funded_account, val, 100 * ETHER)
+
+    await staking.send(funded_account, ERC20.fns.approve(staking.address, 50 * ETHER), to=staking.nvnm)
+    await staking.send(funded_account, STAKING.fns.compoundReward(val, 50 * ETHER))
+    assert await staking.call(STAKING.fns.stakedOf(val, me)) == 150 * ETHER
+    assert await staking.call(STAKING.fns.earned(val, me)) == 0  # stablecoin accumulator untouched
 
 
 async def test_committee_election_quantizes_stake_into_seats(staking, funded_account):
@@ -285,13 +305,22 @@ async def test_rewards_paid_in_real_fee_stablecoin(w3, chain_id, funded_account)
     assert await staking.call(ERC20.fns.balanceOf(me), to=PATH_USD) - before == reward - gas_cost_in_token(receipt)
 
 
+async def _router_setup(w3, chain_id, owner, commission_bps, buyback_bps):
+    """PATH_USD staking + a factory (cap 100%) + one router; returns (staking, val, operator, factory, router)."""
+    staking = await _deploy(w3, chain_id, owner, reward_token=PATH_USD)
+    val, operator = new_account().address, new_account().address
+    arg = encode(["address", "address", "uint256"], [staking.address, owner.address, 10_000]).hex()
+    factory = await _create(w3, chain_id, owner, FACTORY_BYTECODE + arg)
+    fn = FEE_ROUTER_FACTORY.fns.create(val, operator, commission_bps, buyback_bps)
+    receipt = await staking.send(owner, fn, to=factory)
+    log = next(lg for lg in receipt["logs"] if lg["address"].lower() == factory.lower())
+    return staking, val, operator, factory, Web3.to_checksum_address(bytes(log["data"])[12:32])
+
+
 async def test_fee_router_splits_fees_to_operator_and_stakers(w3, chain_id, funded_account):
     """PATH_USD landing on the router is split: operator commission + staking-pool deposit."""
-    staking = await _deploy(w3, chain_id, funded_account, reward_token=PATH_USD)
-    me, val, operator = funded_account.address, new_account().address, new_account().address
-
-    arg = encode(["address", "address", "address", "uint256"], [val, operator, staking.address, 1_000]).hex()
-    router = await _create(w3, chain_id, funded_account, ROUTER_BYTECODE + arg)  # 10% commission
+    staking, val, operator, _, router = await _router_setup(w3, chain_id, funded_account, 1_000, 0)
+    me = funded_account.address
     await staking.stake(funded_account, val, 100 * ETHER)
 
     # Fees arrive on the router (FeeManager's distributeFees payout is exactly this transfer).
@@ -305,6 +334,31 @@ async def test_fee_router_splits_fees_to_operator_and_stakers(w3, chain_id, fund
     assert await staking.call(ERC20.fns.balanceOf(operator), to=PATH_USD) == fees // 10
     assert await staking.call(STAKING.fns.earned(val, me)) == fees - fees // 10
     assert await staking.call(ERC20.fns.balanceOf(router), to=PATH_USD) == 0
+
+
+async def test_fee_buyback_compounds_into_stake(w3, chain_id, funded_account):
+    """The buyback split buys NVNM on the owner-set market and compounds it into the pool."""
+    staking, val, operator, factory, router = await _router_setup(w3, chain_id, funded_account, 1_000, 4_000)
+    me = funded_account.address
+
+    # Seed an NVNM/PATH_USD market and point the factory at it.
+    pool_arg = encode(["address", "address"], [PATH_USD, staking.nvnm]).hex()
+    pool = await _create(w3, chain_id, funded_account, POOL_BYTECODE + pool_arg)
+    usd_reserve, nvnm_reserve = 500 * 10**6, 100 * ETHER
+    await staking.send(funded_account, ERC20.fns.transfer(pool, usd_reserve), to=PATH_USD)
+    await staking.send(funded_account, ERC20.fns.transfer(pool, nvnm_reserve), to=staking.nvnm)
+    await staking.send(funded_account, FEE_ROUTER_FACTORY.fns.setSwapper(pool), to=factory)
+
+    await staking.stake(funded_account, val, 100 * ETHER)
+    fees = 200 * 10**6
+    await staking.send(funded_account, ERC20.fns.transfer(router, fees), to=PATH_USD)
+    await staking.send(funded_account, FEE_ROUTER.fns.flush(), to=router)
+
+    buyback = fees * 4_000 // 10_000
+    expected_nvnm = nvnm_reserve * buyback // (usd_reserve + buyback)  # x*y=k
+    assert await staking.call(ERC20.fns.balanceOf(operator), to=PATH_USD) == fees // 10
+    assert await staking.call(STAKING.fns.earned(val, me)) == fees // 2  # 50% deposited
+    assert await staking.call(STAKING.fns.stakedOf(val, me)) == 100 * ETHER + expected_nvnm
 
 
 async def test_distribute_fees_is_permissionless(w3, chain_id, funded_account):

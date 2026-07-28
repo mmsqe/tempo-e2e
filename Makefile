@@ -6,14 +6,14 @@ TEMPO_REPO ?= https://github.com/mmsqe/tempo
 TEMPO_REF ?= nvm
 TEMPO_WORK := .cache/tempo
 
-# _artifact,<Deployer contract>,<output json> — vendor one deployer's initcode + provenance.
+# _artifact,<source .sol>,<contract>,<output json> — vendor one deployer's initcode + provenance.
 define _artifact
 	jq -n \
-	  --arg bc "$$(jq -r '.bytecode.object' $(TEMPO_WORK)/contracts/out/$(1).sol/$(1).json)" \
+	  --arg bc "$$(jq -r '.bytecode.object' $(TEMPO_WORK)/contracts/out/$(1).sol/$(2).json)" \
 	  --arg repo "$(TEMPO_REPO)" --arg ref "$(TEMPO_REF)" --arg commit "$$(git -C $(TEMPO_WORK) rev-parse HEAD)" \
 	  '{source:$$repo, ref:$$ref, commit:$$commit, note:"Regenerate with: make contract-artifacts", deployer_bytecode:$$bc}' \
-	  > integration_tests/artifacts/$(2)
-	@echo "wrote integration_tests/artifacts/$(2) (tempo $$(git -C $(TEMPO_WORK) rev-parse --short HEAD))"
+	  > integration_tests/artifacts/$(3)
+	@echo "wrote integration_tests/artifacts/$(3) (tempo $$(git -C $(TEMPO_WORK) rev-parse --short HEAD))"
 endef
 
 install:
@@ -28,9 +28,10 @@ contract-artifacts:
 	  git fetch -q --depth 1 origin $(TEMPO_REF) && git checkout -q FETCH_HEAD && \
 	  git submodule update --init --depth 1 contracts/lib/solady contracts/lib/forge-std
 	cd $(TEMPO_WORK)/contracts && forge build
-	$(call _artifact,AnchoringDeployer,anchoring.json)
-	$(call _artifact,StakingDeployer,staking.json)
-	$(call _artifact,FeeRouter,feerouter.json)
+	$(call _artifact,AnchoringDeployer,AnchoringDeployer,anchoring.json)
+	$(call _artifact,StakingDeployer,StakingDeployer,staking.json)
+	$(call _artifact,FeeRouter,FeeRouterFactory,feerouter_factory.json)
+	$(call _artifact,MockSwapPool,MockSwapPool,swap_pool.json)
 
 # Full suite (launches a local dev node).
 test:

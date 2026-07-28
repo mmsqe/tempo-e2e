@@ -266,6 +266,7 @@ STAKING = Contract.from_abi(
         "function stake(address validator, uint256 amount)",
         "function unstake(address validator, uint256 amount)",
         "function depositReward(address validator, uint256 amount)",
+        "function compoundReward(address validator, uint256 amount)",
         "function claim(address validator) returns (uint256 amount)",
         "function earned(address validator, address user) view returns (uint256)",
         "function stakedOf(address validator, address user) view returns (uint256)",
@@ -300,6 +301,13 @@ FEE_ROUTER = Contract.from_abi(
         "function flush() returns (uint256 deposited)",
         "function validator() view returns (address)",
         "function commissionBps() view returns (uint256)",
+    ]
+)
+FEE_ROUTER_FACTORY = Contract.from_abi(
+    [
+        "function create(address validator, address operator, uint256 commissionBps, uint256 buybackBps) returns (address router)",
+        "function setSwapper(address swapper)",
+        "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps, uint256 buybackBps)",
     ]
 )
 
