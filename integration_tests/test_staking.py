@@ -3,8 +3,9 @@
 StakingDeployer deploys mock NVNM + the staking proxy in one create tx; the reward token is a
 mock by default or a real address passed as the constructor arg.
 
-Grouped by concern: core staking, committee election, unbonding/slash, fee routing, and the
-node-side epoch feed.
+Grouped by concern: core staking, committee election, unbonding/slash, fee routing, the global
+fee pool (the model NVM runs), bridge/swapper, and the node-side epoch feed. The per-validator
+surface stays covered because the contracts keep it live for weighted PoS.
 """
 
 import asyncio
@@ -24,23 +25,33 @@ from tempo.devnet.ports import find_free_base_ports
 from web3 import AsyncWeb3, Web3
 
 from .abi import (
+    BRIDGED_NVNM,
     CURRENT_COMMITTEE,
     CURRENT_COMMITTEE_ADDRESS,
     FEE,
     FEE_ROUTER,
     FEE_ROUTER_FACTORY,
+    GUARDED_SWAPPER,
+    MOCK_ERC20,
     STAKING,
     STAKING_DEPLOYER,
     VALIDATOR_CONFIG_V2,
 )
 from .conftest import _consensus_net_supervisord, _run_devnet_init
 from .network import FAUCET_PRIVATE_KEY, resolve_tempo_bin, resolve_xtask_bin
-from .utils import fund, gas_cost_in_token, new_account, send_calls
+from .utils import call_revert, fund, gas_cost_in_token, new_account, send_calls
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
 
 ETHER = 10**18
 cs = Web3.to_checksum_address
+
+# Custom-error selector (keccak256(sig)[:4]) for revert-reason assertions.
+ERR_AMOUNT_TOO_LARGE = "0x" + keccak(text="AmountTooLarge()")[:4].hex()
+
+# The global fee pool's sentinel "validator": every staker delegates here and every validator's
+# router deposits here, so the pool key belongs to no real operator.
+GLOBAL_POOL = to_checksum_address(keccak(b"nvm.global.pool")[12:])
 
 
 def _bytecode(name):
@@ -50,9 +61,12 @@ def _bytecode(name):
 DEPLOYER_BYTECODE = _bytecode("staking")
 FACTORY_BYTECODE = _bytecode("feerouter_factory")
 POOL_BYTECODE = _bytecode("swap_pool")
+MOCK_ERC20_BYTECODE = _bytecode("mock_erc20")
+BRIDGED_NVNM_BYTECODE = _bytecode("bridged_nvnm")
+GUARDED_SWAPPER_BYTECODE = _bytecode("guarded_swapper")
 
 
-async def _send(w3, chain_id, signer, to, fn):
+async def _send(w3, chain_id, signer, to, fn, expect=1):
     receipt = await send_calls(
         w3,
         chain_id=chain_id,
@@ -60,7 +74,7 @@ async def _send(w3, chain_id, signer, to, fn):
         calls=[{"to": to, "data": fn.data}],
         gas_limit=8_000_000,
     )
-    assert receipt["status"] == 1
+    assert receipt["status"] == expect
     return receipt
 
 
@@ -142,6 +156,11 @@ async def _router_setup(w3, chain_id, owner, commission_bps, buyback_bps):
     factory = await _deploy_factory(staking, owner)
     router = await _create_router(staking, owner, factory, validator, operator, commission_bps, buyback_bps)
     return staking, validator, operator, factory, router
+
+
+async def _mock_token(w3, chain_id, deployer, symbol):
+    arg = encode(["string", "string"], [symbol, symbol]).hex()
+    return await _create(w3, chain_id, deployer, MOCK_ERC20_BYTECODE + arg)
 
 
 async def _setup_election(staking, owner, validators, tokens_per_seat=100 * ETHER):
@@ -383,6 +402,118 @@ class TestFeeRouting:
         await _send(w3, chain_id, funded_account, FEE_MANAGER_ADDRESS, FEE.fns.distributeFees(recipient, PATH_USD))
 
 
+class TestGlobalPool:
+    """The chosen fee-sharing model: one pool for every staker, each validator's router pointed at
+    it. These assert the model is reachable by configuration alone — no contract change.
+    """
+
+    async def test_all_validators_fees_reach_one_staker_pool(self, w3, chain_id, funded_account):
+        """Two validators, two routers, one pool: a staker who picked no operator earns from both."""
+        owner = funded_account
+        staking = await _deploy(w3, chain_id, owner, reward_token=PATH_USD)
+        factory = await _deploy_factory(staking, owner)
+
+        # Stake once, into the sentinel pool — no operator selection, no per-validator pool.
+        await staking.stake(owner, GLOBAL_POOL, 100 * ETHER)
+
+        # Each validator gets its own router whose "validator" is the shared pool and whose
+        # "operator" is that validator's own payout address.
+        payouts = [new_account().address for _ in range(2)]
+        routers = [
+            await _create_router(staking, owner, factory, GLOBAL_POOL, p, 1_000)  # 10% validator share
+            for p in payouts
+        ]
+
+        fees = 200 * 10**6
+        for router in routers:
+            await staking.transfer(owner, PATH_USD, router, fees)
+            await staking.send(owner, FEE_ROUTER.fns.flush(), to=router)
+
+        # Both validators' deposits land in the single pool the staker holds shares in.
+        assert await staking.earned(GLOBAL_POOL, owner.address) == 2 * (fees - fees // 10)
+        for payout in payouts:
+            assert await staking.balance(PATH_USD, payout) == fees // 10
+
+    async def test_slash_takes_only_the_validator_bond(self, staking, funded_account):
+        """Bond-only slashing: slashing an undelegated validator cannot touch the global pool."""
+        owner, treasury = funded_account, new_account().address
+        await staking.stake(owner, GLOBAL_POOL, 100 * ETHER)
+
+        # The validator posts the candidacy bond from its own account (its skin in the game).
+        validator = new_account()
+        await fund(staking.w3, validator.address)  # gas
+        await staking.send(owner, STAKING.fns.setCandidacyBond(50 * ETHER))
+        await staking.transfer(owner, staking.nvnm, validator.address, 50 * ETHER)
+        await staking.send(validator, ERC20.fns.approve(staking.address, 50 * ETHER), to=staking.nvnm)
+        await staking.send(validator, STAKING.fns.registerCandidate())
+
+        await staking.send(owner, STAKING.fns.slash(validator.address, 10_000, treasury))
+        # The full bond is seized, and stakers — who never delegated to it — keep every token.
+        assert await staking.balance(staking.nvnm, treasury) == 50 * ETHER
+        assert await staking.call(STAKING.fns.bondOf(validator.address)) == 0
+        assert await staking.staked_of(GLOBAL_POOL, owner.address) == 100 * ETHER
+
+
+class TestBridgeAndSwapper:
+    """The L1 BridgedNVNM token and the GuardedSwapper buyback-market wrapper."""
+
+    async def test_bridged_nvnm_only_bridge_mints_and_burns(self, w3, chain_id, funded_account):
+        """The L1 NVNM: supply moves only through a Safe-curated BRIDGE-role adapter."""
+        owner = funded_account
+
+        async def send(signer, fn, expect=1):
+            return await _send(w3, chain_id, signer, token, fn, expect)
+
+        async def balance_of(who):
+            return await ERC20.fns.balanceOf(who).call(w3, to=token)
+
+        token = await _create(w3, chain_id, owner, BRIDGED_NVNM_BYTECODE + encode(["address"], [owner.address]).hex())
+
+        stranger, bridge = new_account(), new_account()
+        await fund(w3, stranger.address)
+        await fund(w3, bridge.address)
+        await send(stranger, BRIDGED_NVNM.fns.bridgeMint(stranger.address, ETHER), expect=0)  # not a bridge
+
+        await send(owner, BRIDGED_NVNM.fns.setRole(bridge.address, 1, True))  # owner grants BRIDGE
+        await send(bridge, BRIDGED_NVNM.fns.bridgeMint(bridge.address, 100 * ETHER))
+        assert await balance_of(bridge.address) == 100 * ETHER
+        await send(bridge, BRIDGED_NVNM.fns.bridgeBurn(bridge.address, 40 * ETHER))
+        assert await balance_of(bridge.address) == 60 * ETHER
+        assert await ERC20.fns.totalSupply().call(w3, to=token) == 60 * ETHER  # burn shrank supply
+
+    async def test_guarded_swapper_caps_size_and_price_floor(self, w3, chain_id, funded_account):
+        """The buyback swapper caps swap size and rejects execution below its EMA price floor."""
+        owner = funded_account
+
+        async def send(to, fn, expect=1):
+            return await _send(w3, chain_id, owner, to, fn, expect)
+
+        async def swap(amount, expect=1):
+            return await send(guard, GUARDED_SWAPPER.fns.swap(usd, nvnm, amount, 0), expect)
+
+        usd = await _mock_token(w3, chain_id, owner, "USD")
+        nvnm = await _mock_token(w3, chain_id, owner, "NVNM")
+
+        # Seed a 1:1 pool and a guard (cap 50, -3% floor, EMA alpha 20%), reference price 1.0.
+        pool = await _create(w3, chain_id, owner, POOL_BYTECODE + encode(["address", "address"], [usd, nvnm]).hex())
+        for tok in (usd, nvnm):
+            await send(tok, MOCK_ERC20.fns.mint(owner.address, 10_000 * ETHER))
+            await send(tok, ERC20.fns.transfer(pool, 1_000 * ETHER))
+        guard_arg = encode(["address", "address", "address"], [owner.address, usd, nvnm]).hex()
+        guard = await _create(w3, chain_id, owner, GUARDED_SWAPPER_BYTECODE + guard_arg)
+        await send(guard, GUARDED_SWAPPER.fns.setGuards(pool, 50 * ETHER, 300, 2_000))
+        await send(guard, GUARDED_SWAPPER.fns.seedPrice(ETHER))
+        await send(usd, ERC20.fns.approve(guard, 10_000 * ETHER))
+
+        await swap(10 * ETHER)  # clears; drifts the EMA down
+        assert await GUARDED_SWAPPER.fns.emaPrice().call(w3, to=guard) < ETHER
+        await swap(40 * ETHER, expect=0)  # below the price floor
+        # Over the size cap must revert on the cap specifically — the cap is checked before the
+        # swap, so a regression removing it would surface as a PriceBelowFloor revert instead.
+        err = await call_revert(w3, guard, GUARDED_SWAPPER.fns.swap(usd, nvnm, 51 * ETHER, 0).data)
+        assert ERR_AMOUNT_TOO_LARGE in err, f"expected AmountTooLarge, got {err}"
+
+
 # -- native epoch feed (opt-in: --consensus + a feed-capable binary) -----------------------------
 # Genesis carries the precomputed proxy address; the node's feed eth_calls computeCommittee() at a
 # block hash from address(0). A binary without the feed keeps all validators and fails these.
@@ -486,7 +617,8 @@ class TestEpochFeed:
         assert await ERC20.fns.balanceOf(pick).call(w3, to=PATH_USD) - before >= collected
 
     async def test_committee_follows_staking_election(self, election_w3):
-        """Once 4 of 5 validators are staked, CurrentCommittee must shrink to exactly those 4."""
+        """Below min(4, registry) the node keeps the full registry (fallback); at/above it, the
+        committee shrinks to exactly the elected set."""
         w3 = election_w3
         deployer, faucet = ELECTION_DEPLOYER, Account.from_key(FAUCET_PRIVATE_KEY)
         # Fund fresh deployer, its nonce-0 create must land on the genesis-patched address.
@@ -499,16 +631,32 @@ class TestEpochFeed:
         nvnm = cs(await STAKING_DEPLOYER.fns.nvnm().call(w3, to=d))
         staking = Staking(w3, LOCALNET_CHAIN_ID, staking_addr, nvnm, PATH_USD)
 
-        # Elect 4 of the 5 validators by their registry validatorAddress.
         active = await VALIDATOR_CONFIG_V2.fns.getActiveValidators().call(w3, to=VALIDATOR_CONFIG_V2_ADDRESS)
         assert len(active) == N_ELECTION_VALIDATORS
         key_by_addr = {cs(v[1]): bytes(v[0]) for v in active}
-        elected = sorted(key_by_addr)[: N_ELECTION_VALIDATORS - 1]
+        ranked = sorted(key_by_addr)  # deterministic order by address
         await staking.send(deployer, STAKING.fns.setSeatConfig(100 * ETHER, 10, 5))
-        for v in elected:
-            await staking.send(deployer, STAKING.fns.setCandidate(v, True))
-            await staking.stake(deployer, v, 100 * ETHER)
 
-        # The DKG for a later epoch must pick up the election.
-        expected = {key_by_addr[v] for v in elected}
-        await _wait_committee(w3, lambda _e, m: m == expected, "committee never matched the election")
+        async def elect(addr):
+            await staking.send(deployer, STAKING.fns.setCandidate(addr, True))
+            await staking.stake(deployer, addr, 100 * ETHER)
+
+        # Phase 1 — elect only 3 of 5: below the min(4, registry) floor, so the node must keep the
+        # full registry. Let two epoch boundaries pass (the election is read at each), then confirm
+        # the committee still holds all 5 — i.e. the read fell back rather than shrinking.
+        for addr in ranked[:3]:
+            await elect(addr)
+        start_epoch, _ = await _committee(w3)
+        _, members = await _wait_committee(
+            w3,
+            lambda e, _m: e >= start_epoch + 2,
+            "epoch did not advance to confirm the below-minimum election was read",
+        )
+        assert members == set(key_by_addr.values()), (
+            f"below-minimum election shrank committee to {len(members)}, expected fallback"
+        )
+
+        # Phase 2 — add the 4th: now at the floor, the committee shrinks to exactly those 4.
+        await elect(ranked[3])
+        expected = {key_by_addr[a] for a in ranked[:4]}
+        await _wait_committee(w3, lambda _e, m: m == expected, "committee never matched the 4 elected")
