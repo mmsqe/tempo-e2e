@@ -311,6 +311,27 @@ FEE_ROUTER_FACTORY = Contract.from_abi(
     ]
 )
 
+# Test mock ERC-20 (open mint) and the guarded fee-buyback swapper / bridged L1 NVNM token.
+MOCK_ERC20 = Contract.from_abi(["function mint(address to, uint256 amount)"])
+
+GUARDED_SWAPPER = Contract.from_abi(
+    [
+        "function setGuards(address inner, uint256 maxAmountIn, uint256 maxDeviationBps, uint256 emaAlphaBps)",
+        "function seedPrice(uint256 price)",
+        "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) returns (uint256 out)",
+        "function emaPrice() view returns (uint256)",
+    ]
+)
+
+# BridgedNVNM: BRIDGE=1 role holders mint/burn; owner curates the role (setRole from EnumerableRoles).
+BRIDGED_NVNM = Contract.from_abi(
+    [
+        "function setRole(address holder, uint256 role, bool active)",
+        "function bridgeMint(address to, uint256 amount)",
+        "function bridgeBurn(address from, uint256 amount)",
+    ]
+)
+
 # The one-shot deployer helper (tempo/contracts StakingDeployer.sol): stands up mock NVNM + reward
 # tokens and the staking proxy, and exposes their addresses.
 STAKING_DEPLOYER = Contract.from_abi(

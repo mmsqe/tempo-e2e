@@ -32,6 +32,9 @@ contract-artifacts:
 	$(call _artifact,StakingDeployer,StakingDeployer,staking.json)
 	$(call _artifact,FeeRouter,FeeRouterFactory,feerouter_factory.json)
 	$(call _artifact,MockSwapPool,MockSwapPool,swap_pool.json)
+	$(call _artifact,MockERC20,MockERC20,mock_erc20.json)
+	$(call _artifact,BridgedNVNM,BridgedNVNM,bridged_nvnm.json)
+	$(call _artifact,GuardedSwapper,GuardedSwapper,guarded_swapper.json)
 
 # Full suite (launches a local dev node).
 test:

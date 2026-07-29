@@ -159,7 +159,8 @@ async def test_compound_reward_grows_stakes_pro_rata(staking, funded_account):
 
     await staking.send(funded_account, ERC20.fns.approve(staking.address, 50 * ETHER), to=staking.nvnm)
     await staking.send(funded_account, STAKING.fns.compoundReward(val, 50 * ETHER))
-    assert await staking.call(STAKING.fns.stakedOf(val, me)) == 150 * ETHER
+    # 1 wei tolerance: the virtual-offset share rate rounds in the pool's favor.
+    assert abs(await staking.call(STAKING.fns.stakedOf(val, me)) - 150 * ETHER) <= 1
     assert await staking.call(STAKING.fns.earned(val, me)) == 0  # stablecoin accumulator untouched
 
 
@@ -358,7 +359,8 @@ async def test_fee_buyback_compounds_into_stake(w3, chain_id, funded_account):
     expected_nvnm = nvnm_reserve * buyback // (usd_reserve + buyback)  # x*y=k
     assert await staking.call(ERC20.fns.balanceOf(operator), to=PATH_USD) == fees // 10
     assert await staking.call(STAKING.fns.earned(val, me)) == fees // 2  # 50% deposited
-    assert await staking.call(STAKING.fns.stakedOf(val, me)) == 100 * ETHER + expected_nvnm
+    # 1 wei tolerance: the staking pool's virtual-offset share rate rounds in the pool's favor.
+    assert abs(await staking.call(STAKING.fns.stakedOf(val, me)) - (100 * ETHER + expected_nvnm)) <= 1
 
 
 async def test_distribute_fees_is_permissionless(w3, chain_id, funded_account):
