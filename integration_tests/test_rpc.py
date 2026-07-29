@@ -1,6 +1,9 @@
+import pytest
 from web3 import Web3
 
 from .utils import RETURN_42_RUNTIME, new_account, send_calls, transfer_call
+
+pytestmark = pytest.mark.requires("tempo-native")
 
 
 async def test_client_version_is_tempo(w3):

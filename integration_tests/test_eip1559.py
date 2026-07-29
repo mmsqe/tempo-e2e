@@ -16,6 +16,8 @@ from .utils import (
     transfer_call,
 )
 
+pytestmark = pytest.mark.requires("tempo-native")
+
 
 async def _base_fee(w3, block: int | str = "latest") -> int:
     return (await w3.eth.get_block(block))["baseFeePerGas"]

@@ -5,6 +5,8 @@ from tempo import Signer, serialize, sign_transaction
 
 from .utils import build_tempo_tx, new_account, suggested_max_fee, transfer_call
 
+pytestmark = pytest.mark.requires("tempo-native")
+
 
 async def _send_signed(w3, tx, private_key):
     return await w3.eth.send_raw_transaction(serialize(sign_transaction(tx, Signer(private_key))))

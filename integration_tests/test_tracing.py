@@ -1,8 +1,11 @@
 """debug_traceTransaction: a tempo tx's real work (CREATE/CALL) appears as callTracer subcalls."""
 
+import pytest
 from hexbytes import HexBytes
 
 from .utils import RETURN_42_INIT, deploy_contract, new_account, send_calls, transfer_call
+
+pytestmark = pytest.mark.requires("tempo-native")
 
 
 async def _trace(w3, tx_hash, options):

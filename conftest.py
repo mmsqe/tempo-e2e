@@ -3,6 +3,11 @@ import os
 
 def pytest_addoption(parser):
     group = parser.getgroup("tempo")
+    group.addoption(
+        "--backend",
+        default=os.environ.get("E2E_BACKEND", "tempo"),
+        help="Node backend driver to test against (tempo | allegro | …; also $E2E_BACKEND)",
+    )
     group.addoption("--tempo-bin", default=None, help="Path to the tempo node binary")
     group.addoption(
         "--tempo-rpc",

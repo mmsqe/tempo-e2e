@@ -1,5 +1,11 @@
 """txpool & operator RPC namespaces."""
 
+import pytest
+
+# tempo exposes the txpool namespace and the tempo-only `operator_*` methods;
+# a bare reth fork (allegro) enables neither, so gate the whole file.
+pytestmark = pytest.mark.requires("tempo-native")
+
 
 async def test_txpool_status_has_pending_and_queued(w3):
     resp = await w3.provider.make_request("txpool_status", [])
