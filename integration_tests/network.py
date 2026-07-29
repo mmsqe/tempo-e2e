@@ -219,7 +219,7 @@ class TempoNode:
 
         def check_alive():
             if self.proc is not None and self.proc.poll() is not None:
-                raise RuntimeError(f"tempo node exited early (code {self.proc.returncode}); see {self.log_path}")
+                raise RuntimeError(f"node exited early (code {self.proc.returncode}); see {self.log_path}")
 
         self.chain_id = _poll_rpc(self.rpc_url, timeout=timeout, want_block=want_block, check_alive=check_alive)
         return self

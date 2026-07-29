@@ -1337,7 +1337,7 @@ dev = [
 requires-dist = [
     { name = "eth-account", specifier = ">=0.13.0" },
     { name = "eth-contract", specifier = ">=0.4.0" },
-    { name = "tempo-py", extras = ["devnet"], git = "https://github.com/yihuang/tempo-py.git?branch=main" },
+    { name = "tempo-py", extras = ["devnet"], git = "https://github.com/yihuang/tempo-py.git?branch=cli" },
     { name = "web3", specifier = ">=7.0.0" },
 ]
 
@@ -1354,7 +1354,7 @@ dev = [
 [[package]]
 name = "tempo-py"
 version = "0.1.0"
-source = { git = "https://github.com/yihuang/tempo-py.git?branch=main#9e7409c91bd45015279e2b80d891849352b7143e" }
+source = { git = "https://github.com/yihuang/tempo-py.git?branch=cli#b3d2eaacb07939dbfbcda63861e78c41e11c8a53" }
 dependencies = [
     { name = "attrs" },
     { name = "eth-account" },
