@@ -1,8 +1,9 @@
-"""Genesis-embedded validator set (allegro's ``valset`` feature).
+"""allegro devnet tests: genesis-embedded validator set and block timestamps.
 
 Runs a fresh 2-validator devnet and checks that ``genesis.json`` embeds the
 validator set, every node loads exactly it, consensus finalizes and stays in
-sync, and standard eth JSON-RPC plus the plain-transfer fund path work.
+sync, standard eth JSON-RPC and funding work, and block production is not
+throttled by reth timestamp rejections.
 
 Gated on the ``embedded-validators`` capability (allegro); skips elsewhere.
 """
@@ -22,6 +23,12 @@ pytestmark = pytest.mark.requires("embedded-validators")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 N_VALIDATORS = 2
+
+# A broken proposer that reuses the parent's seconds timestamp gets every
+# same-second proposal rejected by reth, capping production at 1 block/s; the
+# fixed proposer is limited only by consensus speed (~8 blocks/s locally).
+MEASURE_SECONDS = 10
+MIN_BLOCKS = 15
 
 
 @pytest.fixture(scope="module")
@@ -99,3 +106,26 @@ async def test_standard_eth_and_funding_on_validator(valset_cluster, driver):
         assert await w3.eth.get_balance(recipient) == before + Web3.to_wei(1, "ether")
     finally:
         await w3.provider.disconnect()
+
+
+async def test_block_production_is_not_throttled(valset_cluster):
+    """Blocks finalize much faster than 1/s — reth accepts every proposal."""
+    w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(valset_cluster[0].rpc_url))
+    try:
+        start = await w3.eth.block_number
+        await asyncio.sleep(MEASURE_SECONDS)
+        produced = await w3.eth.block_number - start
+        assert produced >= MIN_BLOCKS, (
+            f"only {produced} blocks in {MEASURE_SECONDS}s (expected >= {MIN_BLOCKS}); "
+            "reth is likely rejecting proposals over non-increasing timestamps"
+        )
+    finally:
+        await w3.provider.disconnect()
+
+
+def test_no_payload_rejections_in_logs(valset_cluster):
+    """No node ever had a proposal rejected by reth's payload builder."""
+    for node in valset_cluster:
+        log = _ANSI.sub("", node.log_path.read_text())
+        rejected = [line for line in log.splitlines() if "payload builder failed" in line]
+        assert not rejected, f"node {node.node_index} payload failures:\n" + "\n".join(rejected[:5])
