@@ -1,10 +1,13 @@
 """The tempo_fundAddress faucet RPC."""
 
+import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 
 from .network import FAUCET_AMOUNT
 from .utils import fund, new_account, send_calls
+
+pytestmark = pytest.mark.requires("faucet")
 
 
 async def test_fund_returns_tx_hashes(w3):

@@ -401,3 +401,24 @@ async def get_nonce(w3: AsyncWeb3, address: str, nonce_key: int = 0) -> int:
     if nonce_key == 0:
         return await w3.eth.get_transaction_count(AsyncWeb3.to_checksum_address(address))
     return await NONCE.fns.getNonce(address, nonce_key).call(w3, to=NONCE_ADDRESS)
+
+
+async def fund_via_transfer(w3: AsyncWeb3, funder_key: str, address: str, amount: int) -> str:
+    """Fund ``address`` with a plain EIP-1559 transfer from ``funder_key``; await the receipt."""
+    funder = Account.from_key(funder_key)
+    base_fee = (await w3.eth.get_block("latest")).get("baseFeePerGas") or 0
+    priority = Web3.to_wei(1, "gwei")
+    tx = {
+        "chainId": await w3.eth.chain_id,
+        "nonce": await w3.eth.get_transaction_count(funder.address, "pending"),
+        "to": AsyncWeb3.to_checksum_address(address),
+        "value": amount,
+        "gas": 21_000,
+        "maxPriorityFeePerGas": priority,
+        "maxFeePerGas": base_fee * 2 + priority,
+        "type": 2,
+    }
+    signed = funder.sign_transaction(tx)
+    tx_hash = await w3.eth.send_raw_transaction(signed.raw_transaction)
+    await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60.0)
+    return tx_hash.hex()

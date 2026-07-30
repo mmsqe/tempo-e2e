@@ -1,9 +1,12 @@
 """EVM ``BALANCE`` opcode is 0 for a stablecoin-funded account."""
 
+import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 
 from .utils import deploy_contract
+
+pytestmark = pytest.mark.requires("tempo-native")
 
 # Runtime returns CALLER.balance (BALANCE opcode); init copies the 10-byte runtime out.
 CALLER_BALANCE_INIT = "600a600c600039600a6000f3" + "333160005260206000f3"

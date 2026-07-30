@@ -1,6 +1,10 @@
 """EVM contract deployment and calls via tempo (0x76) transactions."""
 
+import pytest
+
 from .utils import RETURN_42_INIT, RETURN_42_RUNTIME, deploy_contract, get_nonce
+
+pytestmark = pytest.mark.requires("tempo-native")
 
 
 async def test_deploy_sets_code(w3, chain_id, funded_account):

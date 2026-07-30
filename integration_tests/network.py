@@ -36,8 +36,22 @@ def _resolve_bin(name: str, env_var: str) -> str:
     """``$<env_var>``, else ``name`` on PATH, else raise."""
     path = os.environ.get(env_var) or shutil.which(name)
     if not path:
-        raise RuntimeError(f"the devnet needs {name} (set ${env_var}, put it on PATH, or build ../tempo)")
+        raise RuntimeError(f"the devnet needs {name} (set ${env_var} or put it on PATH)")
     return path
+
+
+def terminate_process_group(proc: subprocess.Popen | None, *, timeout: float = 15) -> None:
+    """SIGTERM the process's group, escalating to SIGKILL on timeout; no-op if already gone."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=timeout)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def resolve_tempo_bin() -> str:
@@ -205,23 +219,13 @@ class TempoNode:
 
         def check_alive():
             if self.proc is not None and self.proc.poll() is not None:
-                raise RuntimeError(f"tempo node exited early (code {self.proc.returncode}); see {self.log_path}")
+                raise RuntimeError(f"node exited early (code {self.proc.returncode}); see {self.log_path}")
 
         self.chain_id = _poll_rpc(self.rpc_url, timeout=timeout, want_block=want_block, check_alive=check_alive)
         return self
 
     def stop(self) -> None:
-        if self.proc is None:
-            return
-        if self.proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-                self.proc.wait(timeout=15)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        terminate_process_group(self.proc)
         self.proc = None
 
     @property
