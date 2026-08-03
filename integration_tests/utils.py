@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import time
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Sequence
 
+import pytest
 from eth_account import Account
 from eth_contract.erc20 import ERC20
 from eth_utils import keccak
@@ -422,3 +426,60 @@ async def fund_via_transfer(w3: AsyncWeb3, funder_key: str, address: str, amount
     tx_hash = await w3.eth.send_raw_transaction(signed.raw_transaction)
     await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60.0)
     return tx_hash.hex()
+
+
+# ── Devnet clusters and RPC transports ─────────────────────────────────────
+
+
+@asynccontextmanager
+async def rpc(node):
+    """An RPC client for `node`, disconnected on the way out."""
+    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(node.rpc_url))
+    try:
+        yield client
+    finally:
+        await client.provider.disconnect()
+
+
+@asynccontextmanager
+async def rpc_all(nodes):
+    """A client per node, all disconnected on the way out."""
+    async with AsyncExitStack() as stack:
+        yield [await stack.enter_async_context(rpc(node)) for node in nodes]
+
+
+def cluster_fixture(name: str, validators: int, *, env: dict[str, str] | None = None, warmup: float = 0.0):
+    """A module-scoped fixture yielding a started `validators`-node devnet.
+
+    `env` is applied to the environment the nodes inherit and restored after;
+    `warmup` gives consensus time to get past the first few views before the
+    tests look at it. Skips on backends without ``make_cluster``.
+    """
+
+    @pytest.fixture(scope="module")
+    def _cluster(request, driver, tmp_path_factory):
+        if not hasattr(driver, "make_cluster"):
+            pytest.skip(f"backend {driver.name!r} has no make_cluster()")
+        base = tmp_path_factory.mktemp(name)
+        nodes = driver.make_cluster(base, validators)
+        previous = {key: os.environ.get(key) for key in env or {}}
+        os.environ.update(env or {})
+        try:
+            for node in nodes:
+                node.start()
+            for node in nodes:
+                node.wait_for_rpc(timeout=90.0, want_block=1)
+            time.sleep(warmup)
+            yield nodes
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            for node in nodes:
+                node.stop()
+            if request.config.getoption("--clean-data"):
+                shutil.rmtree(base, ignore_errors=True)
+
+    return _cluster

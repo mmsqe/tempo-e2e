@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import shutil
 import signal
 import socket
@@ -38,6 +39,13 @@ def _resolve_bin(name: str, env_var: str) -> str:
     if not path:
         raise RuntimeError(f"the devnet needs {name} (set ${env_var} or put it on PATH)")
     return path
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def node_log(node) -> str:
+    return _ANSI.sub("", node.log_path.read_text())
 
 
 def terminate_process_group(proc: subprocess.Popen | None, *, timeout: float = 15) -> None:
