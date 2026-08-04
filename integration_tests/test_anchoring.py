@@ -1,234 +1,187 @@
-"""Anchoring precompile (0x…0a00) over JSON-RPC: registries, versioned records, scoped RBAC.
+"""Anchoring precompile (IAnchoring, 0x…0a00): a caller-partitioned commitment log.
 
-Records are versioned per ``(registryId, checksum)``: ``recordId`` identifies the version
-stream, ``index`` the 1-based version, and only the newest carries ``isLatest``. Writes need
-``admin`` or ``editor``, scoped to a registry or to a single record stream.
+Enshrined at genesis, so any EOA anchors under its own address with nothing to deploy. State
+is one word per ``(namespace, key)``; history lives in the ``Anchored`` log, and re-writing
+the stored commitment reverts.
 """
 
+from collections import namedtuple
+
 import pytest
+from eth_abi.abi import decode
 from eth_utils import keccak
 from hexbytes import HexBytes
 
 from .abi import ANCHORING as A
 from .abi import ANCHORING_ADDRESS as ADDR
-from .utils import call_revert, fund, new_account, send_call
+from .utils import call_revert, error_selector, fund, new_account, send_call, send_calls
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 tx, gas in PATH_USD
 
-ADD_REGISTRY_TOPIC = HexBytes(keccak(text="AddRegistry(address,uint64,string)"))
-ADD_RECORD_TOPIC = HexBytes(keccak(text="AddRecord(address,uint64,uint64,uint64,string)"))
+ANCHORED_TOPIC = HexBytes(keccak(text="Anchored(address,bytes32,bytes32,bytes)"))
+ZERO32 = b"\x00" * 32
 
-# Record tuple positions, mirroring the struct field order in abi.py.
-URI, CHECKSUM, STATUS, RECORD_ID, INDEX, IS_LATEST, REGISTRY_ID = 0, 1, 5, 6, 7, 8, 9
-# Registry tuple positions.
-REG_NAME, REG_CREATOR = 1, 3
+# The paginated record query the x/anchoring precompile served at this address; the tuple is
+# its PageRequest. Any retired selector would do; this is calldata a stale integration sends.
+LEGACY_SELECTOR = error_selector("records(uint64,string,uint64,uint64,(bytes,uint64,uint64,bool,bool))")
 
-ADMIN, EDITOR = "admin", "editor"
+COMMITMENT_UNCHANGED = error_selector("CommitmentUnchanged()")
+UNKNOWN_FUNCTION_SELECTOR = error_selector("UnknownFunctionSelector(bytes4)")
 
-
-def page(limit=0):
-    return (b"", 0, limit, False, False)
+Anchored = namedtuple("Anchored", "caller key commitment metadata")
 
 
-def a_record(registry_id, checksum, uri="ipfs://a", status="active"):
-    """A Record tuple; the chain overwrites timestamp/recordId/index/isLatest on write."""
-    return (uri, checksum, "sha256", '{"document":"d"}', "", status, 0, 0, False, registry_id)
+def key_of(label: str) -> bytes:
+    """Applications derive their own keys; a label digest is the simplest such scheme."""
+    return keccak(text=label)
 
 
-async def send(w3, chain_id, signer, call):
-    return await send_call(w3, chain_id, signer, ADDR, call.data)
+async def latest(w3, namespace, key) -> bytes:
+    return bytes(await A.fns.latest(namespace, key).call(w3, to=ADDR))
 
 
-async def revert(w3, call, sender):
-    return await call_revert(w3, ADDR, call.data, sender=sender)
+async def anchor(w3, chain_id, signer, key, commitment, metadata=b""):
+    return await send_call(w3, chain_id, signer, ADDR, A.fns.anchor(key, commitment, metadata).data)
 
 
-def registry_id_of(receipt):
-    """The `registryId` from the AddRegistry log — the return value is not in the receipt."""
-    log = next(lg for lg in receipt["logs"] if lg["topics"][0] == ADD_REGISTRY_TOPIC)
-    return int.from_bytes(bytes(log["data"])[:32], "big")
+async def anchor_and_hash(w3, chain_id, signer, key, metadata):
+    return await send_call(w3, chain_id, signer, ADDR, A.fns.anchorAndHash(key, metadata).data)
 
 
-async def new_registry(w3, chain_id, signer, name="docs"):
-    return registry_id_of(await send(w3, chain_id, signer, A.fns.addRegistry(name, "", "")))
+def anchored(receipt) -> list[Anchored]:
+    """The receipt's ``Anchored`` events, decoded, in canonical log order."""
+    return [
+        Anchored(
+            "0x" + bytes(lg["topics"][1])[-20:].hex(),
+            bytes(lg["topics"][2]),
+            *decode(["bytes32", "bytes"], bytes(lg["data"])),
+        )
+        for lg in receipt["logs"]
+        if lg["address"].lower() == ADDR.lower() and lg["topics"][0] == ANCHORED_TOPIC
+    ]
 
 
-async def add_record(w3, chain_id, signer, registry_id, checksum, uri="ipfs://a"):
-    return await send(w3, chain_id, signer, A.fns.addRecord(a_record(registry_id, checksum, uri)))
-
-
-async def query_records(w3, registry_id=0, checksum="", record_id=0, index=0, limit=0):
-    result = await A.fns.records(registry_id, checksum, record_id, index, page(limit)).call(w3, to=ADDR)
-    return result[0]
-
-
-async def query_registries(w3, registry_id=0, limit=0):
-    result = await A.fns.registries(registry_id, page(limit)).call(w3, to=ADDR)
-    return result[0]
-
-
-async def funded(w3):
+@pytest.fixture
+async def anchorer(w3):
+    """A funded EOA; its own address is the namespace it writes under."""
     account = new_account()
     await fund(w3, account.address)
     return account
 
 
-@pytest.fixture
-async def admin(w3):
-    return await funded(w3)
-
-
 async def test_precompile_is_live_at_genesis(w3):
-    """No deployment step: the marker bytecode is allocated at genesis."""
     assert bytes(await w3.eth.get_code(ADDR)) == b"\xef"
 
 
-async def test_add_registry(w3, chain_id, admin):
-    """Permissionless, sequential ids, and registry names need not be unique."""
-    first = await new_registry(w3, chain_id, admin)
-    second = await new_registry(w3, chain_id, admin)
-    assert second == first + 1
-
-    (found,) = await query_registries(w3, registry_id=first)
-    assert found[REG_NAME] == "docs"
-    assert found[REG_CREATOR].lower() == admin.address.lower()
+async def test_untouched_key_reads_zero(w3, anchorer):
+    assert await latest(w3, anchorer.address, key_of("never-anchored")) == ZERO32
 
 
-async def test_add_record_and_query(w3, chain_id, admin):
-    """A first record gets recordId 1, index 1, and is the latest version."""
-    reg = await new_registry(w3, chain_id, admin)
-    await add_record(w3, chain_id, admin, reg, "abc")
+async def test_anchor_sets_head_and_emits(w3, chain_id, anchorer):
+    key, commitment, metadata = key_of("doc-1"), b"\x11" * 32, b'{"v":1,"kind":"content"}'
 
-    (found,) = await query_records(w3, registry_id=reg, checksum="abc")
-    assert found[RECORD_ID] == 1 and found[INDEX] == 1
-    assert found[IS_LATEST] is True
-    assert found[CHECKSUM] == "abc"
+    receipt = await anchor(w3, chain_id, anchorer, key, commitment, metadata)
 
-
-async def test_same_checksum_maintains_record_id_and_versions(w3, chain_id, admin):
-    """Re-anchoring a checksum keeps its recordId and bumps index; only the newest is latest."""
-    reg = await new_registry(w3, chain_id, admin)
-    await add_record(w3, chain_id, admin, reg, "abc", "ipfs://v1")
-    await add_record(w3, chain_id, admin, reg, "abc", "ipfs://v2")
-
-    (latest,) = await query_records(w3, registry_id=reg, checksum="abc")
-    assert (latest[RECORD_ID], latest[INDEX]) == (1, 2)
-    assert latest[IS_LATEST] is True
-
-    (first,) = await query_records(w3, registry_id=reg, record_id=1, index=1)
-    assert first[IS_LATEST] is False
-    assert first[URI] == "ipfs://v1"
+    assert await latest(w3, anchorer.address, key) == commitment
+    (event,) = anchored(receipt)
+    assert event.caller.lower() == anchorer.address.lower()
+    assert (event.key, event.commitment, event.metadata) == (key, commitment, metadata)
 
 
-async def test_shared_checksum_across_registries(w3, chain_id, admin):
-    """A checksum-only query spans every registry holding it."""
-    r1 = await new_registry(w3, chain_id, admin, "a")
-    r2 = await new_registry(w3, chain_id, admin, "b")
-    await add_record(w3, chain_id, admin, r1, "shared")
-    await add_record(w3, chain_id, admin, r2, "shared")
+async def test_successive_anchors_update_head_and_emit_each(w3, chain_id, anchorer):
+    """Version order lives in the log; the chain keeps only the head."""
+    key, first, second = key_of("doc-2"), b"\x22" * 32, b"\x33" * 32
 
-    across = await query_records(w3, checksum="shared")
-    assert sorted(r[REGISTRY_ID] for r in across) == [r1, r2]
-
-
-async def test_grant_and_revoke_role_as_admin(w3, chain_id, admin):
-    """Only a registry admin may grant, and a revoked editor loses write access."""
-    editor = await funded(w3)
-    reg = await new_registry(w3, chain_id, admin)
-
-    # A stranger cannot grant.
-    err = await revert(w3, A.fns.grantRole(reg, "", editor.address, EDITOR), sender=editor.address)
-    assert "unauthorized" in err
-
-    await send(w3, chain_id, admin, A.fns.grantRole(reg, "", editor.address, EDITOR))
-    await add_record(w3, chain_id, editor, reg, "abc")
-
-    await send(w3, chain_id, admin, A.fns.revokeRole(reg, "", editor.address, EDITOR))
-    err = await revert(w3, A.fns.addRecord(a_record(reg, "def")), sender=editor.address)
-    assert "unauthorized" in err
+    for commitment in (first, second):
+        receipt = await anchor(w3, chain_id, anchorer, key, commitment)
+        assert [e.commitment for e in anchored(receipt)] == [commitment]
+        assert await latest(w3, anchorer.address, key) == commitment
 
 
-async def test_disallow_last_admin_self_revoke(w3, chain_id, admin):
-    """A registry never reaches zero admins: grant a replacement before stepping down."""
-    reg = await new_registry(w3, chain_id, admin)
+async def test_re_anchoring_current_commitment_reverts(w3, chain_id, anchorer):
+    """The no-op rule — and it is the commitment that matters, not the metadata."""
+    key, commitment = key_of("doc-3"), b"\x44" * 32
+    await anchor(w3, chain_id, anchorer, key, commitment, b"first")
+    data = A.fns.anchor(key, commitment, b"different").data
 
-    err = await revert(w3, A.fns.revokeRole(reg, "", admin.address, ADMIN), sender=admin.address)
-    assert "cannot revoke the last registry admin" in err
+    assert COMMITMENT_UNCHANGED in await call_revert(w3, ADDR, data, sender=anchorer.address)
 
-    second = await funded(w3)
-    await send(w3, chain_id, admin, A.fns.grantRole(reg, "", second.address, ADMIN))
-    await send(w3, chain_id, second, A.fns.revokeRole(reg, "", admin.address, ADMIN))
-
-
-async def test_record_level_role_is_per_checksum(w3, chain_id, admin):
-    """A record-scoped role authorizes only its own checksum."""
-    editor = await funded(w3)
-    reg = await new_registry(w3, chain_id, admin)
-    await add_record(w3, chain_id, admin, reg, "abc")
-    await add_record(w3, chain_id, admin, reg, "def")
-
-    await send(w3, chain_id, admin, A.fns.grantRole(reg, "abc", editor.address, EDITOR))
-    await add_record(w3, chain_id, editor, reg, "abc", "ipfs://a2")
-
-    err = await revert(w3, A.fns.addRecord(a_record(reg, "def")), sender=editor.address)
-    assert "unauthorized" in err, "a role on one checksum must not authorize another"
+    # ...and as a real tx it fails, leaving the head and the log untouched.
+    receipt = await send_calls(
+        w3, chain_id=chain_id, private_key=anchorer.key.hex(), calls=[{"to": ADDR, "data": data}]
+    )
+    assert receipt["status"] == 0
+    assert not anchored(receipt)
+    assert await latest(w3, anchorer.address, key) == commitment
 
 
-async def test_role_scope_existence_validation(w3, chain_id, admin):
-    """Roles cannot be granted into a registry or checksum that does not exist."""
-    other = new_account()
-    ghost = 2**40  # far beyond any registry id this suite can reach
-    err = await revert(w3, A.fns.grantRole(ghost, "", other.address, EDITOR), sender=admin.address)
-    assert f"registry {ghost} does not exist" in err
+async def test_older_commitment_can_be_anchored_again(w3, chain_id, anchorer):
+    """Only the *current* head is rejected; going back is a genuine state change."""
+    key, first, second = key_of("doc-4"), b"\x55" * 32, b"\x66" * 32
 
-    reg = await new_registry(w3, chain_id, admin)
-    err = await revert(w3, A.fns.grantRole(reg, "nope", other.address, EDITOR), sender=admin.address)
-    assert "does not exist in registry" in err
+    for commitment in (first, second, first):
+        await anchor(w3, chain_id, anchorer, key, commitment)
+
+    assert await latest(w3, anchorer.address, key) == first
 
 
-async def test_update_record_status_is_idempotent(w3, chain_id, admin):
-    """updateRecordStatus re-asserting the same status is allowed."""
-    reg = await new_registry(w3, chain_id, admin)
-    await add_record(w3, chain_id, admin, reg, "abc")
+async def test_zero_commitment_is_a_reset_not_a_special_case(w3, chain_id, anchorer):
+    """Zero is a legal commitment; it is rejected only when the head is already zero."""
+    key = key_of("doc-5")
+    data = A.fns.anchor(key, ZERO32, b"").data
 
-    update = A.fns.updateRecordStatus(reg, 1, 1, "redacted")
-    await send(w3, chain_id, admin, update)
-    await send(w3, chain_id, admin, update)
+    assert COMMITMENT_UNCHANGED in await call_revert(w3, ADDR, data, sender=anchorer.address)
 
-    (found,) = await query_records(w3, registry_id=reg, checksum="abc")
-    assert found[STATUS] == "redacted"
-
-
-async def test_queries_respect_limits_and_reject_bad_filters(w3, chain_id, admin):
-    """Queries honour `limit`, and reject filter combinations they cannot resolve."""
-    reg = await new_registry(w3, chain_id, admin)
-    for i in range(3):
-        await add_record(w3, chain_id, admin, reg, f"c{i}")
-
-    assert len(await query_records(w3, registry_id=reg, limit=2)) == 2
-    assert len(await query_records(w3, registry_id=reg)) == 3
-
-    err = await revert(w3, A.fns.records(0, "", 5, 0, page()), sender=admin.address)
-    assert "record_id requires registry_id" in err
-    err = await revert(w3, A.fns.records(0, "", 0, 1, page()), sender=admin.address)
-    assert "index requires registry_id" in err
+    await anchor(w3, chain_id, anchorer, key, b"\x77" * 32)
+    await anchor(w3, chain_id, anchorer, key, ZERO32)
+    assert await latest(w3, anchorer.address, key) == ZERO32
 
 
-async def test_writes_reject_non_eoa_callers(w3):
-    """Writes require ``msg.sender == tx.origin``, so a contract cannot reach them.
+async def test_anchor_and_hash_commits_metadata_digest(w3, chain_id, anchorer):
+    """The event is self-verifying: the commitment is the digest of its own metadata."""
+    key, metadata = key_of("doc-6"), b'{"v":1,"kind":"content","data":{"uri":"ipfs://QmX"}}'
 
-    An ``eth_call`` from a non-EOA address exercises the same guard.
+    receipt = await anchor_and_hash(w3, chain_id, anchorer, key, metadata)
+
+    (event,) = anchored(receipt)
+    assert event.commitment == keccak(metadata)
+    assert keccak(event.metadata) == event.commitment
+    assert await latest(w3, anchorer.address, key) == event.commitment
+
+
+async def test_anchor_and_hash_replays_rows_differing_only_in_seq(w3, chain_id, anchorer):
+    """Legacy replay: two rows identical but for their ordinal must both land.
+
+    Hashing the envelope rather than the raw checksum is what makes this work — the ``seq``
+    discriminator changes the digest, so the second write is not a no-op.
     """
-    # A call whose `from` is the precompile itself can never be the tx origin.
-    err = await revert(w3, A.fns.addRegistry("x", "", ""), sender=ADDR)
-    assert "sender not an eoa" in err
+    key = key_of("doc-7")
+    for seq in (1, 2):
+        await anchor_and_hash(w3, chain_id, anchorer, key, b'{"seq":%d,"checksum":"0xabc"}' % seq)
+
+    assert await latest(w3, anchorer.address, key) == keccak(b'{"seq":2,"checksum":"0xabc"}')
 
 
-async def test_events_are_emitted(w3, chain_id, admin):
-    """Indexers key off these topics, so they are part of the ABI."""
-    receipt = await send(w3, chain_id, admin, A.fns.addRegistry("docs", "", ""))
-    log = next(lg for lg in receipt["logs"] if lg["topics"][0] == ADD_REGISTRY_TOPIC)
-    assert bytes(log["topics"][1])[-20:].hex() == admin.address[2:].lower()
+async def test_namespaces_are_isolated(w3, chain_id, anchorer):
+    """Writes land under msg.sender, so one account cannot reach another's partition."""
+    other = new_account()
+    await fund(w3, other.address)
+    key, mine, theirs = key_of("shared-key"), b"\x88" * 32, b"\x99" * 32
 
-    receipt = await add_record(w3, chain_id, admin, registry_id_of(receipt), "abc")
-    assert any(lg["topics"][0] == ADD_RECORD_TOPIC for lg in receipt["logs"])
+    await anchor(w3, chain_id, anchorer, key, mine)
+    await anchor(w3, chain_id, other, key, theirs)
+    assert await latest(w3, anchorer.address, key) == mine
+    assert await latest(w3, other.address, key) == theirs
+
+    # The no-op rule is per namespace: mirroring another account's commitment is a real write.
+    await anchor(w3, chain_id, other, key, mine)
+    assert await latest(w3, anchorer.address, key) == mine
+    assert await latest(w3, other.address, key) == mine
+
+
+async def test_legacy_selector_reverts_unknown_function_selector(w3, anchorer):
+    """The address is reused, the ABI is not: old calldata fails loudly instead of mis-decoding."""
+    err = await call_revert(w3, ADDR, "0x" + LEGACY_SELECTOR + "00" * 64, sender=anchorer.address)
+
+    assert UNKNOWN_FUNCTION_SELECTOR in err
+    assert LEGACY_SELECTOR in err, "the rejected selector is echoed back"

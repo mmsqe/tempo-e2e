@@ -186,6 +186,15 @@ async def prepare_tx(w3: AsyncWeb3, chain_id: int, sender, calls: Sequence[dict]
     )
 
 
+def error_selector(sig: str) -> str:
+    """A custom error's 4-byte selector as lowercase hex, for ``call_revert`` assertions.
+
+    Tempo precompiles and contracts revert with ABI-encoded custom errors; the RPC error
+    surfaces the raw data, so tests match on the selector of the error's signature.
+    """
+    return keccak(text=sig)[:4].hex()
+
+
 async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None) -> str:
     """eth_call that MUST revert; return the joined error message+data for assertions.
 

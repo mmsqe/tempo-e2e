@@ -229,31 +229,18 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
 )
 
 
-# Anchoring precompile (IAnchoring): registries and versioned records with scoped RBAC,
-# enshrined at genesis. Records are versioned per (registryId, checksum): recordId identifies
-# the version stream, index the 1-based version, and only the newest carries isLatest. Writes
-# need an EOA caller and revert with plain Error(string) reasons.
+# Anchoring precompile (IAnchoring): a caller-partitioned commitment log, enshrined at genesis.
+# The caller is the namespace, so there is no authorization surface and nothing to deploy.
+# Supersedes the withdrawn AnchoringRegistry: the address is inherited from the x/anchoring
+# precompile, but its selectors are gone and now revert UnknownFunctionSelector. Registry and
+# record reads become indexer queries over the Anchored log; roles have no successor at all --
+# there is no grantRole/hasRole here, and permissioning is a wrapper-contract concern.
 ANCHORING_ADDRESS = to_checksum_address("0x0000000000000000000000000000000000000a00")
-_RECORD = (
-    "(string uri, string checksum, string checksumAlgo, string metadata, string timestamp, "
-    "string status, uint64 recordId, uint64 index, bool isLatest, uint64 registryId)"
-)
-_REGISTRY = "(uint64 id, string name, string description, string creator, string createdAt, string metadata)"
-_PAGE_REQUEST = "(bytes key, uint64 offset, uint64 limit, bool countTotal, bool reverse)"
-_PAGE_RESPONSE = "(bytes nextKey, uint64 total)"
 ANCHORING = Contract.from_abi(
     [
-        "function addRegistry(string name, string description, string metadata) returns (uint64 registryId)",
-        f"function addRecord({_RECORD} record) returns (uint64 recordId)",
-        "function updateRecordStatus(uint64 registryId, uint64 recordId, uint64 index, string status)",
-        f"function records(uint64 registryId, string checksum, uint64 recordId, uint64 index, {_PAGE_REQUEST} pagination) view returns ({_RECORD}[] records, {_PAGE_RESPONSE} pagination)",
-        f"function registries(uint64 registryId, {_PAGE_REQUEST} pagination) view returns ({_REGISTRY}[] registries, {_PAGE_RESPONSE} pagination)",
-        "function grantRole(uint64 registryId, string checksum, address account, string role)",
-        "function revokeRole(uint64 registryId, string checksum, address account, string role)",
-        "event AddRegistry(address indexed caller, uint64 registryId, string name)",
-        "event AddRecord(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string checksum)",
-        "event UpdateRecordStatus(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string status)",
-        "event GrantRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
-        "event RevokeRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
+        "function anchor(bytes32 key, bytes32 commitment, bytes metadata)",
+        "function anchorAndHash(bytes32 key, bytes metadata)",
+        "function latest(address namespace, bytes32 key) view returns (bytes32 commitment)",
+        "event Anchored(address indexed caller, bytes32 indexed key, bytes32 commitment, bytes metadata)",
     ]
 )
