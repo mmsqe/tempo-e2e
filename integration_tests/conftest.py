@@ -28,9 +28,6 @@ if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
     tempfile.tempdir = "/tmp"
 
-# NVM testnet chain id, baked into the generated consensus-localnet genesis.
-NVM_TESTNET_CHAIN_ID = 787222
-
 
 # Legacy feature marks map onto capability tokens so existing tests gate cleanly.
 _MARK_CAPABILITY = {"tempo": CAP_TEMPO_NATIVE, "consensus": CAP_CONSENSUS_NET}
@@ -254,7 +251,7 @@ def _init_consensus_devnet(request, base, *, docker: bool):
     n = request.config.getoption("--consensus-validators")
     # Random free base ports (baked into genesis) so runs don't collide with each other or a dev node.
     config = {
-        "chain_id": NVM_TESTNET_CHAIN_ID,
+        "chain_id": 1337,
         "accounts": 200,
         "epoch_length": 100,
         "seed": 0,
@@ -396,7 +393,7 @@ def _init_two_network_devnet(request, base):
     ports = find_free_base_ports(n + 3)
     val_ports, follow_port, proxy_port, public_port = ports[:n], ports[n], ports[n + 1], ports[n + 2]
     config = {
-        "chain_id": NVM_TESTNET_CHAIN_ID,
+        "chain_id": 1337,
         "accounts": 200,
         "epoch_length": 100,
         "seed": 0,

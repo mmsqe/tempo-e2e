@@ -43,8 +43,6 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
-        "function distributeFees(address validator, address token)",  # permissionless payout to the fee recipient
-        "function collectedFees(address validator, address token) view returns (uint256)",
     ]
 )
 
@@ -257,89 +255,5 @@ ANCHORING = Contract.from_abi(
         "event UpdateRecordStatus(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string status)",
         "event GrantRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
         "event RevokeRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
-    ]
-)
-
-
-# NVNMStaking (upgradeable app contract): delegated staking that shares chain fees with stakers.
-# Stake NVNM toward a validator, deposited reward-token (nvmnUSD) is split pro-rata per validator.
-STAKING = Contract.from_abi(
-    [
-        "function stake(address validator, uint256 amount)",
-        "function unstake(address validator, uint256 amount)",
-        "function depositReward(address validator, uint256 amount)",
-        "function compoundReward(address validator, uint256 amount)",
-        "function claim(address validator) returns (uint256 amount)",
-        "function earned(address validator, address user) view returns (uint256)",
-        "function stakedOf(address validator, address user) view returns (uint256)",
-        "function totalStaked(address validator) view returns (uint256)",
-        "function stakeToken() view returns (address)",
-        "function rewardToken() view returns (address)",
-        # committee election (quantized multi-seat): seats = min(stake/tokensPerSeat, cap),
-        # ranked by stake, truncated to the maxSeats budget.
-        "function setCandidate(address validator, bool active)",
-        "function setSeatConfig(uint256 tokensPerSeat, uint256 maxSeats, uint256 maxSeatsPerValidator)",
-        "function candidates() view returns (address[])",
-        "function computeCommittee() view returns (address[] vals, uint256[] seats)",
-        # bonded candidacy: self-register against an NVNM bond (refunded on resign/kick).
-        "function setCandidacyBond(uint256 bond)",
-        "function registerCandidate()",
-        "function resignCandidate()",
-        "function bondOf(address validator) view returns (uint256)",
-        # slashing: system caller (address(0)) or owner cuts a validator pool pro-rata in O(1);
-        # pending (unbonding) stake is cut too via the per-validator factor.
-        "function slash(address validator, uint256 bps, address recipient) returns (uint256 seized)",
-        # unbonding: with a period set, unstake parks stake in a pending bucket until withdraw.
-        "function setUnbondingPeriod(uint256 period)",
-        "function withdraw(address validator) returns (uint256 amount)",
-        "function pendingUnstakeOf(address validator, address user) view returns (uint256 amount, uint256 releaseAt)",
-    ]
-)
-
-# FeeRouter (app contract): per-validator fee splitter — commission to the operator, remainder
-# deposited into the staking pool. `flush` is permissionless.
-FEE_ROUTER = Contract.from_abi(
-    [
-        "function flush() returns (uint256 deposited)",
-        "function validator() view returns (address)",
-        "function commissionBps() view returns (uint256)",
-    ]
-)
-FEE_ROUTER_FACTORY = Contract.from_abi(
-    [
-        "function create(address validator, address operator, uint256 commissionBps, uint256 buybackBps) returns (address router)",
-        "function setSwapper(address swapper)",
-        "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps, uint256 buybackBps)",
-    ]
-)
-
-# Test mock ERC-20 (open mint) and the guarded fee-buyback swapper / bridged L1 NVNM token.
-MOCK_ERC20 = Contract.from_abi(["function mint(address to, uint256 amount)"])
-
-GUARDED_SWAPPER = Contract.from_abi(
-    [
-        "function setGuards(address inner, uint256 maxAmountIn, uint256 maxDeviationBps, uint256 emaAlphaBps)",
-        "function seedPrice(uint256 price)",
-        "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) returns (uint256 out)",
-        "function emaPrice() view returns (uint256)",
-    ]
-)
-
-# BridgedNVNM: BRIDGE=1 role holders mint/burn; owner curates the role (setRole from EnumerableRoles).
-BRIDGED_NVNM = Contract.from_abi(
-    [
-        "function setRole(address holder, uint256 role, bool active)",
-        "function bridgeMint(address to, uint256 amount)",
-        "function bridgeBurn(address from, uint256 amount)",
-    ]
-)
-
-# The one-shot deployer helper (tempo/contracts StakingDeployer.sol): stands up mock NVNM + reward
-# tokens and the staking proxy, and exposes their addresses.
-STAKING_DEPLOYER = Contract.from_abi(
-    [
-        "function staking() view returns (address)",
-        "function nvnm() view returns (address)",
-        "function usd() view returns (address)",
     ]
 )

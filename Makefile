@@ -1,40 +1,9 @@
-.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down contract-artifacts
+.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down
 
 BIN := .venv/bin
-# The app contracts (NVNMStaking, FeeRouter, …) live in the tempo repo; fetch + build from git.
-# Anchoring is not among them: it is an enshrined precompile, so there is nothing to deploy.
-TEMPO_REPO ?= https://github.com/mmsqe/tempo
-TEMPO_REF ?= nvm
-TEMPO_WORK := .cache/tempo
-
-# _artifact,<source .sol>,<contract>,<output json> — vendor one deployer's initcode + provenance.
-define _artifact
-	jq -n \
-	  --arg bc "$$(jq -r '.bytecode.object' $(TEMPO_WORK)/contracts/out/$(1).sol/$(2).json)" \
-	  --arg repo "$(TEMPO_REPO)" --arg ref "$(TEMPO_REF)" --arg commit "$$(git -C $(TEMPO_WORK) rev-parse HEAD)" \
-	  '{source:$$repo, ref:$$ref, commit:$$commit, note:"Regenerate with: make contract-artifacts", deployer_bytecode:$$bc}' \
-	  > integration_tests/artifacts/$(3)
-	@echo "wrote integration_tests/artifacts/$(3) (tempo $$(git -C $(TEMPO_WORK) rev-parse --short HEAD))"
-endef
 
 install:
 	uv sync
-
-# Rebuild the vendored deployer initcodes from the tempo repo's Foundry sources.
-contract-artifacts:
-	rm -rf $(TEMPO_WORK)
-	# init+fetch instead of clone --branch so TEMPO_REF may be a branch, tag, or commit SHA.
-	git init -q $(TEMPO_WORK)
-	cd $(TEMPO_WORK) && git remote add origin $(TEMPO_REPO) && \
-	  git fetch -q --depth 1 origin $(TEMPO_REF) && git checkout -q FETCH_HEAD && \
-	  git submodule update --init --depth 1 contracts/lib/solady contracts/lib/forge-std
-	cd $(TEMPO_WORK)/contracts && forge build
-	$(call _artifact,StakingDeployer,StakingDeployer,staking.json)
-	$(call _artifact,FeeRouter,FeeRouterFactory,feerouter_factory.json)
-	$(call _artifact,MockSwapPool,MockSwapPool,swap_pool.json)
-	$(call _artifact,MockERC20,MockERC20,mock_erc20.json)
-	$(call _artifact,BridgedNVNM,BridgedNVNM,bridged_nvnm.json)
-	$(call _artifact,GuardedSwapper,GuardedSwapper,guarded_swapper.json)
 
 # Full suite (launches a local dev node).
 test:
