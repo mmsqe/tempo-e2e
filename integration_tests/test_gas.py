@@ -8,6 +8,8 @@ from tempo.constants import ALPHA_USD, PATH_USD
 
 from .utils import fund, new_account, send_calls, transfer_call
 
+pytestmark = pytest.mark.requires("tempo-native")
+
 SSTORE_CREATE_COST = 250_000  # TIP-1000: creating a new state element
 TX_GAS_CAP = 30_000_000  # TIP-1010: per-transaction gas limit cap
 

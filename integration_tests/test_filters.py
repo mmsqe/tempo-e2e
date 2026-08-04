@@ -2,9 +2,12 @@
 
 import asyncio
 
+import pytest
 from tempo.constants import PATH_USD
 
 from .utils import TRANSFER_TOPIC, new_account, send_calls, transfer_call
+
+pytestmark = pytest.mark.requires("tempo-native")
 
 
 async def test_transfer_emits_transfer_log(w3, chain_id, funded_account):

@@ -17,9 +17,12 @@ from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
 
+from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
-from .network import ExternalNode, dev_node, resolve_tempo_bin, resolve_xtask_bin
-from .utils import fund, new_account
+from .drivers import get_driver
+from .drivers.base import CAP_CONSENSUS_NET, CAP_INDEXER, CAP_TEMPO_NATIVE
+from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin
+from .utils import new_account
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -29,12 +32,48 @@ if not os.environ.get("TMPDIR", "").startswith("/tmp"):
 NVM_TESTNET_CHAIN_ID = 787222
 
 
-@pytest.fixture(scope="session")
-def tempo(request, tmp_path_factory):
-    """A tempo dev node for the session.
+# Legacy feature marks map onto capability tokens so existing tests gate cleanly.
+_MARK_CAPABILITY = {"tempo": CAP_TEMPO_NATIVE, "consensus": CAP_CONSENSUS_NET}
 
-    By default launches a fresh ``tempo node --dev`` and tears it down at the
-    end. With ``--tempo-rpc URL`` (or ``$TEMPO_RPC``) it instead attaches to an
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "requires(cap): skip unless the active --backend advertises capability `cap`")
+    # tidx indexes the node from a container, so the node has to listen off-loopback.
+    # Set before the `tempo` fixture builds the command line.
+    if config.getoption("--tidx"):
+        os.environ["TEMPO_HTTP_ADDR"] = "0.0.0.0"
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip tests whose required capabilities the active backend lacks."""
+    caps = get_driver(config.getoption("--backend")).capabilities()
+    # Orthogonal to --tidx: a second index alongside the node does not make the node's
+    # own handlers answer, so the differential tests need both flags.
+    if config.getoption("--indexer"):
+        caps |= {CAP_INDEXER}
+    for item in items:
+        required = {cap for mark, cap in _MARK_CAPABILITY.items() if item.get_closest_marker(mark)}
+        required |= {arg for mark in item.iter_markers("requires") for arg in mark.args}
+        missing = required - caps
+        if missing:
+            item.add_marker(
+                pytest.mark.skip(reason=f"backend {config.getoption('--backend')!r} lacks {sorted(missing)}")
+            )
+
+
+@pytest.fixture(scope="session")
+def driver(request):
+    """The active backend driver (``--backend`` / ``$E2E_BACKEND``, default tempo)."""
+    return get_driver(request.config.getoption("--backend"))
+
+
+@pytest.fixture(scope="session")
+def tempo(request, driver, tmp_path_factory):
+    """A single dev node for the session, from the active backend.
+
+    By default launches a fresh dev node (tempo's ``--dev`` node, or a solo
+    validator for consensus backends) and tears it down at the end. With
+    ``--tempo-rpc URL`` (or ``$TEMPO_RPC``) it instead attaches to an
     already-running node and leaves it running; ``--tempo-ws`` supplies that
     node's WebSocket URL for the eth_subscribe tests.
     """
@@ -46,8 +85,8 @@ def tempo(request, tmp_path_factory):
     if request.config.getoption("--tempo-bin"):
         os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
 
-    base = tmp_path_factory.mktemp("tempo")
-    node = dev_node(base, log_name="tempo.log")
+    base = tmp_path_factory.mktemp(driver.name)
+    node = driver.dev_node(base, log_name=f"{driver.name}.log")
     try:
         node.start().wait_for_rpc()
         yield node
@@ -69,15 +108,55 @@ def chain_id(tempo) -> int:
     return tempo.chain_id
 
 
+@pytest.fixture(scope="session")
+def tidx(request, driver, tempo, tmp_path_factory):
+    """tempoxyz/tidx indexing the session node, as a differential oracle (``--tidx``).
+
+    Skips rather than fails when docker or the image is missing, so a developer
+    without them still gets the rest of the suite. Session-scoped: the stack takes
+    tens of seconds to come up and backfill.
+    """
+    if not request.config.getoption("--tidx"):
+        pytest.skip("tidx oracle not requested (pass --tidx)")
+    # tidx decodes tempo's block shape, not plain Ethereum's: it requires the
+    # `timestampMillis` header field tempo adds, and its sync loop errors on every
+    # batch without it. Checked here rather than left to the readiness timeout, which
+    # would otherwise burn three minutes and report a generic "did not come up".
+    if CAP_TEMPO_NATIVE not in driver.capabilities():
+        pytest.skip(f"tidx only decodes tempo-format blocks; backend {driver.name!r} serves plain Ethereum ones")
+    try:
+        tidx_mod.preflight()
+    except tidx_mod.TidxUnavailable as e:
+        pytest.skip(str(e))
+
+    base = tmp_path_factory.mktemp("tidx")
+    stack = tidx_mod.Tidx(
+        base,
+        chain_id=tempo.chain_id,
+        rpc_url=tidx_mod.rpc_url_for_container(tempo.rpc_url),
+        api_port=free_port(),
+    )
+    try:
+        try:
+            stack.up().wait_for_block(0)  # the first block landing proves the whole path works
+        except tidx_mod.TidxUnavailable as e:
+            pytest.skip(f"tidx did not come up: {e}")
+        yield stack
+    finally:
+        stack.down()
+        if request.config.getoption("--clean-data"):
+            shutil.rmtree(base, ignore_errors=True)
+
+
 @pytest.fixture
 def account():
     return new_account()
 
 
 @pytest.fixture
-async def funded_account(w3):
+async def funded_account(w3, driver):
     acct = new_account()
-    await fund(w3, acct.address)
+    await driver.fund(w3, acct.address, 10_000_000_000_000_000)
     return acct
 
 

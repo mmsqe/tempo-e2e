@@ -4,11 +4,14 @@ The implementation only reads (returns a constant), sidestepping tempo's storage
 accounting for writes from a fresh account; the sponsor pays gas in the default stablecoin.
 """
 
+import pytest
 from eth_account import Account
 from hexbytes import HexBytes
 from web3 import AsyncWeb3
 
 from .utils import DEFAULT_MAX_PRIORITY_FEE_PER_GAS, RETURN_42_INIT, deploy_contract, new_account, suggested_max_fee
+
+pytestmark = pytest.mark.requires("tempo-native")
 
 ZERO_ADDRESS = "0x" + "00" * 20
 SET_CODE_GAS = 500_000
