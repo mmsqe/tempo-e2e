@@ -157,6 +157,9 @@ class TempoNode:
         self.genesis = Path(genesis) if genesis else default_genesis()
         self.binary = binary or resolve_tempo_bin()
         self.block_time = block_time or os.environ.get("TEMPO_BLOCK_TIME", "50ms")
+        # Loopback by default so a test node is never exposed on the network; --tidx
+        # sets 0.0.0.0 because its container reaches the node from outside loopback.
+        self.http_addr = os.environ.get("TEMPO_HTTP_ADDR", "127.0.0.1")
         self.proc: subprocess.Popen | None = None
         self.chain_id: int | None = None
 
@@ -173,7 +176,7 @@ class TempoNode:
             self.block_time,
             "--http",
             "--http.addr",
-            "127.0.0.1",
+            self.http_addr,
             "--http.port",
             str(self.http_port),
             "--http.api",

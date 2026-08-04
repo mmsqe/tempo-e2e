@@ -17,8 +17,8 @@ from tempo.devnet.ports import http_rpc_port, ws_rpc_port
 from web3 import AsyncWeb3
 
 from ..network import TempoNode, _resolve_bin
-from ..utils import fund_via_transfer
-from .base import CAP_EMBEDDED_VALIDATORS
+from ..utils import fund_via_transfer, new_account
+from .base import CAP_EMBEDDED_VALIDATORS, CAP_INDEXER_RPC
 
 # Anvil account 0 — prefunded with 10_000 ETH in allegro's xtask genesis.
 FUNDER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
@@ -51,7 +51,10 @@ class AllegroDriver:
         self._xtask: str | None = None
 
     def capabilities(self) -> set[str]:
-        return {CAP_EMBEDDED_VALIDATORS}  # standard eth + genesis-embedded validator set
+        # allegro serves eth_getTransactions from its own ExEx-backed index, so unlike
+        # tempo the handler is real -- but the token_ namespace needs TIP-20, which
+        # allegro has no equivalent of, so those tests stay skipped.
+        return {CAP_EMBEDDED_VALIDATORS, CAP_INDEXER_RPC}
 
     def resolve_bin(self) -> str:
         if self._bin is None:
@@ -111,3 +114,8 @@ class AllegroDriver:
     async def fund(self, w3: AsyncWeb3, address: str, amount: int) -> str:
         """Plain EIP-1559 transfer from the prefunded anvil account."""
         return await fund_via_transfer(w3, FUNDER_KEY, address, amount)
+
+    async def send_tx(self, w3: AsyncWeb3, chain_id: int, sender) -> dict:
+        """A plain EIP-1559 value transfer -- allegro has no native AA tx type."""
+        tx_hash = await fund_via_transfer(w3, sender.key.hex(), new_account().address, 1)
+        return await w3.eth.get_transaction_receipt(tx_hash)

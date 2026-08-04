@@ -8,6 +8,7 @@ suite is plain Ethereum JSON-RPC. Drivers are duck-typed (see ``tempo.py`` and
     capabilities() -> set[str]             # CAP_* tokens the fork supports
     dev_node(base, *, log_name=..., **kw)  # single node, ready to start()
     async fund(w3, address, amount)        # make address able to pay gas
+    async send_tx(w3, chain_id, sender)    # one ordinary tx from sender -> receipt
 
 Nodes expose ``start()`` / ``wait_for_rpc()`` / ``stop()``, ``rpc_url`` /
 ``ws_url``, and ``chain_id``. A test that needs a fork-specific feature
@@ -19,3 +20,8 @@ CAP_TEMPO_NATIVE = "tempo-native"  # native/AA (0x76) txs, fee tokens, tempo pre
 CAP_FAUCET = "faucet"  # tempo_fundAddress faucet RPC
 CAP_CONSENSUS_NET = "consensus-net"  # multi-validator consensus localnet (tempo-devnet)
 CAP_EMBEDDED_VALIDATORS = "embedded-validators"  # validators embedded in genesis.json + make_cluster()
+CAP_INDEXER_RPC = "indexer-rpc"  # node registers eth_getTransactions / token_* (handlers may be stubs)
+# …and a live indexer answers them with chain data. Not a property of the binary but of
+# the deployment (a tidx sidecar today, a reth ExEx later), so conftest adds it from
+# --indexer/--tidx rather than any driver advertising it.
+CAP_INDEXER = "indexer"

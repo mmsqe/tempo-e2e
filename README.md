@@ -51,6 +51,35 @@ make test-consensus-docker
 If your `tempo-xtask` comes from an older checkout, pull that release's tag
 (e.g. `ghcr.io/tempoxyz/tempo:1.10.1`) rather than `latest`.
 
+## Indexer RPCs
+
+`eth_getTransactions` and the `token_*` namespace are registered on tempo but every
+handler returns `unimplemented`, so by default `test_indexer.py` only checks the wire
+contract (methods registered, params deserialize) — enough to pin the schema before
+allegro serves it from a reth ExEx.
+
+Pass `--indexer` once a backend answers them for real: the semantic tests then run and
+compare against an oracle built from plain `eth_` RPC. On tempo they fail with
+`unimplemented`, which is the point of the flag being opt-in.
+
+`--tidx` additionally runs [tempoxyz/tidx](https://github.com/tempoxyz/tidx) (docker:
+tidx + postgres) over the same node as a second, independent index, so the differential
+tests are two implementations concurring rather than a node confirming itself. It binds
+the node's RPC to `0.0.0.0` so the container can reach it, and skips if docker or the
+image is missing. The two flags are orthogonal — tidx indexing the chain does not make
+the node's own handlers answer, so the differential tests need both:
+
+```bash
+docker pull --platform linux/amd64 ghcr.io/tempoxyz/tidx:latest
+pytest integration_tests/test_indexer.py --indexer --tidx
+```
+
+tidx publishes `linux/amd64` only, so an Apple-silicon host runs it emulated — via
+Rosetta (Docker Desktop → Settings → General) or the QEMU handlers (`docker run
+--privileged --rm tonistiigi/binfmt --install amd64`). The suite probes this up front
+and skips with the docker error if neither is available. Point `$TIDX_IMAGE` at a
+natively-built image to skip emulation, with `TIDX_PLATFORM=` to drop the amd64 pin.
+
 ## Markers
 
 - `tempo` — tempo-native features (TIP-20, AA tx, nonces, fees, DEX)
@@ -69,6 +98,7 @@ If your `tempo-xtask` comes from an older checkout, pull that release's tag
 | `test_eip1559.py` | EIP-1559 | base fee present, effective price ≤ maxFee, maxFee-below-basefee rejection |
 | `test_fee_history.py` | — | `eth_feeHistory` shape and reward percentiles |
 | `test_filters.py` | — | event logs / filters: transfer log, `get_logs`, block & log filters |
+| `test_indexer.py` | — | `eth_getTransactions` / `token_*`: wire contract vs the stubs, semantics vs an `eth_` oracle (`--indexer`) and vs tidx (`--tidx`) |
 | `test_subscribe.py` | — | `eth_subscribe`: new heads, logs |
 | `test_tracing.py` | — | `debug_traceTransaction` (callTracer, struct logger), `trace_block_by_number` |
 | `test_contract.py` | — | EVM contract deploy + call via tempo (0x76) txs |
