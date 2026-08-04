@@ -1,7 +1,8 @@
 .PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down contract-artifacts
 
 BIN := .venv/bin
-# The app contracts (AnchoringRegistry, NVNMStaking) live in the tempo repo; fetch + build from git.
+# The app contracts (NVNMStaking, FeeRouter, …) live in the tempo repo; fetch + build from git.
+# Anchoring is not among them: it is an enshrined precompile, so there is nothing to deploy.
 TEMPO_REPO ?= https://github.com/mmsqe/tempo
 TEMPO_REF ?= nvm
 TEMPO_WORK := .cache/tempo
@@ -28,7 +29,6 @@ contract-artifacts:
 	  git fetch -q --depth 1 origin $(TEMPO_REF) && git checkout -q FETCH_HEAD && \
 	  git submodule update --init --depth 1 contracts/lib/solady contracts/lib/forge-std
 	cd $(TEMPO_WORK)/contracts && forge build
-	$(call _artifact,AnchoringDeployer,AnchoringDeployer,anchoring.json)
 	$(call _artifact,StakingDeployer,StakingDeployer,staking.json)
 	$(call _artifact,FeeRouter,FeeRouterFactory,feerouter_factory.json)
 	$(call _artifact,MockSwapPool,MockSwapPool,swap_pool.json)

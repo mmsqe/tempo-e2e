@@ -231,32 +231,34 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
 )
 
 
-# AnchoringRegistry (upgradeable app contract, NOT a precompile): named registries hold checksum
-# records, versioned per checksum, with RBAC. Roles: ADMIN=1, REGISTRAR=2, STATUS_UPDATER=3.
+# Anchoring precompile (IAnchoring): registries and versioned records with scoped RBAC,
+# enshrined at genesis. Records are versioned per (registryId, checksum): recordId identifies
+# the version stream, index the 1-based version, and only the newest carries isLatest. Writes
+# need an EOA caller and revert with plain Error(string) reasons.
+ANCHORING_ADDRESS = to_checksum_address("0x0000000000000000000000000000000000000a00")
 _RECORD = (
-    "(uint256 registryId, string uri, string checksum, string checksumAlgo, string metadata, "
-    "uint256 timestamp, string status, uint256 recordId, uint256 index, bool isLatest)"
+    "(string uri, string checksum, string checksumAlgo, string metadata, string timestamp, "
+    "string status, uint64 recordId, uint64 index, bool isLatest, uint64 registryId)"
 )
+_REGISTRY = "(uint64 id, string name, string description, string creator, string createdAt, string metadata)"
+_PAGE_REQUEST = "(bytes key, uint64 offset, uint64 limit, bool countTotal, bool reverse)"
+_PAGE_RESPONSE = "(bytes nextKey, uint64 total)"
 ANCHORING = Contract.from_abi(
     [
-        "function addRegistry(string name, string description, string metadata) returns (uint256 id)",
-        "function addRecord(string registry, string uri, string checksum, string checksumAlgo, string metadata) returns (uint256 recordId, uint256 index)",
-        "function updateRecordStatus(uint256 registryId, uint256 recordId, uint256 index, string status)",
-        "function grantRole(address holder, uint256 role)",
-        "function hasRole(address holder, uint256 role) view returns (bool)",
-        "function registryCount() view returns (uint256)",
-        "function registryIdByName(string name) view returns (uint256)",
-        "function recordIdForChecksum(uint256 registryId, string checksum) view returns (uint256)",
-        "function versionCount(uint256 registryId, uint256 recordId) view returns (uint256)",
-        "function checksumRefCount(string checksum) view returns (uint256)",
-        f"function getRecord(uint256 registryId, uint256 recordId, uint256 index) view returns ({_RECORD})",
-        "function queryByChecksum(string checksum, uint256 limit) view returns ((uint256 registryId, uint256 recordId)[])",
+        "function addRegistry(string name, string description, string metadata) returns (uint64 registryId)",
+        f"function addRecord({_RECORD} record) returns (uint64 recordId)",
+        "function updateRecordStatus(uint64 registryId, uint64 recordId, uint64 index, string status)",
+        f"function records(uint64 registryId, string checksum, uint64 recordId, uint64 index, {_PAGE_REQUEST} pagination) view returns ({_RECORD}[] records, {_PAGE_RESPONSE} pagination)",
+        f"function registries(uint64 registryId, {_PAGE_REQUEST} pagination) view returns ({_REGISTRY}[] registries, {_PAGE_RESPONSE} pagination)",
+        "function grantRole(uint64 registryId, string checksum, address account, string role)",
+        "function revokeRole(uint64 registryId, string checksum, address account, string role)",
+        "event AddRegistry(address indexed caller, uint64 registryId, string name)",
+        "event AddRecord(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string checksum)",
+        "event UpdateRecordStatus(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string status)",
+        "event GrantRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
+        "event RevokeRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
     ]
 )
-
-# The one-shot deployer helper (tempo/contracts AnchoringDeployer.sol): its create tx stands up
-# impl + proxy + init and exposes the proxy address.
-ANCHORING_DEPLOYER = Contract.from_abi(["function registry() view returns (address)"])
 
 
 # NVNMStaking (upgradeable app contract): delegated staking that shares chain fees with stakers.
