@@ -179,6 +179,21 @@ async def test_namespaces_are_isolated(w3, chain_id, anchorer):
     assert await latest(w3, other.address, key) == mine
 
 
+async def test_value_bearing_anchor_is_rejected(w3, anchorer):
+    data = A.fns.anchor(key_of("paid"), b"\xaa" * 32, b"").data
+    tx = {
+        "to": ADDR,
+        "from": anchorer.address,
+        "data": data if isinstance(data, str) else "0x" + bytes(data).hex(),
+        "gas": hex(2_000_000),
+        "value": "0x1",
+    }
+
+    resp = await w3.provider.make_request("eth_call", [tx, "latest"])
+    assert resp.get("error") is not None, f"value-bearing anchor must fail, got {resp!r}"
+    assert await latest(w3, anchorer.address, key_of("paid")) == ZERO32
+
+
 async def test_legacy_selector_reverts_unknown_function_selector(w3, anchorer):
     """The address is reused, the ABI is not: old calldata fails loudly instead of mis-decoding."""
     err = await call_revert(w3, ADDR, "0x" + LEGACY_SELECTOR + "00" * 64, sender=anchorer.address)
