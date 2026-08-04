@@ -244,3 +244,36 @@ ANCHORING = Contract.from_abi(
         "event Anchored(address indexed caller, bytes32 indexed key, bytes32 commitment, bytes metadata)",
     ]
 )
+
+# AnchoringRegistry (app contract): registries of checksum records with scoped RBAC, anchored
+# through the precompile rather than stored on-chain -- the wrapper keeps only counters and role
+# membership, and latest(wrapper, key) in the precompile is the source of truth. Roles are
+# registry-scoped or record-scoped (one checksum within one registry) over "admin"/"editor",
+# passed as right-padded bytes32. Deployed per test via the vendored one-shot deployer.
+ANCHORING_REGISTRY = Contract.from_abi(
+    [
+        "function addRegistry(string name, string description, string metadata) returns (uint256 id)",
+        "function addRecord(uint256 registryId, string uri, string checksum, string checksumAlgo, string metadata) returns (uint256 recordId, uint256 index)",
+        "function updateRecordStatus(uint256 registryId, uint256 recordId, uint256 index, string status)",
+        "function grantRole(uint256 registryId, string checksum, address account, bytes32 role)",
+        "function revokeRole(uint256 registryId, string checksum, address account, bytes32 role)",
+        "function hasRole(uint256 registryId, string checksum, address account, bytes32 role) view returns (bool)",
+        "function registryCount() view returns (uint256)",
+        "function recordCount(uint256 registryId) view returns (uint256)",
+        "function recordIdForChecksum(uint256 registryId, string checksum) view returns (uint256)",
+        "function versionCount(uint256 registryId, uint256 recordId) view returns (uint256)",
+        "function latestRecordDigest(uint256 registryId, uint256 recordId) view returns (bytes32)",
+        "function recordKey(uint256 registryId, uint256 recordId) pure returns (bytes32)",
+        "function statusKey(uint256 registryId, uint256 recordId, uint256 index) pure returns (bytes32)",
+        "function owner() view returns (address)",
+        "event RegistryAdded(uint256 indexed id, string name, address indexed creator)",
+        "event RecordAdded(uint256 indexed registryId, uint256 indexed recordId, uint256 index, string checksum)",
+        "event RecordStatusUpdated(uint256 indexed registryId, uint256 indexed recordId, uint256 index, string status)",
+        "event RoleGranted(uint256 indexed registryId, bytes32 checksumHash, address indexed account, bytes32 role)",
+        "event RoleRevoked(uint256 indexed registryId, bytes32 checksumHash, address indexed account, bytes32 role)",
+    ]
+)
+
+# Its one-shot deployer: a single create tx deploys impl + ERC-1967 proxy and initializes it
+# with the calling EOA as owner (upgrade authority + break-glass admin).
+ANCHORING_DEPLOYER = Contract.from_abi(["function registry() view returns (address)"])
