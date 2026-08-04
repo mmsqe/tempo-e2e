@@ -10,6 +10,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The anchoring precompile is not in upstream tempo
+  TEMPO_REPO: mmsqe/tempo
+  TEMPO_REF: nvm
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -45,27 +50,66 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
-      - name: Download the tempo node binary + genesis
+      - name: Resolve the tempo revision
+        id: tempo
         run: |
           set -euo pipefail
-          # Track main, same image as --consensus-docker.
-          image="ghcr.io/tempoxyz/tempo:latest"
+          sha=$(git ls-remote "https://github.com/$TEMPO_REPO" "refs/heads/$TEMPO_REF" | cut -f1)
+          [ -n "$sha" ] || { echo "no such branch: $TEMPO_REPO@$TEMPO_REF" >&2; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tempo node: $TEMPO_REPO@$TEMPO_REF ($sha)"
+
+      # Keyed on the node revision, so the build only reruns when that branch moves.
+      - name: Restore the tempo node binary
+        id: tempo-bin
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/tempo/tempo
+          key: tempo-bin-${{ runner.os }}-${{ steps.tempo.outputs.sha }}
+
+      - name: Check out the tempo node
+        if: steps.tempo-bin.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TEMPO_REPO }}
+          ref: ${{ steps.tempo.outputs.sha }}
+          path: tempo-src
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.tempo-bin.outputs.cache-hit != 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.tempo-bin.outputs.cache-hit != 'true'
+        with:
+          workspaces: tempo-src
+
+      # Default features only: the image's asm-keccak/jemalloc/otlp are perf and
+      # observability knobs the harness does not need. tempo-xtask is skipped too,
+      # since the consensus localnet is not part of this job.
+      - name: Build the tempo node binary
+        if: steps.tempo-bin.outputs.cache-hit != 'true'
+        working-directory: tempo-src
+        run: |
+          set -euo pipefail
+          cargo build --release --bin tempo
+          mkdir -p "$RUNNER_TEMP/tempo"
+          cp target/release/tempo "$RUNNER_TEMP/tempo/tempo"
+
+      - name: Point the harness at the node + genesis
+        run: |
+          set -euo pipefail
           dir="$RUNNER_TEMP/tempo"
-          mkdir -p "$dir"
-          docker pull -q "$image"
-          cid=$(docker create "$image")  # the binary only ships inside the image
-          docker cp "$cid:/usr/local/bin/tempo" "$dir/tempo"
-          docker rm -v "$cid" > /dev/null
           chmod +x "$dir/tempo"
           "$dir/tempo" --version
           echo "TEMPO_BIN=$dir/tempo" >> "$GITHUB_ENV"
-          # The matching dev genesis (every hardfork at block 0); not shipped in the image.
+          # The matching dev genesis (every hardfork at block 0, anchoring allocated
+          # at 0x…0a00); it is not built into the binary.
           genesis="$dir/test-genesis.json"
           curl -fsSL -o "$genesis" \
-            "https://raw.githubusercontent.com/tempoxyz/tempo/main/crates/node/tests/assets/test-genesis.json"
+            "https://raw.githubusercontent.com/$TEMPO_REPO/${{ steps.tempo.outputs.sha }}/crates/node/tests/assets/test-genesis.json"
           echo "TEMPO_GENESIS=$genesis" >> "$GITHUB_ENV"
 
-      # The dev-node tests only; the consensus localnet also needs tempo-xtask, which
-      # this image does not ship (build from source to run those locally).
+      # The dev-node tests only; the consensus localnet also needs tempo-xtask,
+      # a second binary this job does not build (run those locally).
       - name: Test
         run: uv run --all-extras pytest -m "not consensus"
