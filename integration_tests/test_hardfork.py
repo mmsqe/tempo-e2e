@@ -32,7 +32,7 @@ FAR_FUTURE = 4_000_000_000
 ACTIVATION_LEAD = 30
 
 # Hardcoded rather than read from the node, so moving the fork has to be a decision.
-ANCHORING_FORK = "t9_time"
+ANCHORING_FORK = "t10_time"
 
 
 def _fork_label(name: str) -> str:
@@ -195,8 +195,11 @@ def test_anchoring_precompile_installs_at_its_boundary(tmp_path):
     # `latest` on a never-anchored key: a zero word from a precompile, nothing from an account.
     probe = {"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.latest(ANCHORING_ADDRESS, b"\x00" * 32).data}
 
+    forks = xtask_forks()
     with _running(node) as w3:
         _assert_pre_fork(w3, activation, _fork_label(ANCHORING_FORK))
+        # Names the fork the absence holds at, rather than leaving it to the schedule.
+        assert _active_fork(w3) == _fork_label(forks[forks.index(ANCHORING_FORK) - 1])
         assert _code(w3, ANCHORING_ADDRESS) == b"", f"no code before {_fork_label(ANCHORING_FORK)}"
         assert bytes(w3.eth.call(probe)) == b"", "an empty account answers nothing"
 
