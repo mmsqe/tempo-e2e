@@ -9,6 +9,9 @@ import json
 from pathlib import Path
 
 import pytest
+from eth_abi.abi import decode
+from eth_utils import keccak
+from hexbytes import HexBytes
 from web3 import Web3
 
 from .abi import ANCHORING, ANCHORING_ADDRESS, ANCHORING_DEPLOYER
@@ -28,6 +31,18 @@ LAST_ADMIN = error_selector("LastAdmin()")
 REGISTRY_NOT_FOUND = error_selector("RegistryNotFound(uint256)")
 NO_RECORD_FOR_CHECKSUM = error_selector("NoRecordForChecksum(uint256,bytes32)")
 INVALID_ROLE = error_selector("InvalidRole(bytes32)")
+MISSING_ROLE = error_selector("MissingRole(address,bytes32)")
+
+ANCHORED_TOPIC = HexBytes(keccak(text="Anchored(address,bytes32,bytes32,bytes)"))
+# The record envelope the wrapper anchors, in field order.
+RECORD_ENVELOPE = ["uint256", "uint256", "uint256", "string", "string", "string", "string", "uint256"]
+
+
+async def anchored_logs(w3, wrapper, *, key=None, from_block=0):
+    topics = [ANCHORED_TOPIC, HexBytes(bytes(12) + bytes.fromhex(wrapper.address[2:]))]
+    if key is not None:
+        topics.append(HexBytes(key))
+    return await w3.eth.get_logs({"fromBlock": from_block, "address": ANCHORING_ADDRESS, "topics": topics})
 
 
 async def head(w3, namespace, key) -> bytes:
@@ -50,6 +65,15 @@ class Wrapper:
     async def expect_revert(self, sender, fn, selector):
         err = await call_revert(self.w3, self.address, fn.data, sender=sender.address)
         assert selector in err, err
+
+    async def grant(self, signer, registry_id, account, role, checksum=""):
+        return await self.write(signer, REG.fns.grantRole(registry_id, checksum, account.address, role))
+
+    async def revoke(self, signer, registry_id, account, role, checksum=""):
+        return await self.write(signer, REG.fns.revokeRole(registry_id, checksum, account.address, role))
+
+    async def has_role(self, registry_id, account, role, checksum="") -> bool:
+        return await self.read(REG.fns.hasRole(registry_id, checksum, account.address, role))
 
     async def add_registry(self, signer, name="docs"):
         await self.write(signer, REG.fns.addRegistry(name, "", ""))
@@ -86,123 +110,206 @@ async def funded(w3):
     return account
 
 
-async def test_creator_becomes_registry_admin(w3, wrapper):
-    creator = await funded(w3)
-    rid = await wrapper.add_registry(creator)
-    assert await wrapper.read(REG.fns.hasRole(rid, "", creator.address, ADMIN)) is True
-    assert await wrapper.read(REG.fns.hasRole(rid, "", wrapper.owner.address, ADMIN)) is False
+class TestRecords:
+    async def test_creator_becomes_registry_admin(self, w3, wrapper):
+        creator = await funded(w3)
+        rid = await wrapper.add_registry(creator)
+        assert await wrapper.has_role(rid, creator, ADMIN) is True
+        assert await wrapper.has_role(rid, wrapper.owner, ADMIN) is False
+
+    async def test_writes_require_a_role(self, w3, wrapper):
+        creator, stranger = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+        await wrapper.expect_revert(stranger, REG.fns.addRecord(rid, "ipfs://a", "abc", "sha256", "{}"), UNAUTHORIZED)
+
+    async def test_update_record_status_is_idempotent_on_chain(self, w3, wrapper):
+        """The envelope's sequence number keeps repeated status writes clear of the no-op rule."""
+        creator = await funded(w3)
+        rid = await wrapper.add_registry(creator)
+        record_id, index = await wrapper.add_record(creator, rid, "abc")
+
+        await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, index, "redacted"))
+        await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, index, "redacted"))
+
+        key = await wrapper.read(REG.fns.statusKey(rid, record_id, index))
+        assert await head(w3, wrapper.address, key) != b"\x00" * 32
 
 
-async def test_writes_require_a_role(w3, wrapper):
-    creator, stranger = await funded(w3), await funded(w3)
-    rid = await wrapper.add_registry(creator)
-    await wrapper.expect_revert(stranger, REG.fns.addRecord(rid, "ipfs://a", "abc", "sha256", "{}"), UNAUTHORIZED)
+class TestRoles:
+    async def test_grant_and_revoke_registry_editor(self, w3, wrapper):
+        creator, editor = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+
+        # A non-admin cannot grant.
+        await wrapper.expect_revert(editor, REG.fns.grantRole(rid, "", editor.address, EDITOR), UNAUTHORIZED)
+
+        await wrapper.grant(creator, rid, editor, EDITOR)
+        await wrapper.add_record(editor, rid, "abc")
+
+        await wrapper.revoke(creator, rid, editor, EDITOR)
+        await wrapper.expect_revert(editor, REG.fns.addRecord(rid, "ipfs://a", "def", "sha256", "{}"), UNAUTHORIZED)
+
+    async def test_record_role_is_scoped_to_checksum_and_registry(self, w3, wrapper):
+        """A record grant must not leak to another checksum, nor to another registry sharing it."""
+        creator, editor = await funded(w3), await funded(w3)
+        r1 = await wrapper.add_registry(creator, "a")
+        r2 = await wrapper.add_registry(creator, "b")
+        await wrapper.add_record(creator, r1, "shared")
+        await wrapper.add_record(creator, r1, "other")
+        await wrapper.add_record(creator, r2, "shared")
+
+        await wrapper.grant(creator, r1, editor, EDITOR, checksum="shared")
+
+        _, index = await wrapper.add_record(editor, r1, "shared")  # own scope: ok
+        assert index == 2
+        await wrapper.expect_revert(  # other checksum: no
+            editor, REG.fns.addRecord(r1, "ipfs://a", "other", "sha256", "{}"), UNAUTHORIZED
+        )
+        await wrapper.expect_revert(  # other registry, same checksum: no
+            editor, REG.fns.addRecord(r2, "ipfs://a", "shared", "sha256", "{}"), UNAUTHORIZED
+        )
+
+    async def test_grant_validates_scope_and_role(self, w3, wrapper):
+        creator, other = await funded(w3), new_account()
+        await wrapper.expect_revert(creator, REG.fns.grantRole(99, "", other.address, EDITOR), REGISTRY_NOT_FOUND)
+        rid = await wrapper.add_registry(creator)
+        await wrapper.expect_revert(
+            creator, REG.fns.grantRole(rid, "nope", other.address, EDITOR), NO_RECORD_FOR_CHECKSUM
+        )
+        await wrapper.expect_revert(
+            creator, REG.fns.grantRole(rid, "", other.address, b"root".ljust(32, b"\x00")), INVALID_ROLE
+        )
+
+    async def test_only_an_admin_may_revoke(self, w3, wrapper):
+        """Revoking is admin-only: holding a role is not enough to shed it."""
+        creator, editor = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+        await wrapper.grant(creator, rid, editor, EDITOR)
+
+        # Not even on itself.
+        await wrapper.expect_revert(editor, REG.fns.revokeRole(rid, "", editor.address, EDITOR), UNAUTHORIZED)
+        assert await wrapper.has_role(rid, editor, EDITOR) is True
+
+        await wrapper.revoke(creator, rid, editor, EDITOR)
+        assert await wrapper.has_role(rid, editor, EDITOR) is False
+
+    async def test_revoking_a_role_never_held_reverts(self, w3, wrapper):
+        """A revoke names a specific grant, so a wrong one fails rather than no-opping."""
+        creator, stranger = await funded(w3), new_account()
+        rid = await wrapper.add_registry(creator)
+
+        await wrapper.expect_revert(creator, REG.fns.revokeRole(rid, "", stranger.address, EDITOR), MISSING_ROLE)
+
+    async def test_roles_are_independent_across_accounts(self, w3, wrapper):
+        """Grants are per account: revoking one leaves the others holding theirs."""
+        creator, first, second = await funded(w3), await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+
+        for account in (first, second):
+            await wrapper.grant(creator, rid, account, EDITOR)
+        await wrapper.grant(creator, rid, second, ADMIN)
+
+        await wrapper.revoke(creator, rid, first, EDITOR)
+
+        assert await wrapper.has_role(rid, first, EDITOR) is False
+        assert await wrapper.has_role(rid, second, EDITOR) is True
+        assert await wrapper.has_role(rid, second, ADMIN) is True
+        # The surviving editor grant still authorizes a write.
+        await wrapper.add_record(second, rid, "abc")
+
+    async def test_last_registry_admin_cannot_be_revoked(self, w3, wrapper):
+        creator, second = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+
+        await wrapper.expect_revert(creator, REG.fns.revokeRole(rid, "", creator.address, ADMIN), LAST_ADMIN)
+
+        # With a replacement in place the original can step down.
+        await wrapper.grant(creator, rid, second, ADMIN)
+        await wrapper.revoke(second, rid, creator, ADMIN)
+        assert await wrapper.has_role(rid, creator, ADMIN) is False
+
+    async def test_repeated_grants_do_not_inflate_the_admin_count(self, w3, wrapper):
+        creator, second = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+        for _ in range(3):
+            await wrapper.grant(creator, rid, second, ADMIN)
+
+        await wrapper.revoke(second, rid, creator, ADMIN)
+        # Were the count inflated, this would still pass; it must hit LastAdmin.
+        await wrapper.expect_revert(second, REG.fns.revokeRole(rid, "", second.address, ADMIN), LAST_ADMIN)
+
+    async def test_owner_break_glass_grants_registry_admin_only(self, w3, wrapper):
+        """The owner holds no role, yet may install a new admin — and exactly that."""
+        creator, rescuer = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+
+        await wrapper.grant(wrapper.owner, rid, rescuer, ADMIN)
+        assert await wrapper.has_role(rid, rescuer, ADMIN) is True
+
+        await wrapper.expect_revert(wrapper.owner, REG.fns.grantRole(rid, "", rescuer.address, EDITOR), UNAUTHORIZED)
+        await wrapper.expect_revert(wrapper.owner, REG.fns.revokeRole(rid, "", rescuer.address, ADMIN), UNAUTHORIZED)
 
 
-async def test_grant_and_revoke_registry_editor(w3, wrapper):
-    creator, editor = await funded(w3), await funded(w3)
-    rid = await wrapper.add_registry(creator)
+class TestAnchoredLog:
+    async def test_anchors_land_in_the_precompile(self, w3, wrapper):
+        """The wrapper's writes are real anchors: a new version moves the head."""
+        creator = await funded(w3)
+        rid = await wrapper.add_registry(creator)
+        record_id, _ = await wrapper.add_record(creator, rid, "abc")
 
-    # A non-admin cannot grant.
-    await wrapper.expect_revert(editor, REG.fns.grantRole(rid, "", editor.address, EDITOR), UNAUTHORIZED)
+        key = await wrapper.read(REG.fns.recordKey(rid, record_id))
+        before = await head(w3, wrapper.address, key)
+        assert before != b"\x00" * 32
+        assert bytes(await wrapper.read(REG.fns.latestRecordDigest(rid, record_id))) == before
 
-    await wrapper.write(creator, REG.fns.grantRole(rid, "", editor.address, EDITOR))
-    await wrapper.add_record(editor, rid, "abc")
+        await wrapper.add_record(creator, rid, "abc")  # new version moves the head
+        assert await head(w3, wrapper.address, key) != before
 
-    await wrapper.write(creator, REG.fns.revokeRole(rid, "", editor.address, EDITOR))
-    await wrapper.expect_revert(editor, REG.fns.addRecord(rid, "ipfs://a", "def", "sha256", "{}"), UNAUTHORIZED)
+    async def test_the_anchored_log_alone_reconstructs_a_record_stream(self, w3, wrapper):
+        """Version history is only in the log, since the wrapper keeps no record data.
 
+        Envelopes carry no kind tag, so they are classifiable only by the key they were
+        anchored under — the filter an indexer has to apply.
+        """
+        creator = await funded(w3)
+        rid = await wrapper.add_registry(creator, "docs")
+        await wrapper.add_record(creator, rid, "abc", uri="ipfs://v1")
+        record_id, _ = await wrapper.add_record(creator, rid, "abc", uri="ipfs://v2")
+        await wrapper.add_record(creator, rid, "def", uri="ipfs://other")
 
-async def test_record_role_is_scoped_to_checksum_and_registry(w3, wrapper):
-    """A record grant must not leak to another checksum, nor to another registry sharing it."""
-    creator, editor = await funded(w3), await funded(w3)
-    r1 = await wrapper.add_registry(creator, "a")
-    r2 = await wrapper.add_registry(creator, "b")
-    await wrapper.add_record(creator, r1, "shared")
-    await wrapper.add_record(creator, r1, "other")
-    await wrapper.add_record(creator, r2, "shared")
+        key = await wrapper.read(REG.fns.recordKey(rid, record_id))
 
-    await wrapper.write(creator, REG.fns.grantRole(r1, "shared", editor.address, EDITOR))
+        versions, commitments = {}, {}
+        for lg in await anchored_logs(w3, wrapper, key=key):
+            commitment, envelope = decode(["bytes32", "bytes"], bytes(lg["data"]))
+            assert keccak(envelope) == commitment, "anchorAndHash makes each event self-verifying"
+            _, _, index, uri, checksum, *_ = decode(RECORD_ENVELOPE, envelope)
+            versions[index] = (uri, checksum)
+            commitments[index] = commitment
 
-    _, index = await wrapper.add_record(editor, r1, "shared")  # own scope: ok
-    assert index == 2
-    await wrapper.expect_revert(  # other checksum: no
-        editor, REG.fns.addRecord(r1, "ipfs://a", "other", "sha256", "{}"), UNAUTHORIZED
-    )
-    await wrapper.expect_revert(  # other registry, same checksum: no
-        editor, REG.fns.addRecord(r2, "ipfs://a", "shared", "sha256", "{}"), UNAUTHORIZED
-    )
+        assert versions == {1: ("ipfs://v1", "abc"), 2: ("ipfs://v2", "abc")}
+        latest = max(versions)
+        assert latest == await wrapper.read(REG.fns.versionCount(rid, record_id))
+        digest = await wrapper.read(REG.fns.latestRecordDigest(rid, record_id))
+        assert bytes(digest) == commitments[latest]
 
+    async def test_acl_changes_are_not_in_the_anchored_log(self, w3, wrapper):
+        """Permissions are the one thing the log cannot rebuild.
 
-async def test_grant_validates_scope_and_role(w3, wrapper):
-    creator, other = await funded(w3), new_account()
-    await wrapper.expect_revert(creator, REG.fns.grantRole(99, "", other.address, EDITOR), REGISTRY_NOT_FOUND)
-    rid = await wrapper.add_registry(creator)
-    await wrapper.expect_revert(creator, REG.fns.grantRole(rid, "nope", other.address, EDITOR), NO_RECORD_FOR_CHECKSUM)
-    await wrapper.expect_revert(
-        creator, REG.fns.grantRole(rid, "", other.address, b"root".ljust(32, b"\x00")), INVALID_ROLE
-    )
+        Grants and revokes emit their own events but anchor nothing, so an indexer following
+        only ``Anchored`` never sees them.
+        """
+        creator, editor = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
 
+        before = await w3.eth.block_number
+        receipts = [
+            await wrapper.grant(creator, rid, editor, EDITOR),
+            await wrapper.revoke(creator, rid, editor, EDITOR),
+        ]
 
-async def test_last_registry_admin_cannot_be_revoked(w3, wrapper):
-    creator, second = await funded(w3), await funded(w3)
-    rid = await wrapper.add_registry(creator)
-
-    await wrapper.expect_revert(creator, REG.fns.revokeRole(rid, "", creator.address, ADMIN), LAST_ADMIN)
-
-    # With a replacement in place the original can step down.
-    await wrapper.write(creator, REG.fns.grantRole(rid, "", second.address, ADMIN))
-    await wrapper.write(second, REG.fns.revokeRole(rid, "", creator.address, ADMIN))
-    assert await wrapper.read(REG.fns.hasRole(rid, "", creator.address, ADMIN)) is False
-
-
-async def test_repeated_grants_do_not_inflate_the_admin_count(w3, wrapper):
-    creator, second = await funded(w3), await funded(w3)
-    rid = await wrapper.add_registry(creator)
-    for _ in range(3):
-        await wrapper.write(creator, REG.fns.grantRole(rid, "", second.address, ADMIN))
-
-    await wrapper.write(second, REG.fns.revokeRole(rid, "", creator.address, ADMIN))
-    # Were the count inflated, this would still pass; it must hit LastAdmin.
-    await wrapper.expect_revert(second, REG.fns.revokeRole(rid, "", second.address, ADMIN), LAST_ADMIN)
-
-
-async def test_owner_break_glass_grants_registry_admin_only(w3, wrapper):
-    """The owner holds no role, yet may install a new admin — and exactly that."""
-    creator, rescuer = await funded(w3), await funded(w3)
-    rid = await wrapper.add_registry(creator)
-
-    await wrapper.write(wrapper.owner, REG.fns.grantRole(rid, "", rescuer.address, ADMIN))
-    assert await wrapper.read(REG.fns.hasRole(rid, "", rescuer.address, ADMIN)) is True
-
-    await wrapper.expect_revert(wrapper.owner, REG.fns.grantRole(rid, "", rescuer.address, EDITOR), UNAUTHORIZED)
-    await wrapper.expect_revert(wrapper.owner, REG.fns.revokeRole(rid, "", rescuer.address, ADMIN), UNAUTHORIZED)
-
-
-async def test_anchors_land_in_the_precompile(w3, wrapper):
-    """The wrapper's writes are real anchors: the head is set under its namespace, and a new
-    version moves it."""
-    creator = await funded(w3)
-    rid = await wrapper.add_registry(creator)
-    record_id, _ = await wrapper.add_record(creator, rid, "abc")
-
-    key = await wrapper.read(REG.fns.recordKey(rid, record_id))
-    before = await head(w3, wrapper.address, key)
-    assert before != b"\x00" * 32
-    assert bytes(await wrapper.read(REG.fns.latestRecordDigest(rid, record_id))) == before
-
-    await wrapper.add_record(creator, rid, "abc")  # new version moves the head
-    assert await head(w3, wrapper.address, key) != before
-
-
-async def test_update_record_status_is_idempotent_on_chain(w3, wrapper):
-    """The envelope's sequence number keeps repeated status writes clear of the no-op rule."""
-    creator = await funded(w3)
-    rid = await wrapper.add_registry(creator)
-    record_id, index = await wrapper.add_record(creator, rid, "abc")
-
-    await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, index, "redacted"))
-    await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, index, "redacted"))
-
-    key = await wrapper.read(REG.fns.statusKey(rid, record_id, index))
-    assert await head(w3, wrapper.address, key) != b"\x00" * 32
+        assert not await anchored_logs(w3, wrapper, from_block=before + 1), "ACL must not anchor"
+        for receipt in receipts:
+            assert any(lg["address"].lower() == wrapper.address.lower() for lg in receipt["logs"]), (
+                "the wrapper still emits its own role event"
+            )
