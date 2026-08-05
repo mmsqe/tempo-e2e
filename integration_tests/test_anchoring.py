@@ -1,6 +1,6 @@
 """Anchoring precompile (IAnchoring, 0x…0a00): a caller-partitioned commitment log.
 
-Enshrined from the T9 hardfork, so any EOA anchors under its own address with nothing to
+Enshrined from the T10 hardfork, so any EOA anchors under its own address with nothing to
 deploy. State is one word per ``(namespace, key)``; history lives in the ``Anchored`` log,
 and re-writing the stored commitment reverts.
 """
@@ -99,7 +99,7 @@ async def anchorer(w3):
 
 class TestReads:
     async def test_precompile_is_enshrined(self, w3):
-        """Installed at the T9 boundary rather than deployed, so it carries only the marker byte."""
+        """Installed at the T10 boundary rather than deployed, so it carries only the marker byte."""
         assert bytes(await w3.eth.get_code(ADDR)) == b"\xef"
 
     async def test_untouched_key_reads_zero(self, w3, anchorer):
