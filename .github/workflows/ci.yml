@@ -13,7 +13,7 @@ concurrency:
 env:
   # The anchoring precompile is not in upstream tempo
   TEMPO_REPO: mmsqe/tempo
-  TEMPO_REF: nvm
+  TEMPO_REF: main
 
 jobs:
   lint:

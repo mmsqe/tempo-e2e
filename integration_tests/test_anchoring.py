@@ -1,8 +1,8 @@
 """Anchoring precompile (IAnchoring, 0x…0a00): a caller-partitioned commitment log.
 
-Enshrined at genesis, so any EOA anchors under its own address with nothing to deploy. State
-is one word per ``(namespace, key)``; history lives in the ``Anchored`` log, and re-writing
-the stored commitment reverts.
+Enshrined from the T9 hardfork, so any EOA anchors under its own address with nothing to
+deploy. State is one word per ``(namespace, key)``; history lives in the ``Anchored`` log,
+and re-writing the stored commitment reverts.
 """
 
 from collections import namedtuple
@@ -69,7 +69,8 @@ async def anchorer(w3):
     return account
 
 
-async def test_precompile_is_live_at_genesis(w3):
+async def test_precompile_is_enshrined(w3):
+    """Installed at the T9 boundary rather than deployed, so it carries only the marker byte."""
     assert bytes(await w3.eth.get_code(ADDR)) == b"\xef"
 
 
