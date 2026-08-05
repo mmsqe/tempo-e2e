@@ -91,18 +91,46 @@ def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None
     raise TimeoutError(f"tempo RPC {rpc_url} not ready after {timeout}s (last error: {last_err})")
 
 
-def generate_dev_genesis(output_dir: Path) -> Path:
+@functools.lru_cache(maxsize=1)
+def xtask_forks() -> tuple[str, ...]:
+    """Hardforks the installed ``tempo-xtask`` can schedule, oldest first (``"t0_time", ...``).
+
+    Read off its ``--tN-time`` flags, so the binary is the authority on which forks exist.
+    One built before a fork was declared lacks its flag, letting a test that schedules it
+    skip with a clear reason instead of dying in clap.
+    """
+    result = subprocess.run([resolve_xtask_bin(), "generate-genesis", "--help"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"tempo-xtask generate-genesis --help failed (exit {result.returncode}):\n{result.stderr}")
+    forks = re.findall(r"--t(\d+)([a-z]?)-time", result.stdout)
+    # Numeric sort, point releases after their base: t1 < t1a < t2 < ... < t9 < t10.
+    return tuple(f"t{num}{point}_time" for num, point in sorted(forks, key=lambda f: (int(f[0]), f[1])))
+
+
+def generate_dev_genesis(output_dir: Path, *, fork_times: dict[str, int] | None = None) -> Path:
     """The dev genesis: ``$TEMPO_GENESIS`` if set, else generated in ``output_dir`` via ``tempo-xtask``.
 
     An already-generated ``genesis.json`` is reused (deterministic ``--seed 0``), so a node
     can restart on the same dir and CI can supply a prebuilt genesis without needing xtask.
+
+    ``fork_times`` schedules hardforks past genesis (``{"t10_time": <unix seconds>}``) for
+    tests that cross a boundary on a running chain. It has to go through xtask, which keys
+    parts of the *alloc* off the activation time, so a schedule bolted onto finished JSON
+    yields a chain already holding the fork's state at block 0.
     """
-    env_genesis = os.environ.get("TEMPO_GENESIS")
-    if env_genesis:
-        return Path(env_genesis).resolve()
     genesis = output_dir / "genesis.json"
-    if genesis.exists():
-        return genesis
+    if fork_times:
+        unknown = sorted(set(fork_times) - set(xtask_forks()))
+        if unknown:
+            raise ValueError(f"tempo-xtask cannot schedule {unknown}; it knows {list(xtask_forks())}")
+    else:
+        # Only an unscheduled genesis may be supplied or reused: neither a prebuilt nor a
+        # leftover file can be trusted to carry a schedule.
+        env_genesis = os.environ.get("TEMPO_GENESIS")
+        if env_genesis:
+            return Path(env_genesis).resolve()
+        if genesis.exists():
+            return genesis
     output_dir.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         [
@@ -117,6 +145,8 @@ def generate_dev_genesis(output_dir: Path) -> Path:
             "--validators",
             "127.0.0.1:30303",
             "--no-dkg-in-genesis",
+            # t10_time -> --t10-time <ts>
+            *[a for name, ts in (fork_times or {}).items() for a in (f"--{name.replace('_', '-')}", str(ts))],
         ],
         capture_output=True,
         text=True,
@@ -248,15 +278,18 @@ class TempoNode:
         return f"ws://127.0.0.1:{self.ws_port}"
 
 
-def dev_node(base: Path, *, log_name: str = "node.log", **kwargs) -> TempoNode:
+def dev_node(
+    base: Path, *, log_name: str = "node.log", fork_times: dict[str, int] | None = None, **kwargs
+) -> TempoNode:
     """A ``--dev`` node with a fresh ``genesis.json`` beside its datadir.
 
     Lays out ``base/devnet/{genesis.json, node0}`` — the self-contained shape the
     session fixture uses. ``http_port`` defaults to a free port; extra keyword args
-    (``block_time``, ...) pass through to ``TempoNode``.
+    (``block_time``, ...) pass through to ``TempoNode``. ``fork_times`` schedules
+    hardforks past genesis (see :func:`generate_dev_genesis`).
     """
     devnet = base / "devnet"
-    genesis = generate_dev_genesis(devnet)
+    genesis = generate_dev_genesis(devnet, fork_times=fork_times)
     kwargs.setdefault("http_port", free_port())
     return TempoNode(datadir=devnet / "node0", log_path=devnet / log_name, genesis=genesis, **kwargs)
 
