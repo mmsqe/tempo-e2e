@@ -64,8 +64,10 @@ jobs:
         id: tempo-bin
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/tempo/tempo
-          key: tempo-bin-${{ runner.os }}-${{ steps.tempo.outputs.sha }}
+          path: |
+            ${{ runner.temp }}/tempo/tempo
+            ${{ runner.temp }}/tempo/tempo-xtask
+          key: tempo-bins-${{ runner.os }}-${{ steps.tempo.outputs.sha }}
 
       - name: Check out the tempo node
         if: steps.tempo-bin.outputs.cache-hit != 'true'
@@ -84,32 +86,30 @@ jobs:
           workspaces: tempo-src
 
       # Default features only: the image's asm-keccak/jemalloc/otlp are perf and
-      # observability knobs the harness does not need. tempo-xtask is skipped too,
-      # since the consensus localnet is not part of this job.
-      - name: Build the tempo node binary
+      # observability knobs the harness does not need. tempo-xtask comes along because
+      # the hardfork tests generate their own genesis to schedule a fork past block 0 --
+      # a prebuilt one cannot express that.
+      - name: Build the tempo node binaries
         if: steps.tempo-bin.outputs.cache-hit != 'true'
         working-directory: tempo-src
         run: |
           set -euo pipefail
-          cargo build --release --bin tempo
+          cargo build --release --bin tempo --bin tempo-xtask
           mkdir -p "$RUNNER_TEMP/tempo"
-          cp target/release/tempo "$RUNNER_TEMP/tempo/tempo"
+          cp target/release/tempo target/release/tempo-xtask "$RUNNER_TEMP/tempo/"
 
       - name: Point the harness at the node + genesis
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/tempo"
-          chmod +x "$dir/tempo"
+          chmod +x "$dir/tempo" "$dir/tempo-xtask"
           "$dir/tempo" --version
           echo "TEMPO_BIN=$dir/tempo" >> "$GITHUB_ENV"
-          # The matching dev genesis (every hardfork at block 0, anchoring allocated
-          # at 0x…0a00); it is not built into the binary.
-          genesis="$dir/test-genesis.json"
-          curl -fsSL -o "$genesis" \
-            "https://raw.githubusercontent.com/$TEMPO_REPO/${{ steps.tempo.outputs.sha }}/crates/node/tests/assets/test-genesis.json"
-          echo "TEMPO_GENESIS=$genesis" >> "$GITHUB_ENV"
+          echo "TEMPO_XTASK_BIN=$dir/tempo-xtask" >> "$GITHUB_ENV"
+          # No TEMPO_GENESIS: the harness generates one per run with xtask. The fork tests
+          # need a schedule past block 0, which a prebuilt genesis cannot carry.
 
-      # The dev-node tests only; the consensus localnet also needs tempo-xtask,
-      # a second binary this job does not build (run those locally).
+      # The dev-node tests only; the consensus localnet needs a multi-validator cluster
+      # this job does not stand up (run those locally).
       - name: Test
         run: uv run --all-extras pytest -m "not consensus"
