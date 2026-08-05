@@ -38,6 +38,27 @@ ANCHORED_TOPIC = HexBytes(keccak(text="Anchored(address,bytes32,bytes32,bytes)")
 RECORD_ENVELOPE = ["uint256", "uint256", "uint256", "string", "string", "string", "string", "uint256"]
 
 
+def _topic(value) -> HexBytes:
+    if isinstance(value, int):
+        return HexBytes(value.to_bytes(32, "big"))
+    if isinstance(value, str) and value.startswith("0x"):
+        return HexBytes(bytes(12) + bytes.fromhex(value[2:]))
+    return HexBytes(value)
+
+
+def assert_event(receipt, wrapper, signature: str, *, indexed: list, types: list, data: list):
+    topic0 = HexBytes(keccak(text=signature))
+    for lg in receipt["logs"]:
+        if lg["address"].lower() != wrapper.address.lower():
+            continue
+        if HexBytes(lg["topics"][0]) != topic0:
+            continue
+        assert [HexBytes(t) for t in lg["topics"][1:]] == [_topic(v) for v in indexed], signature
+        assert list(decode(types, bytes(lg["data"]))) == data, signature
+        return
+    raise AssertionError(f"{signature} not emitted by {wrapper.address}")
+
+
 async def anchored_logs(w3, wrapper, *, key=None, from_block=0):
     topics = [ANCHORED_TOPIC, HexBytes(bytes(12) + bytes.fromhex(wrapper.address[2:]))]
     if key is not None:
@@ -313,3 +334,67 @@ class TestAnchoredLog:
             assert any(lg["address"].lower() == wrapper.address.lower() for lg in receipt["logs"]), (
                 "the wrapper still emits its own role event"
             )
+
+
+class TestEvents:
+    async def test_record_events_carry_their_identifiers(self, w3, wrapper):
+        """RegistryAdded, RecordAdded and RecordStatusUpdated name what they changed."""
+        creator = await funded(w3)
+
+        receipt = await wrapper.write(creator, REG.fns.addRegistry("docs", "", ""))
+        rid = await wrapper.read(REG.fns.registryCount())
+        assert_event(
+            receipt,
+            wrapper,
+            "RegistryAdded(uint256,string,address)",
+            indexed=[rid, creator.address],
+            types=["string"],
+            data=["docs"],
+        )
+
+        receipt = await wrapper.write(creator, REG.fns.addRecord(rid, "ipfs://a", "abc", "sha256", "{}"))
+        record_id = await wrapper.read(REG.fns.recordIdForChecksum(rid, "abc"))
+        assert_event(
+            receipt,
+            wrapper,
+            "RecordAdded(uint256,uint256,uint256,string)",
+            indexed=[rid, record_id],
+            types=["uint256", "string"],
+            data=[1, "abc"],
+        )
+
+        receipt = await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, 1, "redacted"))
+        assert_event(
+            receipt,
+            wrapper,
+            "RecordStatusUpdated(uint256,uint256,uint256,string)",
+            indexed=[rid, record_id],
+            types=["uint256", "string"],
+            data=[1, "redacted"],
+        )
+
+    async def test_role_events_carry_the_grant(self, w3, wrapper):
+        """The scope of a grant lives only here, since ACL changes are never anchored."""
+        creator, editor = await funded(w3), await funded(w3)
+        rid = await wrapper.add_registry(creator)
+        await wrapper.add_record(creator, rid, "abc")
+
+        receipt = await wrapper.grant(creator, rid, editor, EDITOR, checksum="abc")
+        assert_event(
+            receipt,
+            wrapper,
+            "RoleGranted(uint256,bytes32,address,bytes32)",
+            indexed=[rid, editor.address],
+            types=["bytes32", "bytes32"],
+            data=[keccak(text="abc"), EDITOR],
+        )
+
+        receipt = await wrapper.revoke(creator, rid, editor, EDITOR, checksum="abc")
+        assert_event(
+            receipt,
+            wrapper,
+            "RoleRevoked(uint256,bytes32,address,bytes32)",
+            indexed=[rid, editor.address],
+            types=["bytes32", "bytes32"],
+            data=[keccak(text="abc"), EDITOR],
+        )
