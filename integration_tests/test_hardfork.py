@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from web3 import Web3
 
+from .abi import ANCHORING, ANCHORING_ADDRESS
 from .network import dev_node, generate_dev_genesis, xtask_forks
 
 pytestmark = [pytest.mark.tempo, pytest.mark.slow]
@@ -29,6 +30,9 @@ FAR_FUTURE = 4_000_000_000
 # Gap between launching a node and the fork activating: enough for startup and still some
 # pre-fork blocks to observe. Blocks land every 50ms, so a generous value costs only time.
 ACTIVATION_LEAD = 30
+
+# Hardcoded rather than read from the node, so moving the fork has to be a decision.
+ANCHORING_FORK = "t9_time"
 
 
 def _fork_label(name: str) -> str:
@@ -44,14 +48,14 @@ def _generate_alloc(output_dir: Path, fork_times: dict[str, int] | None = None) 
     return _read_alloc(generate_dev_genesis(output_dir, fork_times=fork_times))
 
 
-def _schedule(fork: str, activation: int) -> dict[str, int]:
-    """Activate ``fork`` and every later fork at ``activation``, leaving earlier ones at genesis.
+def _schedule(fork: str, activation: int, *, later: int | None = None) -> dict[str, int]:
+    """Activate ``fork`` at ``activation``, leaving earlier forks at genesis.
 
-    Later forks come along because a schedule has to stay ordered: no chain sits at T5
-    with T6 pending while T7 is live.
+    Later forks come along at ``later`` — by default same moment, since a schedule has to stay
+    ordered. Pass ``FAR_FUTURE`` to hold them out, so boundary names one fork rather than its neighbour too.
     """
     order = xtask_forks()
-    return {f: activation for f in order[order.index(fork) :]}
+    return {fork: activation, **{f: activation if later is None else later for f in order[order.index(fork) + 1 :]}}
 
 
 @functools.lru_cache(maxsize=1)
@@ -112,6 +116,15 @@ def _active_fork(w3: Web3) -> str:
     return resp["result"]["active"]
 
 
+def _assert_pre_fork(w3: Web3, activation: int, label: str) -> None:
+    """Guard that the boundary is still ahead, so the pre-fork assertions mean something."""
+    ts = w3.eth.get_block("latest")["timestamp"]
+    assert ts < activation, (
+        f"chain reached {label} (block timestamp {ts} >= {activation}) "
+        f"before the pre-fork assertions could run; raise ACTIVATION_LEAD"
+    )
+
+
 def _wait_past(w3: Web3, activation: int, timeout: float = 120.0) -> None:
     """Wait for a block at or past ``activation``."""
     deadline = time.time() + timeout
@@ -140,9 +153,9 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
     than one synced from genesis.
     """
     head_w3, head_alloc = head_chain
+    forks = xtask_forks()
     activation = int(time.time()) + ACTIVATION_LEAD
-    schedule = _schedule(fork, activation)
-    node = dev_node(tmp_path, log_name=f"{fork}.log", fork_times=schedule)
+    node = dev_node(tmp_path, log_name=f"{fork}.log", fork_times=_schedule(fork, activation))
 
     # Whatever the scheduled genesis omits is precisely what the boundary installers owe.
     owed = sorted(set(head_alloc) - set(_read_alloc(node.genesis)))
@@ -153,17 +166,41 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
 
     with _running(node) as w3:
         # Pre-fork: a live chain one fork short, holding none of the state.
-        head = w3.eth.get_block("latest")
-        assert head["timestamp"] < activation, (
-            f"chain reached {_fork_label(fork)} (block timestamp {head['timestamp']} >= {activation}) "
-            f"before the pre-fork assertions could run; raise ACTIVATION_LEAD"
-        )
-        assert _active_fork(w3) == _fork_label([f for f in xtask_forks() if f not in schedule][-1])
+        _assert_pre_fork(w3, activation, _fork_label(fork))
+        assert _active_fork(w3) == _fork_label(forks[forks.index(fork) - 1])
         for address in owed:
             assert _code(w3, address) == b"", f"{address} must hold no code before {_fork_label(fork)}"
 
         _wait_past(w3, activation)
 
         # Post-fork: the executor installed it all on a chain already running without it.
-        assert _active_fork(w3) == _fork_label(xtask_forks()[-1])
+        assert _active_fork(w3) == _fork_label(forks[-1])
         assert fingerprints(w3) == fingerprints(head_w3)
+
+
+def test_anchoring_precompile_installs_at_its_boundary(tmp_path):
+    """Crossing its fork turns the anchoring address from an empty account into a precompile.
+
+    The test above misses this one: it finds forks by diffing allocs, and anchoring writes
+    nothing there. Dispatch is probed as well as code, since a marker installed without its
+    spec gate opening looks the same in state.
+    """
+    activation = int(time.time()) + ACTIVATION_LEAD
+    node = dev_node(
+        tmp_path, log_name="anchoring.log", fork_times=_schedule(ANCHORING_FORK, activation, later=FAR_FUTURE)
+    )
+    assert ANCHORING_ADDRESS.lower() not in {a.lower() for a in _read_alloc(node.genesis)}, (
+        "anchoring must not be in the alloc; it is installed at the boundary"
+    )
+    # `latest` on a never-anchored key: a zero word from a precompile, nothing from an account.
+    probe = {"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.latest(ANCHORING_ADDRESS, b"\x00" * 32).data}
+
+    with _running(node) as w3:
+        _assert_pre_fork(w3, activation, _fork_label(ANCHORING_FORK))
+        assert _code(w3, ANCHORING_ADDRESS) == b"", f"no code before {_fork_label(ANCHORING_FORK)}"
+        assert bytes(w3.eth.call(probe)) == b"", "an empty account answers nothing"
+
+        _wait_past(w3, activation)
+
+        assert _code(w3, ANCHORING_ADDRESS) == b"\xef", "the marker is installed at the boundary"
+        assert bytes(w3.eth.call(probe)) == b"\x00" * 32, "and dispatch answers as a live precompile"
