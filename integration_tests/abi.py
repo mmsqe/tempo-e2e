@@ -229,7 +229,7 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
 )
 
 
-# Anchoring precompile (IAnchoring): a caller-partitioned commitment log, enshrined at T9.
+# Anchoring precompile (IAnchoring): a caller-partitioned commitment log, enshrined at T10.
 # The caller is the namespace, so there is no authorization surface and nothing to deploy.
 # Supersedes the withdrawn AnchoringRegistry: the address is inherited from the x/anchoring
 # precompile, but its selectors are gone and now revert UnknownFunctionSelector. Registry and

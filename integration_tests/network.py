@@ -107,7 +107,9 @@ def xtask_forks() -> tuple[str, ...]:
     return tuple(f"t{num}{point}_time" for num, point in sorted(forks, key=lambda f: (int(f[0]), f[1])))
 
 
-def generate_dev_genesis(output_dir: Path, *, fork_times: dict[str, int] | None = None) -> Path:
+def generate_dev_genesis(
+    output_dir: Path, *, fork_times: dict[str, int] | None = None, chain_id: int | None = None
+) -> Path:
     """The dev genesis: ``$TEMPO_GENESIS`` if set, else generated in ``output_dir`` via ``tempo-xtask``.
 
     An already-generated ``genesis.json`` is reused (deterministic ``--seed 0``), so a node
@@ -117,15 +119,17 @@ def generate_dev_genesis(output_dir: Path, *, fork_times: dict[str, int] | None 
     tests that cross a boundary on a running chain. It has to go through xtask, which keys
     parts of the *alloc* off the activation time, so a schedule bolted onto finished JSON
     yields a chain already holding the fork's state at block 0.
+
+    ``chain_id`` overrides xtask's default.
     """
     genesis = output_dir / "genesis.json"
     if fork_times:
         unknown = sorted(set(fork_times) - set(xtask_forks()))
         if unknown:
             raise ValueError(f"tempo-xtask cannot schedule {unknown}; it knows {list(xtask_forks())}")
-    else:
-        # Only an unscheduled genesis may be supplied or reused: neither a prebuilt nor a
-        # leftover file can be trusted to carry a schedule.
+    if not fork_times and chain_id is None:
+        # Only a default genesis may be supplied or reused: neither a prebuilt nor a leftover
+        # file can be trusted to carry a particular schedule or chain id.
         env_genesis = os.environ.get("TEMPO_GENESIS")
         if env_genesis:
             return Path(env_genesis).resolve()
@@ -147,6 +151,7 @@ def generate_dev_genesis(output_dir: Path, *, fork_times: dict[str, int] | None 
             "--no-dkg-in-genesis",
             # t10_time -> --t10-time <ts>
             *[a for name, ts in (fork_times or {}).items() for a in (f"--{name.replace('_', '-')}", str(ts))],
+            *(("--chain-id", str(chain_id)) if chain_id is not None else ()),
         ],
         capture_output=True,
         text=True,
@@ -279,17 +284,23 @@ class TempoNode:
 
 
 def dev_node(
-    base: Path, *, log_name: str = "node.log", fork_times: dict[str, int] | None = None, **kwargs
+    base: Path,
+    *,
+    log_name: str = "node.log",
+    fork_times: dict[str, int] | None = None,
+    chain_id: int | None = None,
+    **kwargs,
 ) -> TempoNode:
     """A ``--dev`` node with a fresh ``genesis.json`` beside its datadir.
 
     Lays out ``base/devnet/{genesis.json, node0}`` — the self-contained shape the
     session fixture uses. ``http_port`` defaults to a free port; extra keyword args
     (``block_time``, ...) pass through to ``TempoNode``. ``fork_times`` schedules
-    hardforks past genesis (see :func:`generate_dev_genesis`).
+    hardforks past genesis and ``chain_id`` overrides the default one (see
+    :func:`generate_dev_genesis`).
     """
     devnet = base / "devnet"
-    genesis = generate_dev_genesis(devnet, fork_times=fork_times)
+    genesis = generate_dev_genesis(devnet, fork_times=fork_times, chain_id=chain_id)
     kwargs.setdefault("http_port", free_port())
     return TempoNode(datadir=devnet / "node0", log_path=devnet / log_name, genesis=genesis, **kwargs)
 
