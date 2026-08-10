@@ -34,8 +34,16 @@ INVALID_ROLE = error_selector("InvalidRole(bytes32)")
 MISSING_ROLE = error_selector("MissingRole(address,bytes32)")
 
 ANCHORED_TOPIC = HexBytes(keccak(text="Anchored(address,bytes32,bytes32,bytes)"))
-# The record envelope the wrapper anchors, in field order.
-RECORD_ENVELOPE = ["uint256", "uint256", "uint256", "string", "string", "string", "string", "uint256"]
+# Every envelope leads with its kind, so an indexer classifies a payload from the log alone.
+# Spelled out because these literals are wire format, not an implementation detail;
+# ``TestAnchoredLog.test_kind_tags_are_the_wire_constants`` ties them to the contract's own.
+KINDS = {name: name.lower().encode().ljust(32, b"\x00") for name in ("REGISTRY", "RECORD", "STATUS", "ACL")}
+# The envelopes the wrapper anchors, in field order, each after its leading kind.
+REGISTRY_ENVELOPE = ["bytes32", "uint256", "string", "string", "string", "address", "uint256"]
+RECORD_ENVELOPE = ["bytes32", "uint256", "uint256", "uint256", "string", "string", "string", "string", "uint256"]
+STATUS_ENVELOPE = ["bytes32", "uint256", "uint256", "uint256", "string", "uint256"]
+# One grant's new state, keyed by aclKey(registryId, checksumHash, account, role).
+ACL_ENVELOPE = ["bytes32", "uint256", "bytes32", "address", "bytes32", "bool"]
 
 
 def _topic(value) -> HexBytes:
@@ -69,6 +77,22 @@ async def anchored_logs(w3, wrapper, *, key=None, from_block=0):
 async def head(w3, namespace, key) -> bytes:
     """The precompile's latest commitment for ``(namespace, key)``."""
     return bytes(await ANCHORING.fns.latest(namespace, key).call(w3, to=ANCHORING_ADDRESS))
+
+
+async def envelopes(w3, wrapper, key, types, kind, *, from_block=0):
+    """Envelopes anchored under ``key``, in log order, as ``(commitment, fields)`` pairs.
+
+    Checks what holds for every kind on the way past: each commitment hashes its own payload,
+    and the payload leads with the kind it was keyed under.
+    """
+    out = []
+    for lg in await anchored_logs(w3, wrapper, key=key, from_block=from_block):
+        commitment, envelope = decode(["bytes32", "bytes"], bytes(lg["data"]))
+        assert keccak(envelope) == commitment, "anchorAndHash makes each event self-verifying"
+        fields = decode(types, envelope)
+        assert fields[0] == KINDS[kind], f"envelope under {HexBytes(key).hex()} is not a {kind}"
+        out.append((commitment, fields))
+    return out
 
 
 class Wrapper:
@@ -144,7 +168,11 @@ class TestRecords:
         await wrapper.expect_revert(stranger, REG.fns.addRecord(rid, "ipfs://a", "abc", "sha256", "{}"), UNAUTHORIZED)
 
     async def test_update_record_status_is_idempotent_on_chain(self, w3, wrapper):
-        """The envelope's sequence number keeps repeated status writes clear of the no-op rule."""
+        """The envelope's sequence number keeps repeated status writes clear of the no-op rule.
+
+        A moved head would also pass if the second write were dropped, so the test reads ``seq``
+        out of both envelopes.
+        """
         creator = await funded(w3)
         rid = await wrapper.add_registry(creator)
         record_id, index = await wrapper.add_record(creator, rid, "abc")
@@ -154,6 +182,12 @@ class TestRecords:
 
         key = await wrapper.read(REG.fns.statusKey(rid, record_id, index))
         assert await head(w3, wrapper.address, key) != b"\x00" * 32
+
+        anchored = [f for _, f in await envelopes(w3, wrapper, key, STATUS_ENVELOPE, "STATUS")]
+        assert len(anchored) == 2, "the identical repeat anchors again rather than reverting"
+        for _, registry_id, rec, idx, status, _ in anchored:
+            assert (registry_id, rec, idx, status) == (rid, record_id, index, "redacted")
+        assert anchored[1][-1] > anchored[0][-1], "seq is what makes the payloads differ"
 
 
 class TestRoles:
@@ -289,8 +323,8 @@ class TestAnchoredLog:
     async def test_the_anchored_log_alone_reconstructs_a_record_stream(self, w3, wrapper):
         """Version history is only in the log, since the wrapper keeps no record data.
 
-        Envelopes carry no kind tag, so they are classifiable only by the key they were
-        anchored under — the filter an indexer has to apply.
+        Each envelope leads with its kind, so the key it was anchored under confirms the shape
+        rather than being the only thing that identifies it.
         """
         creator = await funded(w3)
         rid = await wrapper.add_registry(creator, "docs")
@@ -301,10 +335,9 @@ class TestAnchoredLog:
         key = await wrapper.read(REG.fns.recordKey(rid, record_id))
 
         versions, commitments = {}, {}
-        for lg in await anchored_logs(w3, wrapper, key=key):
-            commitment, envelope = decode(["bytes32", "bytes"], bytes(lg["data"]))
-            assert keccak(envelope) == commitment, "anchorAndHash makes each event self-verifying"
-            _, _, index, uri, checksum, *_ = decode(RECORD_ENVELOPE, envelope)
+        for commitment, (_, _, _, index, uri, checksum, *_) in await envelopes(
+            w3, wrapper, key, RECORD_ENVELOPE, "RECORD"
+        ):
             versions[index] = (uri, checksum)
             commitments[index] = commitment
 
@@ -314,26 +347,65 @@ class TestAnchoredLog:
         digest = await wrapper.read(REG.fns.latestRecordDigest(rid, record_id))
         assert bytes(digest) == commitments[latest]
 
-    async def test_acl_changes_are_not_in_the_anchored_log(self, w3, wrapper):
-        """Permissions are the one thing the log cannot rebuild.
+    async def test_acl_changes_are_anchored(self, w3, wrapper):
+        """Permissions rebuild from the log too: every real grant or revoke anchors its state.
 
-        Grants and revokes emit their own events but anchor nothing, so an indexer following
-        only ``Anchored`` never sees them.
+        A repeated grant stays a no-op, so granted and revoked alternate and no sequence number
+        is needed to clear the precompile's ``CommitmentUnchanged`` rule.
         """
         creator, editor = await funded(w3), await funded(w3)
         rid = await wrapper.add_registry(creator)
+        checksum_hash = keccak(text="")  # registry scope
+        key = await wrapper.read(REG.fns.aclKey(rid, checksum_hash, editor.address, EDITOR))
 
         before = await w3.eth.block_number
         receipts = [
             await wrapper.grant(creator, rid, editor, EDITOR),
+            await wrapper.grant(creator, rid, editor, EDITOR),  # already a member: anchors nothing
             await wrapper.revoke(creator, rid, editor, EDITOR),
         ]
 
-        assert not await anchored_logs(w3, wrapper, from_block=before + 1), "ACL must not anchor"
+        states = []
+        for _, (_, registry_id, scope, account, role, granted) in await envelopes(
+            w3, wrapper, key, ACL_ENVELOPE, "ACL", from_block=before + 1
+        ):
+            assert (registry_id, scope, role) == (rid, checksum_hash, EDITOR)
+            assert Web3.to_checksum_address(account) == editor.address
+            states.append(granted)
+
+        assert states == [True, False], "one anchor per real change; the repeated grant is a no-op"
+        assert await head(w3, wrapper.address, key) != b"\x00" * 32
         for receipt in receipts:
             assert any(lg["address"].lower() == wrapper.address.lower() for lg in receipt["logs"]), (
                 "the wrapper still emits its own role event"
             )
+
+    async def test_the_registry_envelope_records_its_creation(self, w3, wrapper):
+        """A registry's name, description, metadata and creator live only in its envelope.
+
+        The wrapper keeps a counter and nothing else, so this payload is the only on-chain
+        record of what was created and by whom.
+        """
+        creator = await funded(w3)
+        await wrapper.write(creator, REG.fns.addRegistry("docs", "the docs", '{"src":"e2e"}'))
+        rid = await wrapper.read(REG.fns.registryCount())
+        key = await wrapper.read(REG.fns.registryKey(rid))
+
+        anchored = await envelopes(w3, wrapper, key, REGISTRY_ENVELOPE, "REGISTRY")
+        assert len(anchored) == 1, "a registry is created once and never re-anchored"
+        _, (_, id_, name, description, metadata, account, timestamp) = anchored[0]
+        assert (id_, name, description, metadata) == (rid, "docs", "the docs", '{"src":"e2e"}')
+        assert Web3.to_checksum_address(account) == creator.address
+        assert timestamp > 0, "the envelope carries the block time, since the log does not repeat it"
+
+    async def test_kind_tags_are_the_wire_constants(self, wrapper):
+        """The tags indexers match on are the constants the contract exposes.
+
+        Reading both sides is what stops the wire format and the contract drifting apart.
+        """
+        for name, tag in KINDS.items():
+            on_chain = await wrapper.read(getattr(REG.fns, f"KIND_{name}")())
+            assert bytes(on_chain) == tag, f"KIND_{name} moved away from {name.lower()!r}"
 
 
 class TestEvents:
@@ -374,7 +446,7 @@ class TestEvents:
         )
 
     async def test_role_events_carry_the_grant(self, w3, wrapper):
-        """The scope of a grant lives only here, since ACL changes are never anchored."""
+        """The event names the scope in readable form; the anchored envelope hashes it."""
         creator, editor = await funded(w3), await funded(w3)
         rid = await wrapper.add_registry(creator)
         await wrapper.add_record(creator, rid, "abc")

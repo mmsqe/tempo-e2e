@@ -5,9 +5,9 @@ BIN := .venv/bin
 # App contracts deployed by the suite live in their own repo; their initcode is vendored under
 # integration_tests/artifacts so tests need no toolchain. The repo is private, so this uses
 # SSH; override CONTRACTS_REPO/CONTRACTS_REF to point elsewhere or pin a commit.
-CONTRACTS_REPO ?= git@github.com:NVNM-Chain/nvnm-contracts.git
+CONTRACTS_REPO ?= git@github.com:NVNM-Chain/nvnmchain-contracts.git
 CONTRACTS_REF ?= main
-CONTRACTS_WORK := .cache/nvnm-contracts
+CONTRACTS_WORK := .cache/nvnmchain-contracts
 
 install:
 	uv sync
@@ -27,7 +27,7 @@ contract-artifacts:
 	  --arg commit "$$(git -C $(CONTRACTS_WORK) rev-parse HEAD)" \
 	  '{source: $$repo, commit: $$commit, note: "Regenerate with: make contract-artifacts", deployer_bytecode: $$bc}' \
 	  > integration_tests/artifacts/anchoring.json
-	@echo "wrote integration_tests/artifacts/anchoring.json (nvnm-contracts $$(git -C $(CONTRACTS_WORK) rev-parse --short HEAD))"
+	@echo "wrote integration_tests/artifacts/anchoring.json (nvnmchain-contracts $$(git -C $(CONTRACTS_WORK) rev-parse --short HEAD))"
 
 # Full suite (launches a local dev node).
 test:

@@ -249,7 +249,10 @@ ANCHORING = Contract.from_abi(
 # through the precompile rather than stored on-chain -- the wrapper keeps only counters and role
 # membership, and latest(wrapper, key) in the precompile is the source of truth. Roles are
 # registry-scoped or record-scoped (one checksum within one registry) over "admin"/"editor",
-# passed as right-padded bytes32. Deployed per test via the vendored one-shot deployer.
+# passed as right-padded bytes32. Role changes anchor too, so permissions rebuild from the log
+# alone, and every envelope leads with a bytes32 kind (registry/record/status/acl) an indexer can
+# classify on. Deployed per test via the vendored one-shot deployer, whose initcode is pinned to
+# a nvnmchain-contracts commit in artifacts/anchoring.json.
 ANCHORING_REGISTRY = Contract.from_abi(
     [
         "function addRegistry(string name, string description, string metadata) returns (uint256 id)",
@@ -263,8 +266,15 @@ ANCHORING_REGISTRY = Contract.from_abi(
         "function recordIdForChecksum(uint256 registryId, string checksum) view returns (uint256)",
         "function versionCount(uint256 registryId, uint256 recordId) view returns (uint256)",
         "function latestRecordDigest(uint256 registryId, uint256 recordId) view returns (bytes32)",
+        # The kind tags leading every anchored envelope; indexers match these literals.
+        "function KIND_REGISTRY() pure returns (bytes32)",
+        "function KIND_RECORD() pure returns (bytes32)",
+        "function KIND_STATUS() pure returns (bytes32)",
+        "function KIND_ACL() pure returns (bytes32)",
+        "function registryKey(uint256 id) pure returns (bytes32)",
         "function recordKey(uint256 registryId, uint256 recordId) pure returns (bytes32)",
         "function statusKey(uint256 registryId, uint256 recordId, uint256 index) pure returns (bytes32)",
+        "function aclKey(uint256 registryId, bytes32 checksumHash, address account, bytes32 role) pure returns (bytes32)",
         "function owner() view returns (address)",
         "event RegistryAdded(uint256 indexed id, string name, address indexed creator)",
         "event RecordAdded(uint256 indexed registryId, uint256 indexed recordId, uint256 index, string checksum)",
