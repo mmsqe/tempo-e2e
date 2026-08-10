@@ -102,10 +102,11 @@ natively-built image to skip emulation, with `TIDX_PLATFORM=` to drop the amd64 
 | `test_subscribe.py` | — | `eth_subscribe`: new heads, logs |
 | `test_tracing.py` | — | `debug_traceTransaction` (callTracer, struct logger), `trace_block_by_number` |
 | `test_contract.py` | — | EVM contract deploy + call via tempo (0x76) txs |
-| `test_native_token.py` | — | `BALANCE` opcode is 0 for a stablecoin-funded account |
+| `test_native_token.py` | — | no native token: `BALANCE` opcode is 0, `eth_getBalance` is a fixed placeholder |
 | `test_block_hashes.py` | EIP-2935 | history-storage predeploy: present at genesis, in-window hash read, out-of-window revert |
 | `test_mempool.py` | — | `txpool_status`/`content` and `operator_peers` RPCs |
 | `test_faucet.py` | — | `tempo_fundAddress` faucet RPC |
+| `test_simulate.py` | — | `tempo_simulateV1`: gas for a reverting call, transfer trace + TIP-20 metadata |
 | `test_validation.py` | — | malformed / unfunded tx rejection |
 | `test_gas.py` | TIP-1000, TIP-1010 | gas estimation/accounting: state-creation cost, 30M per-tx cap |
 | `test_node_ops.py` | — | node resumes from persisted state on restart (`slow`) |
