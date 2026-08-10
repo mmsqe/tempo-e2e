@@ -56,11 +56,13 @@ TIP20_FACTORY = Contract.from_abi(
 )
 TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
 
-# AccountKeychain view used only by tests (not part of the tempo-py bindings).
+# AccountKeychain views used only by tests (not part of the tempo-py bindings).
 KEYCHAIN_VIEWS = Contract.from_abi(
     [
         "function getRemainingLimitWithPeriod(address account, address keyId, address token)"
         " view returns (uint256 remaining, uint64 periodEnd)",
+        "function getKey(address account, address keyId)"
+        " view returns ((uint8 signatureType, address keyId, uint64 expiry, bool enforceLimits, bool isRevoked))",
     ]
 )
 

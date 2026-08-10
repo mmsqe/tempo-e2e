@@ -1337,7 +1337,7 @@ dev = [
 requires-dist = [
     { name = "eth-account", specifier = ">=0.13.0" },
     { name = "eth-contract", specifier = ">=0.4.0" },
-    { name = "tempo-py", extras = ["devnet"], git = "https://github.com/yihuang/tempo-py.git?branch=main" },
+    { name = "tempo-py", extras = ["devnet"], git = "https://github.com/yihuang/tempo-py.git?branch=p256-webauthn" },
     { name = "web3", specifier = ">=7.0.0" },
 ]
 
@@ -1354,12 +1354,13 @@ dev = [
 [[package]]
 name = "tempo-py"
 version = "0.1.0"
-source = { git = "https://github.com/yihuang/tempo-py.git?branch=main#7a4140469f3c22b0dfd188b7939d4d15b2c1907d" }
+source = { git = "https://github.com/yihuang/tempo-py.git?branch=p256-webauthn#e339c7581a0696b5520f93de2868f8d20efe219f" }
 dependencies = [
     { name = "attrs" },
     { name = "eth-account" },
     { name = "eth-contract" },
     { name = "eth-utils" },
+    { name = "pycryptodome" },
     { name = "rlp" },
     { name = "web3" },
 ]

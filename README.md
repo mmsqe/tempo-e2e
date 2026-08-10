@@ -116,6 +116,7 @@ natively-built image to skip emulation, with `TIDX_PLATFORM=` to drop the amd64 
 | File | TIP(s) | Covers |
 |---|---|---|
 | `test_tempo_tx.py` | — | native 0x76 tx: type, heterogeneous batching under one nonce, validity windows |
+| `test_p256_webauthn.py` | — | P-256 / WebAuthn (passkey) signatures, as the sender and as a keychain access key |
 | `test_standard_tx.py` | TIP-1060 | unmodified type-2 tx pays gas in the default stablecoin |
 | `test_nonces.py` | — | 2D nonces: parallel keys, sequencing, replay, Nonce precompile |
 | `test_expiring_nonce.py` | TIP-1009 | expiring nonces: success, expiry, replay, max-window, zero-nonce |
