@@ -45,6 +45,16 @@ async def _key_sends(w3, chain_id, root, key, data, *, is_admin):
     return await send_signed(w3, signed)
 
 
+async def _key_transfers(w3, chain_id, root, key, amount):
+    """Move ``amount`` with an already-registered key, return the receipt or None if rejected."""
+    tx = await prepare_tx(w3, chain_id, root, [transfer_call(new_account().address, amount)])
+    try:
+        return await send_signed(w3, sign_tx_registered_key(tx, key.key.hex(), root.address))
+    except Exception:
+        # A key the node no longer recognizes is refused before inclusion.
+        return None
+
+
 async def test_is_admin_key_semantics(w3, chain_id):
     root = new_account()
     await fund(w3, root.address)
@@ -141,17 +151,27 @@ async def test_admin_key_rejects_limit_and_scope_mutators(w3, chain_id):
         assert "InvalidKeyId" in await call_revert(w3, KC_ADDR, data, sender=root.address)
 
 
-async def test_revoked_key_cannot_be_reauthorized(w3, chain_id):
+async def test_revocation_ends_the_key_id_not_its_witness(w3, chain_id):
+    """Revoking is final for the key id, but says nothing about the witness that
+    authorized it -- that stays replayable for a fresh key id until it is burned."""
     root = new_account()
     await fund(w3, root.address)
     k2 = new_account().address
-    await _kc(w3, chain_id, root, _authorize_admin(k2))
+    witness = b"\x5b" * 32
+    await _kc(w3, chain_id, root, KC.fns.authorizeAdminKey(k2, SECP256K1, witness).data)
     assert await KC.fns.isAdminKey(root.address, k2).call(w3, to=KC_ADDR)
 
     await _kc(w3, chain_id, root, KC.fns.revokeKey(k2).data)
     assert not await KC.fns.isAdminKey(root.address, k2).call(w3, to=KC_ADDR)  # a revoked key is no longer admin
 
+    # the key id is refused for good, whatever witness the retry carries
     assert "KeyAlreadyRevoked" in await call_revert(w3, KC_ADDR, _authorize_admin(k2), sender=root.address)
+
+    # ...but the witness is untouched, so it still authorizes a different key id
+    assert not await KC.fns.isKeyAuthorizationWitnessBurned(root.address, witness).call(w3, to=KC_ADDR)
+    k3 = new_account().address
+    await _kc(w3, chain_id, root, KC.fns.authorizeAdminKey(k3, SECP256K1, witness).data)
+    assert await KC.fns.isAdminKey(root.address, k3).call(w3, to=KC_ADDR)
 
 
 def test_admin_key_cannot_carry_a_spending_limit(chain_id):
@@ -163,18 +183,32 @@ def test_admin_key_cannot_carry_a_spending_limit(chain_id):
         sign_tx_access_key(tx, k2.key.hex(), Signer(root.key.hex()), is_admin=True, limits=limits)
 
 
-async def test_witness_burn_round_trip(w3, chain_id):
-    root = new_account()
+async def test_witness_burn_retires_the_authorization_not_the_key(w3, chain_id):
+    """TIP-1053: burning stops the authorization being replayed, not the key it
+    authorized -- nothing a client does locally ends a key, only revokeKey does."""
+    root, k2 = new_account(), new_account()
     await fund(w3, root.address)
     witness = b"\x53" * 32
+    await _kc(w3, chain_id, root, KC.fns.authorizeAdminKey(k2.address, SECP256K1, witness).data)
+    assert (await _key_transfers(w3, chain_id, root, k2, 100))["status"] == 1
 
     assert not await KC.fns.isKeyAuthorizationWitnessBurned(root.address, witness).call(w3, to=KC_ADDR)
     await _kc(w3, chain_id, root, KC.fns.burnKeyAuthorizationWitness(witness).data)
     assert await KC.fns.isKeyAuthorizationWitnessBurned(root.address, witness).call(w3, to=KC_ADDR)
 
-    # a key authorization carrying a burned witness is rejected
+    # the burned authorization cannot be replayed for another key
     burned = KC.fns.authorizeAdminKey(new_account().address, SECP256K1, witness).data
     assert "KeyAuthorizationWitnessAlreadyBurned" in await call_revert(w3, KC_ADDR, burned, sender=root.address)
+
+    # ...but k2 is still admin and still signs
+    assert await KC.fns.isAdminKey(root.address, k2.address).call(w3, to=KC_ADDR)
+    assert (await _key_transfers(w3, chain_id, root, k2, 101))["status"] == 1
+
+    # revocation is what ends it
+    await _kc(w3, chain_id, root, KC.fns.revokeKey(k2.address).data)
+    assert not await KC.fns.isAdminKey(root.address, k2.address).call(w3, to=KC_ADDR)
+    receipt = await _key_transfers(w3, chain_id, root, k2, 102)
+    assert receipt is None or receipt["status"] == 0
 
 
 async def test_non_admin_key_cannot_burn_witness(w3, chain_id):
