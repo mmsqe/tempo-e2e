@@ -77,8 +77,20 @@ pytest integration_tests/test_indexer.py --indexer --tidx
 tidx publishes `linux/amd64` only, so an Apple-silicon host runs it emulated — via
 Rosetta (Docker Desktop → Settings → General) or the QEMU handlers (`docker run
 --privileged --rm tonistiigi/binfmt --install amd64`). The suite probes this up front
-and skips with the docker error if neither is available. Point `$TIDX_IMAGE` at a
-natively-built image to skip emulation, with `TIDX_PLATFORM=` to drop the amd64 pin.
+and skips with the docker error if neither is available.
+
+Emulation is avoidable — tidx's Dockerfile has nothing architecture-specific in it:
+
+```bash
+git clone https://github.com/tempoxyz/tidx && cd tidx && docker build -t tidx:local .
+TIDX_IMAGE=tidx:local TIDX_PLATFORM= pytest integration_tests/test_anchoring.py --tidx
+```
+
+`TIDX_PLATFORM=` matters as much as `$TIDX_IMAGE`: at its default the compose file still
+pins `linux/amd64`, so a native image is emulated anyway, or refused for having no amd64
+variant. `test_anchoring.py` because its `TestThroughAnIndexer` checks tidx against the
+anchoring precompile, which is implemented — the tidx coverage that passes on tempo today,
+where `test_indexer.py` is still waiting on `eth_getTransactions`.
 
 ## Markers
 
@@ -171,6 +183,8 @@ natively-built image to skip emulation, with `TIDX_PLATFORM=` to drop the amd64 
 | `test_precompiles.py` | — | a contract STATICCALLs each enshrined precompile for deterministic output |
 | `test_current_committee.py` | TIP-1070 | current-committee precompile (T8+): read members, system-only writes, epoch boundary |
 | `test_validator_config.py` | TIP-1017 | ValidatorConfig V2 append-only registry: genesis state, owner-gated mutators |
+| `test_anchoring.py` | — | anchoring precompile (T10+): commitment log, head slot, retired-selector rejection, and the log read back through tidx (`--tidx`) |
+| `test_anchoring_registry.py` | — | `AnchoringRegistry` wrapper: scoped RBAC, envelopes anchored into the precompile |
 
 ### Consensus & networking (`consensus` marker)
 

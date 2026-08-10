@@ -3,6 +3,9 @@
 Enshrined from the T10 hardfork, so any EOA anchors under its own address with nothing to
 deploy. State is one word per ``(namespace, key)``; history lives in the ``Anchored`` log,
 and re-writing the stored commitment reverts.
+
+``TestThroughAnIndexer`` closes the loop on that: history is only in the log if something
+can get it back out. Needs ``--tidx``, skips without it.
 """
 
 from collections import namedtuple
@@ -26,7 +29,8 @@ from .utils import (
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 tx, gas in PATH_USD
 
-ANCHORED_TOPIC = HexBytes(keccak(text="Anchored(address,bytes32,bytes32,bytes)"))
+ANCHORED = A.events.Anchored
+ANCHORED_TOPIC = HexBytes(ANCHORED.topic)
 ZERO32 = b"\x00" * 32
 
 # The paginated record query the x/anchoring precompile served at this address; the tuple is
@@ -268,3 +272,102 @@ class TestRefusedCalls:
 
         assert UNKNOWN_FUNCTION_SELECTOR in err
         assert LEGACY_SELECTOR in err, "the rejected selector is echoed back"
+
+
+_ARGS = ANCHORED.abi.get("inputs", [])
+
+# The non-indexed arguments, in order: what the log's `data` column holds.
+DATA_TYPES = [a["type"] for a in _ARGS if not a.get("indexed")]
+
+# The event as tidx's `?signature=` takes it: names become result columns, `indexed` says
+# which arguments come from the topics. Built from the ABI so it cannot drift from it.
+ANCHORED_EVENT = "{}({})".format(
+    ANCHORED.name,
+    ", ".join(f"{a['type']}{' indexed' if a.get('indexed') else ''} {a.get('name', '')}" for a in _ARGS),
+)
+
+
+def _bytea(value) -> str:
+    """A byte string as PostgreSQL's literal. ClickHouse takes ``'0x…'``, and a predicate
+    carried between them matches nothing -- an empty result, not an error."""
+    return "'\\x" + HexBytes(value).hex() + "'::bytea"
+
+
+def heads_sql(up_to: int) -> str:
+    """Mirrors ``heads_sql`` in nvnmchain-anchoring's ``src/tidx.rs``: the precompile's own
+    rule as SQL, one word per ``(namespace, key)``, newest anchor wins. Over the base
+    ``logs`` table for the reason the second test pins, and bounded so a head cannot come
+    from a block the state read did not cover."""
+    return (
+        "SELECT namespace, key, data FROM ("
+        " SELECT topic1 AS namespace, topic2 AS key, data,"
+        " ROW_NUMBER() OVER (PARTITION BY topic1, topic2"
+        " ORDER BY block_num DESC, log_idx DESC) AS rn"
+        f" FROM logs WHERE address = {_bytea(ADDR)} AND selector = {_bytea(ANCHORED.topic)}"
+        f" AND block_num <= {up_to}"
+        ") heads WHERE rn = 1"
+    )
+
+
+def indexed_through(tidx) -> int:
+    """The highest block an index-derived answer may be pinned to. ``tip_num``, not
+    ``synced_num``: realtime ingest advances the former and leaves the latter to gap-fill,
+    so on an index following the chain ``synced_num`` sits below rows already there."""
+    return int(tidx.coverage()["tip_num"])
+
+
+class TestThroughAnIndexer:
+    """History and payloads are left to the log "for indexers to derive", so the design
+    holds only if one can. These run the query an indexer uses, where every way of being
+    wrong returns rows that parse and an empty head set audits clean. Needs ``--tidx``."""
+
+    async def test_heads_query_agrees_with_the_precompile(self, w3, chain_id, anchorer, tidx):
+        """Every head the query derives is the word the chain kept.
+
+        Two keys, one anchored twice, so both halves of the rule are covered: the
+        partition keeps the keys apart, and the ordering picks the newer row.
+        """
+        stale, head = b"\x11" * 32, b"\x22" * 32
+        versioned, single = key_of("tidx-versioned"), key_of("tidx-single")
+
+        await anchor(w3, chain_id, anchorer, versioned, stale, b'{"v":1}')
+        await anchor(w3, chain_id, anchorer, single, head, b"solo")
+        receipt = await anchor(w3, chain_id, anchorer, versioned, head, b'{"v":2}')
+        tidx.wait_for_block(receipt["blockNumber"])
+
+        at = indexed_through(tidx)
+        assert at >= receipt["blockNumber"], f"index reached {at}, anchored at {receipt['blockNumber']}"
+
+        ours = {
+            HexBytes(row["key"]): decode(DATA_TYPES, bytes(HexBytes(row["data"])))
+            for row in tidx.sql(heads_sql(at))
+            if HexBytes(row["namespace"])[-20:] == HexBytes(anchorer.address)
+        }
+        assert set(ours) == {HexBytes(versioned), HexBytes(single)}, f"got {list(ours)}"
+
+        for key, (commitment, _) in ours.items():
+            assert commitment == await latest(w3, anchorer.address, key), f"head disagrees for {key.hex()}"
+        assert ours[HexBytes(versioned)] == (head, b'{"v":2}'), "the newest anchor wins, payload and all"
+
+    async def test_metadata_does_not_survive_tidx_decoding(self, w3, chain_id, anchorer, tidx):
+        """Why the query above reads raw ``data`` instead of a decoded event table.
+
+        tidx decodes a dynamic ``bytes`` argument as the 32-byte head word -- the ABI
+        offset, not the payload -- while ``string`` gets a real dereference. An indexer
+        trusting that column would hash ``0x…40`` for every anchor. Pinned rather than
+        worked around silently: if tidx grows the dereference this fails, and the raw
+        read can go.
+        """
+        key, commitment, metadata = key_of("tidx-metadata"), b"\x33" * 32, b"payload-not-offset"
+        receipt = await anchor(w3, chain_id, anchorer, key, commitment, metadata)
+        tidx.wait_for_block(receipt["blockNumber"])
+
+        (row,) = tidx.sql(
+            f"SELECT commitment, metadata FROM Anchored WHERE key = {_bytea(key)}"
+            f" AND block_num <= {indexed_through(tidx)}",
+            signature=ANCHORED_EVENT,
+        )
+
+        assert HexBytes(row["commitment"]) == commitment, "a fixed-width argument decodes correctly"
+        assert HexBytes(row["metadata"]) != metadata, "if this now holds, tidx decodes dynamic bytes"
+        assert int.from_bytes(bytes(HexBytes(row["metadata"])), "big") == 64, "it is the ABI offset word"

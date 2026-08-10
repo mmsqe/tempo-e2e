@@ -96,6 +96,11 @@ class TidxUnavailable(RuntimeError):
     """tidx cannot run here (no docker, no image, unreachable node) -- tests skip."""
 
 
+class QueryRefused(RuntimeError):
+    """tidx rejected a query. Distinct from ``TidxUnavailable``: the stack is up and
+    answering, the SQL is what it would not take, so this fails rather than skips."""
+
+
 class Tidx:
     """A tidx + PostgreSQL stack indexing ``rpc_url``, controlled over docker compose."""
 
@@ -150,17 +155,45 @@ class Tidx:
 
     def _get(self, path: str, params: dict, timeout: float = 30.0) -> dict:
         url = f"http://127.0.0.1:{self.api_port}{path}?{urllib.parse.urlencode(params)}"
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - fixed localhost URL
-            return json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - fixed localhost URL
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            # A refusal puts the reason in the body of a 4xx. Unread, the caller sees only
+            # "HTTP Error 422", naming neither the table nor the clause.
+            raise QueryRefused(f"{e.code} {e.reason}: {e.read().decode(errors='replace')}\n  {url}") from e
 
-    def sql(self, query: str, *, limit: int = 1000) -> list[dict]:
+    def sql(self, query: str, *, signature: str | None = None, limit: int = 1000) -> list[dict]:
         """Run a SELECT and return rows as dicts.
 
-        tidx answers ``{"columns": [...], "rows": [[...]], "row_count": n}``; zipping
-        them here keeps the oracle assertions readable at the call site.
+        tidx answers ``{"columns": [...], "rows": [[...]], "row_count": n}``; zipping them
+        here keeps the assertions readable at the call site. ``signature`` generates a
+        decoded event table named after the event; without one only the base tables exist.
+
+        A refusal comes back 200 with ``ok: false``, so an unchecked read turns SQL tidx
+        would not take into an empty result set -- what a correct query over an empty chain
+        also returns.
         """
-        result = self._get("/query", {"sql": query, "chainId": self.chain_id, "limit": limit})
+        params = {"sql": query, "chainId": self.chain_id, "limit": limit}
+        if signature is not None:
+            params["signature"] = signature
+        result = self._get("/query", params)
+        if not result.get("ok"):
+            raise QueryRefused(f"{result.get('error', result)}\n  sql: {query}")
         return [dict(zip(result["columns"], row)) for row in result["rows"]]
+
+    def coverage(self) -> dict:
+        """The chain's ``/status`` entry: ``tip_num``, ``synced_num``, ``backfill_num``, gaps.
+
+        Not ``SELECT ... FROM sync_state`` -- ``/query`` allowlists blocks/txs/logs/receipts
+        and 422s the rest, that table by name. For which field may bound an index-derived
+        answer, see ``indexed_through`` in ``test_anchoring.py``.
+        """
+        status = self._get("/status", {})
+        for chain in status.get("chains", []):
+            if int(chain["chain_id"]) == self.chain_id:
+                return chain
+        raise TidxUnavailable(f"chain {self.chain_id} is not in /status: {status}")
 
     def synced_block(self) -> int:
         """Highest block written to PostgreSQL, or -1 before the first one.
@@ -189,7 +222,7 @@ class Tidx:
                 head = self.synced_block()
                 if head >= number:
                     return head
-            except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as e:
+            except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError, QueryRefused) as e:
                 last = e  # API still booting, or schema not migrated yet
             time.sleep(0.5)
         raise TidxUnavailable(
