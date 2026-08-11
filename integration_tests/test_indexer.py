@@ -48,6 +48,10 @@ INVALID_PARAMS = -32602
 SOME_ADDRESS = "0x0000000000000000000000000000000000000001"
 SOME_ROLE = "0x" + "00" * 31 + "01"
 INDEXER_LAG = 60.0  # generous: an ExEx commits a block behind, a sidecar polls
+# How far back the completeness walk goes. Bounds the walk against suite length rather
+# than covering the whole chain -- a full-history check would grow with every test that
+# ran before it, and the failure it looks for (a dropped block) is not rarer near the tip.
+WALK_BLOCKS = 200
 
 # TIP-20 role audit trail; token_getRoleHistory is a projection of this log.
 ROLE_MEMBERSHIP_UPDATED = keccak(text="RoleMembershipUpdated(bytes32,address,address,bool)")
@@ -196,28 +200,80 @@ async def _send(driver, w3, chain_id, sender) -> dict:
     return await driver.send_tx(w3, chain_id, sender)
 
 
+async def _query(w3, filters: dict, **params) -> dict:
+    """One page under arbitrary ``filters``, as the full response envelope."""
+    return await _call(w3, "eth_getTransactions", [{"filters": filters, "limit": 100, **params}])
+
+
 async def _page(w3, sender, **params) -> dict:
-    return await _call(w3, "eth_getTransactions", [{"filters": {"from": sender}, "limit": 100, **params}])
+    """One page of ``sender``'s transactions -- the shape most tests want."""
+    return await _query(w3, {"from": sender}, **params)
+
+
+async def _filtered(w3, filters: dict, **params) -> list[dict]:
+    """Just the rows, for the filter tests: they assert on selection, not pagination."""
+    return (await _query(w3, filters, **params))["transactions"]
+
+
+async def _every_page(w3, sender) -> set[str]:
+    """Every indexed hash for ``sender``, following ``nextCursor`` to the end.
+
+    A page caps at 100, so a completeness check built on one would silently pass for any
+    sender busier than that -- claiming coverage it never verified.
+    """
+    seen, cursor = set(), None
+    while True:
+        page = await _page(w3, sender, **({"cursor": cursor} if cursor else {}))
+        seen |= _hashes(page["transactions"])
+        cursor = page["nextCursor"]
+        if cursor is None:
+            return seen
 
 
 async def _indexed(w3, sender, want: set[str]) -> dict | None:
     """``sender``'s page, once it covers every hash in ``want``; else None."""
     page = await _page(w3, sender)
-    return page if want <= {_hex(tx["hash"]) for tx in page["transactions"]} else None
+    return page if want <= _hashes(page["transactions"]) else None
+
+
+async def _covered(w3, sender, want: set[str]) -> set[str] | None:
+    """``sender``'s hashes across all pages, once they cover ``want``; else None."""
+    got = await _every_page(w3, sender)
+    return got if want <= got else None
+
+
+def _recipient_of(receipt, driver) -> str:
+    """The ``to`` of a driver's ordinary transaction, read off the receipt because what
+    one targets is backend-specific. A creation has none, so skip rather than fail later
+    inside ``to_checksum_address(None)``."""
+    to = receipt.get("to")
+    if not to:
+        pytest.skip(f"backend {driver.name!r} sends a contract creation; no recipient to filter on")
+    return AsyncWeb3.to_checksum_address(to)
+
+
+async def _walk_txs(w3: AsyncWeb3, *, from_block: int) -> list[dict]:
+    """Every transaction from ``from_block`` to the tip, in chain order.
+
+    The shared oracle: the same predicate applied here and to the index must select the
+    same set, whichever field it is on.
+    """
+    txs = []
+    for number in range(from_block, await w3.eth.block_number + 1):
+        block = await w3.eth.get_block(number, full_transactions=True)
+        txs.extend(block["transactions"])
+    return txs
+
+
+def _hashes(txs, predicate=lambda _tx: True) -> set[str]:
+    """The hashes of ``txs`` satisfying ``predicate``, comparable against a page."""
+    return {_hex(tx["hash"]) for tx in txs if predicate(tx)}
 
 
 async def _walk(w3: AsyncWeb3, sender: str, *, from_block: int) -> set[str]:
-    """Every tx hash sent by ``sender`` from ``from_block`` to the tip, by block walk.
-
-    The oracle for ``eth_getTransactions``: whatever the indexer reports has to be
-    exactly what walking the chain finds.
-    """
+    """Every tx hash sent by ``sender`` from ``from_block`` to the tip, by block walk."""
     sender = AsyncWeb3.to_checksum_address(sender)
-    hashes = set()
-    for number in range(from_block, await w3.eth.block_number + 1):
-        block = await w3.eth.get_block(number, full_transactions=True)
-        hashes |= {_hex(tx["hash"]) for tx in block["transactions"] if tx["from"] == sender}
-    return hashes
+    return _hashes(await _walk_txs(w3, from_block=from_block), lambda tx: tx["from"] == sender)
 
 
 @backed
@@ -282,6 +338,115 @@ async def test_limit_is_capped_at_one_hundred(w3):
         assert _code(resp) == INVALID_PARAMS
     else:
         assert len(resp["result"]["transactions"]) <= 100
+
+
+@backed
+async def test_to_filter_matches_a_block_walk(driver, w3, chain_id, funded_account):
+    """``to`` selects exactly what a block walk with the same predicate finds.
+
+    Nothing above catches a wrong ``to`` -- or one swapped with ``from`` -- since every
+    row those tests inspect was selected by ``from`` to begin with.
+    """
+    start = await w3.eth.block_number
+    receipts = [await _send(driver, w3, chain_id, funded_account) for _ in range(3)]
+    sent = {_hex(r["transactionHash"]) for r in receipts}
+    target = _recipient_of(receipts[0], driver)
+
+    sender = AsyncWeb3.to_checksum_address(funded_account.address)
+    want = _hashes(
+        await _walk_txs(w3, from_block=start),
+        lambda tx: tx["from"] == sender and tx["to"] and AsyncWeb3.to_checksum_address(tx["to"]) == target,
+    )
+    assert want, "the block walk found no transaction to the target address"
+
+    await _eventually(lambda: _indexed(w3, sender, sent), what="the sent txs to be indexed")
+    got = await _filtered(w3, {"from": sender, "to": target})
+    assert _hashes(got) == want, "the to filter and the block walk disagree"
+
+
+@backed
+async def test_type_filter_selects_only_that_type(driver, w3, chain_id, funded_account):
+    """``type`` selects that type and excludes the others.
+
+    Read off the chain rather than named: tempo's ordinary transaction is ``0x76`` and
+    allegro's ``0x2``, so a hard-coded type would only ever run on one backend.
+    """
+    start = await w3.eth.block_number
+    receipts = [await _send(driver, w3, chain_id, funded_account) for _ in range(2)]
+    sent = {_hex(r["transactionHash"]) for r in receipts}
+
+    sender = AsyncWeb3.to_checksum_address(funded_account.address)
+    walked = await _walk_txs(w3, from_block=start)
+    ours = [tx for tx in walked if _hex(tx["hash"]) in sent]
+    assert ours, "the block walk did not find the transactions just sent"
+    tx_type = int(ours[0]["type"])
+
+    want = _hashes(walked, lambda tx: tx["from"] == sender and int(tx["type"]) == tx_type)
+    await _eventually(lambda: _indexed(w3, sender, sent), what="the sent txs to be indexed")
+
+    got = await _filtered(w3, {"from": sender, "type": hex(tx_type)})
+    assert _hashes(got) == want, "the type filter and the block walk disagree"
+
+    # A type we did not send must not return the ones we did.
+    other = 0 if tx_type != 0 else 2
+    excluded = await _filtered(w3, {"from": sender, "type": hex(other)})
+    assert sent.isdisjoint(_hashes(excluded)), f"type {hex(other)} returned type {hex(tx_type)} txs"
+
+
+@backed
+async def test_filters_intersect_rather_than_union(driver, w3, chain_id, funded_account):
+    """``from`` and ``to`` together select their intersection.
+
+    A handler that ORs its filters, or keeps only the last, passes every single-filter
+    test above -- it just returns too much.
+    """
+    receipts = [await _send(driver, w3, chain_id, funded_account) for _ in range(2)]
+    sent = {_hex(r["transactionHash"]) for r in receipts}
+    sender = AsyncWeb3.to_checksum_address(funded_account.address)
+    target = _recipient_of(receipts[0], driver)
+
+    await _eventually(lambda: _indexed(w3, sender, sent), what="the sent txs to be indexed")
+
+    both = await _filtered(w3, {"from": sender, "to": target})
+    assert both, "the intersection is empty but one transaction matches both filters"
+    for tx in both:
+        assert AsyncWeb3.to_checksum_address(tx["from"]) == sender
+        assert tx["to"] and AsyncWeb3.to_checksum_address(tx["to"]) == target
+
+    # Someone else's sender with our recipient must select nothing of ours.
+    stranger = await _filtered(w3, {"from": new_account().address, "to": target})
+    assert not _hashes(stranger) & sent, "the from filter was ignored when to was also set"
+
+
+@backed
+async def test_every_sender_in_recent_blocks_is_fully_indexed(driver, w3, chain_id, funded_account):
+    """Every sender the chain has, the index has -- with all of their transactions.
+
+    The tests above only inspect transactions they sent themselves, so an indexer that
+    dropped a block it was notified about passes all of them. This is the completeness
+    half of the tidx differential rebuilt on a block walk, so it also covers the backends
+    tidx cannot ingest -- every one serving plain Ethereum blocks, allegro included.
+
+    Bounded to ``WALK_BLOCKS`` so the walk does not grow with whatever ran before it, and
+    the bound is asserted on so a chain with no transactions fails rather than passes.
+    """
+    receipts = [await _send(driver, w3, chain_id, funded_account) for _ in range(2)]
+    sent = {_hex(r["transactionHash"]) for r in receipts}
+    await _eventually(lambda: _indexed(w3, funded_account.address, sent), what="the sent txs to be indexed")
+
+    head = await w3.eth.block_number
+    start = max(0, head - WALK_BLOCKS)
+    by_sender: dict[str, set[str]] = {}
+    for tx in await _walk_txs(w3, from_block=start):
+        by_sender.setdefault(AsyncWeb3.to_checksum_address(tx["from"]), set()).add(_hex(tx["hash"]))
+    assert by_sender, f"blocks {start}..{head} hold no transactions to check"
+
+    for sender, want in sorted(by_sender.items()):
+        got = await _eventually(
+            lambda s=sender, w=want: _covered(w3, s, w),
+            what=f"the index to cover {sender}'s {len(want)} transaction(s)",
+        )
+        assert want <= got, f"{sender}: missing {sorted(want - got)}"
 
 
 @backed
