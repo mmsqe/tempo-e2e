@@ -11,12 +11,13 @@ can get it back out. Needs ``--tidx``, skips without it.
 from collections import namedtuple
 
 import pytest
-from eth_abi.abi import decode
 from eth_utils import keccak
 from hexbytes import HexBytes
 
 from .abi import ANCHORING as A
 from .abi import ANCHORING_ADDRESS as ADDR
+from .anchoring import ANCHORED, ANCHORED_EVENT, ANCHORED_TOPIC, decode_payload, latest
+from .tidx import bytea
 from .utils import (
     call_revert,
     deploy_contract,
@@ -29,8 +30,6 @@ from .utils import (
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 tx, gas in PATH_USD
 
-ANCHORED = A.events.Anchored
-ANCHORED_TOPIC = HexBytes(ANCHORED.topic)
 ZERO32 = b"\x00" * 32
 
 # The paginated record query the x/anchoring precompile served at this address; the tuple is
@@ -48,10 +47,6 @@ def key_of(label: str) -> bytes:
     return keccak(text=label)
 
 
-async def latest(w3, namespace, key) -> bytes:
-    return bytes(await A.fns.latest(namespace, key).call(w3, to=ADDR))
-
-
 async def anchor(w3, chain_id, signer, key, commitment, metadata=b""):
     return await send_call(w3, chain_id, signer, ADDR, A.fns.anchor(key, commitment, metadata).data)
 
@@ -66,7 +61,7 @@ def anchored(receipt) -> list[Anchored]:
         Anchored(
             "0x" + bytes(lg["topics"][1])[-20:].hex(),
             bytes(lg["topics"][2]),
-            *decode(["bytes32", "bytes"], bytes(lg["data"])),
+            *decode_payload(lg["data"]),
         )
         for lg in receipt["logs"]
         if lg["address"].lower() == ADDR.lower() and lg["topics"][0] == ANCHORED_TOPIC
@@ -274,25 +269,6 @@ class TestRefusedCalls:
         assert LEGACY_SELECTOR in err, "the rejected selector is echoed back"
 
 
-_ARGS = ANCHORED.abi.get("inputs", [])
-
-# The non-indexed arguments, in order: what the log's `data` column holds.
-DATA_TYPES = [a["type"] for a in _ARGS if not a.get("indexed")]
-
-# The event as tidx's `?signature=` takes it: names become result columns, `indexed` says
-# which arguments come from the topics. Built from the ABI so it cannot drift from it.
-ANCHORED_EVENT = "{}({})".format(
-    ANCHORED.name,
-    ", ".join(f"{a['type']}{' indexed' if a.get('indexed') else ''} {a.get('name', '')}" for a in _ARGS),
-)
-
-
-def _bytea(value) -> str:
-    """A byte string as PostgreSQL's literal. ClickHouse takes ``'0x…'``, and a predicate
-    carried between them matches nothing -- an empty result, not an error."""
-    return "'\\x" + HexBytes(value).hex() + "'::bytea"
-
-
 def heads_sql(up_to: int) -> str:
     """Mirrors ``heads_sql`` in nvnmchain-anchoring's ``src/tidx.rs``: the precompile's own
     rule as SQL, one word per ``(namespace, key)``, newest anchor wins. Over the base
@@ -303,17 +279,10 @@ def heads_sql(up_to: int) -> str:
         " SELECT topic1 AS namespace, topic2 AS key, data,"
         " ROW_NUMBER() OVER (PARTITION BY topic1, topic2"
         " ORDER BY block_num DESC, log_idx DESC) AS rn"
-        f" FROM logs WHERE address = {_bytea(ADDR)} AND selector = {_bytea(ANCHORED.topic)}"
+        f" FROM logs WHERE address = {bytea(ADDR)} AND selector = {bytea(ANCHORED.topic)}"
         f" AND block_num <= {up_to}"
         ") heads WHERE rn = 1"
     )
-
-
-def indexed_through(tidx) -> int:
-    """The highest block an index-derived answer may be pinned to. ``tip_num``, not
-    ``synced_num``: realtime ingest advances the former and leaves the latter to gap-fill,
-    so on an index following the chain ``synced_num`` sits below rows already there."""
-    return int(tidx.coverage()["tip_num"])
 
 
 class TestThroughAnIndexer:
@@ -333,13 +302,10 @@ class TestThroughAnIndexer:
         await anchor(w3, chain_id, anchorer, versioned, stale, b'{"v":1}')
         await anchor(w3, chain_id, anchorer, single, head, b"solo")
         receipt = await anchor(w3, chain_id, anchorer, versioned, head, b'{"v":2}')
-        tidx.wait_for_block(receipt["blockNumber"])
-
-        at = indexed_through(tidx)
-        assert at >= receipt["blockNumber"], f"index reached {at}, anchored at {receipt['blockNumber']}"
+        at = tidx.bounded(receipt)
 
         ours = {
-            HexBytes(row["key"]): decode(DATA_TYPES, bytes(HexBytes(row["data"])))
+            HexBytes(row["key"]): decode_payload(row["data"])
             for row in tidx.sql(heads_sql(at))
             if HexBytes(row["namespace"])[-20:] == HexBytes(anchorer.address)
         }
@@ -360,11 +326,10 @@ class TestThroughAnIndexer:
         """
         key, commitment, metadata = key_of("tidx-metadata"), b"\x33" * 32, b"payload-not-offset"
         receipt = await anchor(w3, chain_id, anchorer, key, commitment, metadata)
-        tidx.wait_for_block(receipt["blockNumber"])
 
         (row,) = tidx.sql(
-            f"SELECT commitment, metadata FROM Anchored WHERE key = {_bytea(key)}"
-            f" AND block_num <= {indexed_through(tidx)}",
+            f"SELECT commitment, metadata FROM Anchored WHERE key = {bytea(key)}"
+            f" AND block_num <= {tidx.bounded(receipt)}",
             signature=ANCHORED_EVENT,
         )
 

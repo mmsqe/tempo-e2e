@@ -23,6 +23,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from hexbytes import HexBytes
+
 TIDX_IMAGE = os.environ.get("TIDX_IMAGE", "ghcr.io/tempoxyz/tidx:latest")
 # Published as linux/amd64 only, so an arm64 host emulates it. Set TIDX_PLATFORM="" to
 # drop the pin, which is what a natively-built $TIDX_IMAGE needs.
@@ -101,6 +103,32 @@ class QueryRefused(RuntimeError):
     answering, the SQL is what it would not take, so this fails rather than skips."""
 
 
+def bytea(value) -> str:
+    """A byte string as PostgreSQL's SQL literal. ClickHouse takes ``'0x…'``, and a
+    predicate carried between them matches nothing -- an empty result, not an error.
+
+    Uncast, though PostgreSQL would take ``::bytea``: the cast is redundant, and tidx's
+    pushdown extractor reads a bare literal but not a cast expression.
+    """
+    return "'\\x" + HexBytes(value).hex() + "'"
+
+
+def named_signature(event) -> str:
+    """A contract event in the form tidx's ``signature=`` takes: argument names become
+    result columns, ``indexed`` says which come from the topics.
+
+    Built from the ABI rather than typed out -- a signature tidx cannot match builds its
+    table off a different topic0, which returns no rows rather than an error.
+    """
+    return "{}({})".format(
+        event.name,
+        ", ".join(
+            f"{a['type']}{' indexed' if a.get('indexed') else ''} {a.get('name', '')}"
+            for a in event.abi.get("inputs", [])
+        ),
+    )
+
+
 class Tidx:
     """A tidx + PostgreSQL stack indexing ``rpc_url``, controlled over docker compose."""
 
@@ -154,7 +182,9 @@ class Tidx:
     # ------------------------------------------------------------------ queries
 
     def _get(self, path: str, params: dict, timeout: float = 30.0) -> dict:
-        url = f"http://127.0.0.1:{self.api_port}{path}?{urllib.parse.urlencode(params)}"
+        # doseq, so a list value becomes one repeated parameter rather than its repr --
+        # ``?signature=A&signature=B``, which is how tidx takes more than one event.
+        url = f"http://127.0.0.1:{self.api_port}{path}?{urllib.parse.urlencode(params, doseq=True)}"
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - fixed localhost URL
                 return json.loads(resp.read())
@@ -163,12 +193,13 @@ class Tidx:
             # "HTTP Error 422", naming neither the table nor the clause.
             raise QueryRefused(f"{e.code} {e.reason}: {e.read().decode(errors='replace')}\n  {url}") from e
 
-    def sql(self, query: str, *, signature: str | None = None, limit: int = 1000) -> list[dict]:
+    def sql(self, query: str, *, signature: str | list[str] | None = None, limit: int = 1000) -> list[dict]:
         """Run a SELECT and return rows as dicts.
 
         tidx answers ``{"columns": [...], "rows": [[...]], "row_count": n}``; zipping them
         here keeps the assertions readable at the call site. ``signature`` generates a
         decoded event table named after the event; without one only the base tables exist.
+        Several may be passed, each becoming its own table.
 
         A refusal comes back 200 with ``ok: false``, so an unchecked read turns SQL tidx
         would not take into an empty result set -- what a correct query over an empty chain
@@ -176,7 +207,7 @@ class Tidx:
         """
         params = {"sql": query, "chainId": self.chain_id, "limit": limit}
         if signature is not None:
-            params["signature"] = signature
+            params["signature"] = [signature] if isinstance(signature, str) else list(signature)
         result = self._get("/query", params)
         if not result.get("ok"):
             raise QueryRefused(f"{result.get('error', result)}\n  sql: {query}")
@@ -187,13 +218,34 @@ class Tidx:
 
         Not ``SELECT ... FROM sync_state`` -- ``/query`` allowlists blocks/txs/logs/receipts
         and 422s the rest, that table by name. For which field may bound an index-derived
-        answer, see ``indexed_through`` in ``test_anchoring.py``.
+        answer, see ``indexed_through``.
         """
         status = self._get("/status", {})
         for chain in status.get("chains", []):
             if int(chain["chain_id"]) == self.chain_id:
                 return chain
         raise TidxUnavailable(f"chain {self.chain_id} is not in /status: {status}")
+
+    def indexed_through(self) -> int:
+        """The highest block an index-derived answer may be pinned to.
+
+        ``tip_num``, not ``synced_num``: realtime ingest advances the former and leaves the
+        latter to gap-fill, so on an index following the chain ``synced_num`` sits below
+        rows already there and a query bounded by it reads almost nothing while reporting
+        clean.
+        """
+        return int(self.coverage()["tip_num"])
+
+    def bounded(self, receipt) -> int:
+        """``indexed_through`` after waiting for ``receipt``'s block: what a test does
+        between writing and querying. Asserted to cover the block, because a bound below
+        it drops the rows under test and returns what a correct query over an unwritten
+        chain also returns."""
+        wrote = receipt["blockNumber"]
+        self.wait_for_block(wrote)
+        at = self.indexed_through()
+        assert at >= wrote, f"index reached {at}, but the test wrote at {wrote}"
+        return at
 
     def synced_block(self) -> int:
         """Highest block written to PostgreSQL, or -1 before the first one.
