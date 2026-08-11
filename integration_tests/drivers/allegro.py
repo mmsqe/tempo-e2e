@@ -18,7 +18,7 @@ from web3 import AsyncWeb3
 
 from ..network import TempoNode, _resolve_bin
 from ..utils import fund_via_transfer, new_account
-from .base import CAP_EMBEDDED_VALIDATORS, CAP_INDEXER_RPC
+from .base import CAP_EMBEDDED_VALIDATORS, CAP_INDEXER, CAP_INDEXER_RPC
 
 # Anvil account 0 — prefunded with 10_000 ETH in allegro's xtask genesis.
 FUNDER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
@@ -54,7 +54,16 @@ class AllegroDriver:
         # allegro serves eth_getTransactions from its own ExEx-backed index, so unlike
         # tempo the handler is real -- but the token_ namespace needs TIP-20, which
         # allegro has no equivalent of, so those tests stay skipped.
-        return {CAP_EMBEDDED_VALIDATORS, CAP_INDEXER_RPC}
+        #
+        # CAP_INDEXER too, which base.py otherwise leaves to `--indexer` on the grounds
+        # that a live index is a deployment property rather than a binary one. That
+        # holds for a tidx sidecar; it does not hold here, because the index is the
+        # node. Left flag-gated the semantic tier would run only when someone
+        # remembered the flag, which in CI means never. If the indexer ever becomes
+        # opt-in at the node (a `--indexer.*` flag), this must move behind whatever
+        # `make_cluster` passes to enable it, or the claim goes stale in the one
+        # direction that fails tests rather than skipping them.
+        return {CAP_EMBEDDED_VALIDATORS, CAP_INDEXER_RPC, CAP_INDEXER}
 
     def resolve_bin(self) -> str:
         if self._bin is None:

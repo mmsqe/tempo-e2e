@@ -21,7 +21,9 @@ CAP_FAUCET = "faucet"  # tempo_fundAddress faucet RPC
 CAP_CONSENSUS_NET = "consensus-net"  # multi-validator consensus localnet (tempo-devnet)
 CAP_EMBEDDED_VALIDATORS = "embedded-validators"  # validators embedded in genesis.json + make_cluster()
 CAP_INDEXER_RPC = "indexer-rpc"  # node registers eth_getTransactions / token_* (handlers may be stubs)
-# …and a live indexer answers them with chain data. Not a property of the binary but of
-# the deployment (a tidx sidecar today, a reth ExEx later), so conftest adds it from
-# --indexer/--tidx rather than any driver advertising it.
+# …and a live indexer answers them with chain data. For a sidecar that is a property of
+# the deployment rather than the binary, so conftest adds it from --indexer. For a
+# backend that indexes inside the node (allegro's reth ExEx) it *is* a property of the
+# binary, and that driver advertises it directly -- otherwise the semantic tier would
+# depend on someone remembering a flag. Either source grants it; they are not exclusive.
 CAP_INDEXER = "indexer"
