@@ -154,6 +154,9 @@ REJECTED = [
     _case("eth_getTransactions", [{"limit": "ten"}], "limit must be a number"),
     _case("eth_getTransactions", [{"filters": {"from": "notanaddress"}}], "from must be an address"),
     _case("eth_getTransactions", [{"sort": {"on": "blockNumber", "order": "sideways"}}], "order is asc|desc"),
+    # `Sort::order` carries no serde default, so a sort missing it is malformed --
+    # a backend that defaults it accepts requests the others reject.
+    _case("eth_getTransactions", [{"sort": {"on": "blockNumber"}}], "sort needs an order"),
     _case("token_getTokensByAddress", [{}], "address is required"),
 ]
 
@@ -208,10 +211,18 @@ async def _covered(w3, sender, want: set[str]) -> set[str] | None:
             return seen if want <= seen else None
 
 
+def _recipient(tx) -> str | None:
+    """A transaction's recipient, checksummed, or None for a creation.
+
+    A tempo native transaction is a batch of calls with no top-level ``to``; its
+    recipient is the first call's.
+    """
+    to = tx.get("to") or next((c.get("to") for c in tx.get("calls") or [] if c.get("to")), None)
+    return AsyncWeb3.to_checksum_address(to) if to else None
+
+
 def _recipient_of(receipt, driver) -> str:
-    """The ``to`` of a driver's ordinary transaction, read off the receipt because what
-    one targets is backend-specific. A creation has none, so skip rather than fail later
-    inside ``to_checksum_address(None)``."""
+    """The ``to`` of a driver's ordinary transaction, checksummed; skip on a creation."""
     to = receipt.get("to")
     if not to:
         pytest.skip(f"backend {driver.name!r} sends a contract creation; no recipient to filter on")
@@ -292,9 +303,21 @@ class TestTransactions:
         assert blocks == sorted(blocks)
         assert [int(tx["blockNumber"], 16) for tx in desc["transactions"]] == sorted(blocks, reverse=True)
 
+    async def test_limit_defaults_to_ten(self, driver, w3, chain_id, funded_account):
+        """A page that names no limit is 10 rows, the default ``PaginationParams`` documents."""
+        sent = {_hex((await driver.send_tx(w3, chain_id, funded_account))["transactionHash"]) for _ in range(11)}
+        await _eventually(lambda: _indexed(w3, funded_account.address, sent), what="11 txs to be indexed")
+
+        page = await _call(w3, "eth_getTransactions", [{"filters": {"from": funded_account.address}}])
+        assert len(page["transactions"]) == 10, "the default page size is not the documented 10"
+        assert page["nextCursor"], "a defaulted page that left rows behind reported no cursor"
+
     async def test_limit_is_capped_at_one_hundred(self, w3):
-        """The documented ceiling. Over-large limits must clamp or fail, never stream the
-        whole table -- an unbounded page is a trivial way to knock the node over."""
+        """The documented ceiling: an over-large limit must clamp or fail, no stream whole table.
+
+        Bounds rather than proves -- nothing here builds the 100+ transactions that
+        would tell a cap from a small chain.
+        """
         resp = await _raw(w3, "eth_getTransactions", [{"limit": 10_000}])
         if "error" in resp:
             assert _code(resp) == INVALID_PARAMS
@@ -315,7 +338,7 @@ class TestTransactions:
         sender = AsyncWeb3.to_checksum_address(funded_account.address)
         want = _hashes(
             await _walk_txs(w3, from_block=start),
-            lambda tx: tx["from"] == sender and tx["to"] and AsyncWeb3.to_checksum_address(tx["to"]) == target,
+            lambda tx: tx["from"] == sender and _recipient(tx) == target,
         )
         assert want, "the block walk found no transaction to the target address"
 
@@ -367,7 +390,7 @@ class TestTransactions:
         assert both, "the intersection is empty but one transaction matches both filters"
         for tx in both:
             assert AsyncWeb3.to_checksum_address(tx["from"]) == sender
-            assert tx["to"] and AsyncWeb3.to_checksum_address(tx["to"]) == target
+            assert _recipient(tx) == target
 
         # Someone else's sender with our recipient must select nothing of ours.
         stranger = await _rows(w3, {"from": new_account().address, "to": target})
