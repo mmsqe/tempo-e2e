@@ -1,6 +1,7 @@
 """Fee AMM: paying gas in a non-validator stablecoin swaps through the FeeManager pool."""
 
 import pytest
+from eth_contract.erc20 import ERC20
 from hexbytes import HexBytes
 from tempo import Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD, THETA_USD
@@ -10,6 +11,7 @@ from .utils import (
     build_tempo_tx,
     create_token,
     fund_token,
+    gas_cost_in_token,
     new_account,
     seed_fee_pool,
     send_calls,
@@ -69,6 +71,34 @@ async def test_fee_in_non_validator_token_moves_pool(w3, chain_id):
     after = await FEE.fns.getPool(ALPHA_USD, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS)
     assert after[0] > before[0]  # ALPHA (user token) reserve grew
     assert after[1] < before[1]  # PATH (validator token) reserve shrank
+
+
+async def test_creator_seeds_its_own_pool_and_pays_gas_in_it(w3, chain_id, funded_account):
+    """Self-service e2e: one ordinary account creates a TIP-20, seeds its fee pool, then pays gas in it."""
+    creator, minted = funded_account, 10_000_000
+    token = await create_token(w3, chain_id=chain_id, admin=creator, mint=(creator.address, minted))
+    await seed_fee_pool(w3, chain_id=chain_id, user_token=token, funder_pk=creator.key.hex())
+
+    pool_id = await FEE.fns.getPoolId(token, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS)
+    assert await FEE.fns.liquidityBalances(pool_id, creator.address).call(w3, to=FEE_MANAGER_ADDRESS) > 0
+    # mint() only pulls validator side, so seeding cost the creator none of its own token
+    assert await ERC20.fns.balanceOf(creator.address).call(w3, to=token) == minted
+
+    before = await FEE.fns.getPool(token, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS)
+    receipt = await send_calls(
+        w3,
+        chain_id=chain_id,
+        private_key=creator.key.hex(),
+        fee_token=token,
+        calls=[transfer_call(new_account().address, 1000, token)],
+    )
+    assert receipt["status"] == 1
+    after = await FEE.fns.getPool(token, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS)
+
+    fee = gas_cost_in_token(receipt)
+    assert await ERC20.fns.balanceOf(creator.address).call(w3, to=token) == minted - 1000 - fee
+    assert after[0] - before[0] == fee  # fee landed in the pool the creator seeded
+    assert after[1] < before[1]  # and PATH left it for validator
 
 
 async def test_insufficient_liquidity_names_the_fee_token(w3, chain_id, funded_account):
