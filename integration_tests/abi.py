@@ -43,6 +43,8 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
+        "function distributeFees(address validator, address token)",  # permissionless payout to the fee recipient
+        "function collectedFees(address validator, address token) view returns (uint256)",
     ]
 )
 
@@ -359,5 +361,33 @@ STAKING_DEPLOYER = Contract.from_abi(
         "function staking() view returns (address)",
         "function nvnm() view returns (address)",
         "function usd() view returns (address)",
+    ]
+)
+
+# FeeRouter: protocol cuts (devshare/buybacks) then validator remainder → commission + delegators.
+FEE_ROUTER = Contract.from_abi(
+    [
+        # FeeManager swaps each payer's fee into the recipient's preferred token, so a router
+        # normally holds one and the bare overload covers it. `flush(token)` routes anything
+        # else — a preferred token pointed away from the pool's reward token, or a transfer in.
+        "function flush() returns (uint256 deposited)",
+        "function flush(address token) returns (uint256 deposited)",
+        "function validator() view returns (address)",
+        "function commissionBps() view returns (uint256)",
+        # Read live off the staking proxy, so it follows a reward-token migration.
+        "function rewardToken() view returns (address)",
+        # Delegator share held for a token the pool cannot account in, kept out of the
+        # flushable balance so a permissionless re-flush cannot cut it twice.
+        "function heldForDelegators(address token) view returns (uint256)",
+    ]
+)
+FEE_ROUTER_FACTORY = Contract.from_abi(
+    [
+        "function create(address validator, address operator, uint256 commissionBps) returns (address router)",
+        "function setSwapper(address swapper)",
+        "function setProtocolSplit(address devshare, address buyback, uint256 devshareBps, uint256 buybackBps)",
+        # GuardedSwapper reads this to decide who may move its reference price.
+        "function isRouter(address account) view returns (bool)",
+        "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps)",
     ]
 )

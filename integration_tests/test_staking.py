@@ -12,21 +12,36 @@ import json
 from pathlib import Path
 
 import pytest
+import rlp
 from eth_abi.abi import encode
 from eth_contract.erc20 import ERC20
+from eth_utils import keccak
+from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, VALIDATOR_CONFIG_V2_ADDRESS
 from web3 import Web3
 
 from .abi import (
+    FEE,
+    FEE_ROUTER,
+    FEE_ROUTER_FACTORY,
     MOCK_ERC20,
     STAKING,
     STAKING_DEPLOYER,
+    VALIDATOR_CONFIG_V2,
 )
-from .utils import STATE_WRITE_GAS, fund, new_account, send_calls
+from .utils import STATE_WRITE_GAS, fund, gas_cost_in_token, new_account, send_calls
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
 
 ETHER = 10**18
 cs = Web3.to_checksum_address
+
+# FeeRouterFactory.RouterCreated, for picking it out of a batch that also logs the factory's own
+# constructor events.
+ROUTER_CREATED_TOPIC = keccak(text="RouterCreated(address,address,address,uint256)")
+
+# The global fee pool's sentinel "validator": every staker delegates here and every validator's
+# router deposits here, so the pool key belongs to no real operator.
+GLOBAL_POOL = cs(keccak(b"nvm.global.pool")[12:])
 
 
 def _bytecode(name):
@@ -34,6 +49,8 @@ def _bytecode(name):
 
 
 DEPLOYER_BYTECODE = _bytecode("staking")
+FACTORY_BYTECODE = _bytecode("feerouter_factory")
+ROUTER_BYTECODE = _bytecode("feerouter")  # for predicting the factory's CREATE2 address
 MOCK_ERC20_BYTECODE = _bytecode("mock_erc20")
 
 
@@ -122,6 +139,28 @@ async def _deploy(w3, chain_id, deployer, reward_token=None):
     return Staking(w3, chain_id, addr, nvnm, usd)
 
 
+async def _router_setup(w3, chain_id, owner, commission_bps, *, split=False):
+    """PATH_USD staking, a factory over it (commission cap 100%), and one router.
+
+    `split` applies the Phase 1 protocol cuts (25 devshare / 25 buybacks) so a test can assert
+    the whole waterfall; the two cut recipients come back either way.
+    """
+    staking = await _deploy(w3, chain_id, owner, reward_token=PATH_USD)
+    validator, operator = new_account().address, new_account().address
+    arg = encode(["address", "address", "uint256"], [staking.address, owner.address, 10_000]).hex()
+    factory = await _create(w3, chain_id, owner, FACTORY_BYTECODE + arg)
+
+    receipt = await staking.send(owner, FEE_ROUTER_FACTORY.fns.create(validator, operator, commission_bps), to=factory)
+    log = next(lg for lg in receipt["logs"] if bytes(lg["topics"][0]) == ROUTER_CREATED_TOPIC)
+    router = cs(bytes(log["data"])[12:32])
+
+    treasury, buybacks = new_account().address, new_account().address
+    if split:
+        split_fn = FEE_ROUTER_FACTORY.fns.setProtocolSplit(treasury, buybacks, 2_500, 2_500)
+        await staking.send(owner, split_fn, to=factory)
+    return staking, validator, operator, router, treasury, buybacks
+
+
 async def _mock_token(w3, chain_id, deployer, symbol):
     arg = encode(["string", "string"], [symbol, symbol]).hex()
     return await _create(w3, chain_id, deployer, MOCK_ERC20_BYTECODE + arg)
@@ -139,7 +178,116 @@ async def _elected(staking, **kwargs):
     return [cs(a) for a in vals]
 
 
+# Routers cost ~4.5M gas each to deploy, against a 30M per-tx cap; three fit beside the factory.
+ROUTERS_PER_TX = 3
+
+
+def _create_address(sender: str, nonce: int) -> str:
+    """The address of a CREATE from ``sender`` at ``nonce``."""
+    return cs(keccak(rlp.encode([bytes.fromhex(sender[2:]), nonce]))[12:])
+
+
+# StakingDeployer's CREATEs, from a contract's starting nonce of 1: mock NVNM, staking impl,
+# ERC-1967 proxy. Only holds when a real reward token is passed — a zero one mints a mock USD
+# too and shifts these by one. test_committee_follows_staking_election asserts the deployed
+# proxy against this, so a drifting sequence fails there rather than silently.
+_STAKING_NVNM_NONCE = 1
 _STAKING_PROXY_NONCE = 3
+
+
+def _staking_deploys_from(sender: str, nonce: int) -> tuple[str, str]:
+    """The (mock NVNM, staking proxy) a StakingDeployer created at ``sender``'s ``nonce`` makes."""
+    deployer = _create_address(sender, nonce)
+    return _create_address(deployer, _STAKING_NVNM_NONCE), _create_address(deployer, _STAKING_PROXY_NONCE)
+
+
+def _router_address(factory: str, validator: str, operator: str, commission_bps: int, staking: str) -> str:
+    """The CREATE2 address `FeeRouterFactory.create` will deploy to.
+
+    Lets the create and the calls that need its address ride in one tx. The salt and
+    constructor args mirror the factory; a drift shows up as the RouterCreated log in that
+    same receipt disagreeing, which the caller asserts.
+    """
+    salt = keccak(encode(["address", "address", "uint256"], [validator, operator, commission_bps]))
+    initcode = bytes.fromhex(ROUTER_BYTECODE.removeprefix("0x")) + encode(
+        ["address", "address", "address", "address", "uint256"],
+        [validator, operator, staking, factory, commission_bps],
+    )
+    return cs(keccak(b"\xff" + bytes.fromhex(factory[2:]) + salt + keccak(initcode))[12:])
+
+
+async def _deploy_stack(w3, chain_id, deployer, *, routers, commission_bps, stake, split=None, validators=None):
+    """Stand the fee stack up in three txs, in the shape the phase plan calls for.
+
+    One router per operator, each paying its own entity, and all of them keyed to `GLOBAL_POOL`
+    — so every delegator share lands in the one pool a staker holds shares in, whichever
+    validator earned it. `split` applies the protocol cuts; `validators` repoints a registry's
+    fee recipients at the routers, one each, for the localnet that has one.
+
+    Three is the floor here, set by two limits rather than by needing a receipt: a 0x76 tx takes
+    at most one CREATE and only as its first call, so StakingDeployer and the factory cannot
+    share one; and a tx is capped at 30M gas, which a router per validator overruns at ~4.5M
+    each. Everything else batches — addresses are predictable (CREATE from a known nonce,
+    CREATE2 from the factory's salt), so nothing here waits on a receipt to know where to write.
+    """
+    nonce = await w3.eth.get_transaction_count(deployer.address)
+    nvnm, staking = _staking_deploys_from(deployer.address, nonce)
+    factory = _create_address(deployer.address, nonce + 1)
+    payouts = [new_account().address for _ in range(routers)]
+    addresses = [_router_address(factory, GLOBAL_POOL, p, commission_bps, staking) for p in payouts]
+    assert len(addresses) <= 2 * ROUTERS_PER_TX, "more routers than this three-tx shape can deploy"
+
+    async def send(calls):
+        receipt = await send_calls(
+            w3,
+            chain_id=chain_id,
+            private_key=deployer.key.hex(),
+            calls=calls,
+            gas_limit=30_000_000,
+        )
+        assert receipt["status"] == 1, "deploy step reverted"
+        return receipt
+
+    # tx 1 — StakingDeployer: the mock NVNM, the impl, the proxy, and a stake balance for us.
+    await send([{"to": None, "data": DEPLOYER_BYTECODE + encode(["address"], [PATH_USD]).hex()}])
+
+    creates = [
+        {"to": factory, "data": FEE_ROUTER_FACTORY.fns.create(GLOBAL_POOL, p, commission_bps).data} for p in payouts
+    ]
+    factory_create = {
+        "to": None,
+        "data": FACTORY_BYTECODE + encode(["address", "address", "uint256"], [staking, deployer.address, 10_000]).hex(),
+    }
+
+    # tx 2 — the factory, plus as many routers as fit beside it.
+    first = await send([factory_create, *creates[:ROUTERS_PER_TX]])
+    # tx 3 — the rest of the routers, then the wiring, which is all cheap calls.
+    rest = await send(
+        [
+            *creates[ROUTERS_PER_TX:],
+            *(
+                [{"to": factory, "data": FEE_ROUTER_FACTORY.fns.setProtocolSplit(*split, 2_500, 2_500).data}]
+                if split
+                else []
+            ),
+            *(
+                {"to": VALIDATOR_CONFIG_V2_ADDRESS, "data": VALIDATOR_CONFIG_V2.fns.setFeeRecipient(v[5], r).data}
+                for v, r in zip(validators or [], addresses, strict=bool(validators))
+            ),
+            {"to": nvnm, "data": ERC20.fns.approve(staking, stake).data},
+            {"to": staking, "data": STAKING.fns.stake(GLOBAL_POOL, stake).data},
+        ]
+    )
+
+    # Match the topic, not the emitter: the factory's constructor logs into this batch too.
+    logged = [
+        cs(bytes(lg["data"])[12:32])
+        for receipt in (first, rest)
+        for lg in receipt["logs"]
+        if bytes(lg["topics"][0]) == ROUTER_CREATED_TOPIC
+    ]
+    assert logged == addresses, "predicted router addresses drifted from the factory"
+    return Staking(w3, chain_id, staking, nvnm, PATH_USD), addresses, payouts
 
 
 @pytest.fixture
@@ -314,3 +462,110 @@ class TestUnbondingAndSlash:
         before = await staking.balance(staking.nvnm, me)
         await staking.send(funded_account, STAKING.fns.withdraw(val))
         assert await staking.balance(staking.nvnm, me) - before == 100 * ETHER
+
+
+class TestFeeRouting:
+    """FeeRouter: protocol cuts then validator remainder → commission + delegators."""
+
+    async def test_rewards_paid_in_real_fee_stablecoin(self, w3, chain_id, funded_account):
+        """The production reward leg: the contract pulls and pays out PATH_USD (TIP-20 precompile)."""
+        staking = await _deploy(w3, chain_id, funded_account, reward_token=PATH_USD)
+        assert staking.usd == cs(PATH_USD)
+
+        me, val = funded_account.address, new_account().address
+        await staking.stake(funded_account, val, 100 * ETHER)
+
+        reward = 400 * 10**6  # PATH_USD base units (faucet funds far more)
+        await staking.deposit_reward(funded_account, val, reward)
+        assert await staking.earned(val, me) == reward
+
+        before = await staking.balance(PATH_USD, me)
+        receipt = await staking.send(funded_account, STAKING.fns.claim(val))
+        # The claim tx's own gas is also paid in PATH_USD, so net it out of the delta.
+        assert await staking.balance(PATH_USD, me) - before == reward - gas_cost_in_token(receipt)
+
+    async def test_router_splits_fees_to_operator_and_stakers(self, w3, chain_id, funded_account):
+        """PATH_USD landing on the router is split: operator commission + staking-pool deposit."""
+        staking, val, operator, router, _, _ = await _router_setup(w3, chain_id, funded_account, 1_000)
+        me = funded_account.address
+        await staking.stake(funded_account, val, 100 * ETHER)
+
+        # Fees arrive on the router (FeeManager's distributeFees payout is exactly this transfer).
+        fees = 200 * 10**6
+        await staking.transfer(funded_account, PATH_USD, router, fees)
+
+        keeper = new_account()
+        await fund(w3, keeper.address)
+        await staking.send(keeper, FEE_ROUTER.fns.flush(), to=router)
+
+        assert await staking.balance(PATH_USD, operator) == fees // 10
+        assert await staking.earned(val, me) == fees - fees // 10
+        assert await staking.balance(PATH_USD, router) == 0
+
+    async def test_protocol_split_pays_devshare_and_buyback(self, w3, chain_id, funded_account):
+        """25/25 protocol cuts; validator remainder goes to the operator when the pool is empty."""
+        setup = await _router_setup(w3, chain_id, funded_account, 10_000, split=True)
+        staking, val, operator, router, treasury, buybacks = setup
+
+        fees = 200 * 10**6
+        await staking.transfer(funded_account, PATH_USD, router, fees)
+        await staking.send(funded_account, FEE_ROUTER.fns.flush(), to=router)
+
+        assert await staking.balance(PATH_USD, treasury) == fees // 4
+        assert await staking.balance(PATH_USD, buybacks) == fees // 4
+        assert await staking.balance(PATH_USD, operator) == fees // 2
+        assert await staking.earned(val, funded_account.address) == 0
+
+    async def test_flush_waterfalls_a_second_fee_token(self, w3, chain_id, funded_account):
+        """A token other than the pool's reward token still gets the cuts, and its delegator
+        share is escrowed — including against a second, permissionless flush.
+
+        Not the steady state: FeeManager swaps each payer's fee into the recipient's preferred
+        token, so a router normally holds one. This is the misconfigured-or-donated case.
+        """
+        setup = await _router_setup(w3, chain_id, funded_account, 1_000, split=True)
+        staking, val, operator, router, treasury, buybacks = setup
+        await staking.stake(funded_account, val, 100 * ETHER)
+
+        other = await _mock_token(w3, chain_id, funded_account, "otherUSD")
+        fees = 100 * ETHER
+        await _send(w3, chain_id, funded_account, other, MOCK_ERC20.fns.mint(router, fees))
+        await staking.send(funded_account, FEE_ROUTER.fns.flush(other), to=router)
+
+        held = fees // 2 - fees // 20  # the validator remainder less the 10% commission
+        assert await staking.balance(other, treasury) == fees // 4
+        assert await staking.balance(other, buybacks) == fees // 4
+        assert await staking.balance(other, operator) == fees // 20
+        assert await staking.balance(other, router) == held
+        assert await staking.call(FEE_ROUTER.fns.heldForDelegators(other), to=router) == held
+        assert await staking.earned(val, funded_account.address) == 0
+
+        keeper = new_account()
+        await fund(w3, keeper.address)
+        await staking.send(keeper, FEE_ROUTER.fns.flush(other), to=router)
+        assert await staking.balance(other, treasury) == fees // 4, "devshare not taken twice"
+        assert await staking.balance(other, router) == held, "delegators' share intact"
+
+    async def test_distribute_fees_is_permissionless(self, w3, chain_id, funded_account):
+        """Anyone may trigger the FeeManager's payout for any fee recipient (a router included)."""
+        recipient = new_account().address  # nothing collected: succeeds as a no-op, no auth gate
+        await _send(w3, chain_id, funded_account, FEE_MANAGER_ADDRESS, FEE.fns.distributeFees(recipient, PATH_USD))
+
+    async def test_all_validators_fees_reach_one_staker_pool(self, w3, chain_id, funded_account):
+        """Two validators, two routers, one pool: a staker who picked no operator earns from both."""
+        owner = funded_account
+        # The same stack the localnet deploys, minus a registry to repoint and the protocol
+        # cuts: two routers keyed to the shared pool, each paying its own operator.
+        staking, routers, payouts = await _deploy_stack(
+            w3, chain_id, owner, routers=2, commission_bps=1_000, stake=100 * ETHER
+        )
+
+        fees = 200 * 10**6
+        for router in routers:
+            await staking.transfer(owner, PATH_USD, router, fees)
+            await staking.send(owner, FEE_ROUTER.fns.flush(), to=router)
+
+        # Both validators' deposits land in the single pool the staker holds shares in.
+        assert await staking.earned(GLOBAL_POOL, owner.address) == 2 * (fees - fees // 10)
+        for payout in payouts:
+            assert await staking.balance(PATH_USD, payout) == fees // 10
