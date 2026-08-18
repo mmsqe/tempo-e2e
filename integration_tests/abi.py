@@ -303,3 +303,61 @@ REGISTRY_FACTORY = Contract.from_abi(
 # than invalidating any -- with the calling EOA as its owner, and so as every registry's
 # break-glass admin. Read the factory from `factory()`.
 REGISTRY_DEPLOYER = Contract.from_abi(["function factory() view returns (address)"])
+# Test mock ERC-20 (open mint), stood up wherever a plain token is needed.
+MOCK_ERC20 = Contract.from_abi(["function mint(address to, uint256 amount)"])
+
+# NVNMStaking (upgradeable app contract): delegated staking that shares chain fees with stakers.
+# Stake NVNM toward a validator, deposited reward-token (nvmnUSD) is split pro-rata per validator.
+STAKING = Contract.from_abi(
+    [
+        "function stake(address validator, uint256 amount)",
+        "function unstake(address validator, uint256 amount)",
+        "function depositReward(address validator, uint256 amount)",
+        "function compoundReward(address validator, uint256 amount)",
+        "function claim(address validator) returns (uint256 amount)",
+        "function earned(address validator, address user) view returns (uint256)",
+        "function stakedOf(address validator, address user) view returns (uint256)",
+        "function totalStaked(address validator) view returns (uint256)",
+        "function totalShares(address validator) view returns (uint256)",
+        "function stakeToken() view returns (address)",
+        "function rewardToken() view returns (address)",
+        # election: top-`maxCommittee` by acquired*acquiredWeight + delegated, one equal
+        # seat each — the consensus engine is unit-weighted, so the committee is just the
+        # address list. Seating fewer than `minSeats` members elects nobody (registry
+        # fallback on every node at once).
+        "function setCandidate(address validator, bool active)",
+        "function setCommitteeConfig(uint256 maxCommittee, uint256 acquiredWeight, uint256 maxDelegated)",
+        "function candidates() view returns (address[])",
+        "function computeCommittee() view returns (address[] vals)",
+        "function setMinSeats(uint256 minSeats)",
+        "function minSeats() view returns (uint256)",
+        # candidacy: self-register against an NVNM bond. `minAcquired` is the 1M NVNM floor —
+        # below it, delegated stake alone never buys a seat.
+        "function setCandidacyBond(uint256 bond)",
+        "function registerCandidate()",
+        "function resignCandidate()",
+        "function bondOf(address validator) view returns (uint256)",
+        "function setMinAcquired(uint256 minAcquired)",
+        "function minAcquired() view returns (uint256)",
+        # slashing: system caller (address(0)) or owner seizes the candidacy bond, including one
+        # unbonding after a resignation. Delegated stake is never slashed.
+        "function slash(address validator, uint256 bps, address recipient) returns (uint256 seized)",
+        # unbonding: with a period set, exiting stake and a resigned bond each park in a pending
+        # bucket until their own withdrawal.
+        "function setUnbondingPeriod(uint256 period)",
+        "function withdraw(address validator) returns (uint256 amount)",
+        "function pendingUnstakeOf(address validator, address user) view returns (uint256 amount, uint256 releaseAt)",
+        "function withdrawBond() returns (uint256 amount)",
+        "function pendingBondOf(address validator) view returns (uint256 amount, uint256 releaseAt)",
+    ]
+)
+
+# Its one-shot deployer (nvnmchain-contracts StakingDeployer.sol): stands up mock NVNM + reward
+# tokens and the staking proxy, and exposes their addresses.
+STAKING_DEPLOYER = Contract.from_abi(
+    [
+        "function staking() view returns (address)",
+        "function nvnm() view returns (address)",
+        "function usd() view returns (address)",
+    ]
+)
