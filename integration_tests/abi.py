@@ -391,3 +391,30 @@ FEE_ROUTER_FACTORY = Contract.from_abi(
         "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps)",
     ]
 )
+
+# GuardedSwapper: the buyback-market wrapper the factory's `swapper` points at.
+GUARDED_SWAPPER = Contract.from_abi(
+    [
+        "function setGuards(address inner, uint256 maxAmountIn, uint256 maxDeviationBps, uint256 emaAlphaBps)",
+        # Two-sided floor: `maxDeviationBps` against the EMA absorbs honest drift, `maxDriftBps`
+        # against the seeded `refPrice` caps how far it accumulates. Without the second leg the
+        # EMA is walked down a swap at a time.
+        "function setDriftBand(uint256 maxDriftBps)",
+        # Owner and this factory's routers only — a router's output goes to the buyback wallet,
+        # so moving the price costs the full amount rather than being ~free.
+        "function setRouterFactory(address routerFactory)",
+        "function seedPrice(uint256 price)",
+        "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) returns (uint256 out)",
+        "function emaPrice() view returns (uint256)",
+        "function refPrice() view returns (uint256)",
+    ]
+)
+
+# BridgedNVNM: BRIDGE=1 role holders mint/burn; owner curates the role (setRole from EnumerableRoles).
+BRIDGED_NVNM = Contract.from_abi(
+    [
+        "function setRole(address holder, uint256 role, bool active)",
+        "function bridgeMint(address to, uint256 amount)",
+        "function bridgeBurn(address from, uint256 amount)",
+    ]
+)

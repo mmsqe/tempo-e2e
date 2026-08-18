@@ -20,20 +20,25 @@ from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, VALIDATOR_CONFIG_V2_A
 from web3 import Web3
 
 from .abi import (
+    BRIDGED_NVNM,
     FEE,
     FEE_ROUTER,
     FEE_ROUTER_FACTORY,
+    GUARDED_SWAPPER,
     MOCK_ERC20,
     STAKING,
     STAKING_DEPLOYER,
     VALIDATOR_CONFIG_V2,
 )
-from .utils import STATE_WRITE_GAS, fund, gas_cost_in_token, new_account, send_calls
+from .utils import STATE_WRITE_GAS, call_revert, fund, gas_cost_in_token, new_account, send_calls
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
 
 ETHER = 10**18
 cs = Web3.to_checksum_address
+
+# Custom-error selector (keccak256(sig)[:4]) for revert-reason assertions.
+ERR_AMOUNT_TOO_LARGE = "0x" + keccak(text="AmountTooLarge()")[:4].hex()
 
 # FeeRouterFactory.RouterCreated, for picking it out of a batch that also logs the factory's own
 # constructor events.
@@ -51,7 +56,10 @@ def _bytecode(name):
 DEPLOYER_BYTECODE = _bytecode("staking")
 FACTORY_BYTECODE = _bytecode("feerouter_factory")
 ROUTER_BYTECODE = _bytecode("feerouter")  # for predicting the factory's CREATE2 address
+POOL_BYTECODE = _bytecode("swap_pool")
 MOCK_ERC20_BYTECODE = _bytecode("mock_erc20")
+BRIDGED_NVNM_BYTECODE = _bytecode("bridged_nvnm")
+GUARDED_SWAPPER_BYTECODE = _bytecode("guarded_swapper")
 
 
 async def _send(w3, chain_id, signer, to, fn, expect=1):
@@ -569,3 +577,75 @@ class TestFeeRouting:
         assert await staking.earned(GLOBAL_POOL, owner.address) == 2 * (fees - fees // 10)
         for payout in payouts:
             assert await staking.balance(PATH_USD, payout) == fees // 10
+
+
+class TestBridgeAndSwapper:
+    """The L1 BridgedNVNM token and the GuardedSwapper buyback-market wrapper."""
+
+    async def test_bridged_nvnm_only_bridge_mints_and_burns(self, w3, chain_id, funded_account):
+        """The L1 NVNM: supply moves only through a Safe-curated BRIDGE-role adapter."""
+        owner = funded_account
+        token = await _create(w3, chain_id, owner, BRIDGED_NVNM_BYTECODE + encode(["address"], [owner.address]).hex())
+
+        async def send(signer, fn, expect=1):
+            return await _send(w3, chain_id, signer, token, fn, expect)
+
+        async def balance_of(who):
+            return await ERC20.fns.balanceOf(who).call(w3, to=token)
+
+        stranger, bridge = new_account(), new_account()
+        await fund(w3, stranger.address)
+        await fund(w3, bridge.address)
+        await send(stranger, BRIDGED_NVNM.fns.bridgeMint(stranger.address, ETHER), expect=0)  # not a bridge
+
+        await send(owner, BRIDGED_NVNM.fns.setRole(bridge.address, 1, True))  # owner grants BRIDGE
+        await send(bridge, BRIDGED_NVNM.fns.bridgeMint(bridge.address, 100 * ETHER))
+        assert await balance_of(bridge.address) == 100 * ETHER
+        await send(bridge, BRIDGED_NVNM.fns.bridgeBurn(bridge.address, 40 * ETHER))
+        assert await balance_of(bridge.address) == 60 * ETHER
+        assert await ERC20.fns.totalSupply().call(w3, to=token) == 60 * ETHER  # burn shrank supply
+
+    async def test_guarded_swapper_caps_size_and_price_floor(self, w3, chain_id, funded_account):
+        """The buyback swapper caps swap size and rejects execution below its EMA price floor."""
+        owner = funded_account
+
+        async def send(to, fn, expect=1):
+            return await _send(w3, chain_id, owner, to, fn, expect)
+
+        async def swap(amount, expect=1):
+            return await send(guard, GUARDED_SWAPPER.fns.swap(usd, nvnm, amount, 0), expect)
+
+        usd = await _mock_token(w3, chain_id, owner, "USD")
+        nvnm = await _mock_token(w3, chain_id, owner, "NVNM")
+
+        # Seed a 1:1 pool and a guard (cap 50, -3% floor, EMA alpha 20%), reference price 1.0.
+        pool = await _create(w3, chain_id, owner, POOL_BYTECODE + encode(["address", "address"], [usd, nvnm]).hex())
+        for tok in (usd, nvnm):
+            await send(tok, MOCK_ERC20.fns.mint(owner.address, 10_000 * ETHER))
+            await send(tok, ERC20.fns.transfer(pool, 1_000 * ETHER))
+        guard_arg = encode(["address", "address", "address"], [owner.address, usd, nvnm]).hex()
+        guard = await _create(w3, chain_id, owner, GUARDED_SWAPPER_BYTECODE + guard_arg)
+        await send(guard, GUARDED_SWAPPER.fns.setGuards(pool, 50 * ETHER, 300, 2_000))
+        # The EMA may drift, but never more than 10% below the seeded reference: that band is
+        # what stops the floor being walked down a swap at a time.
+        await send(guard, GUARDED_SWAPPER.fns.setDriftBand(1_000))
+        await send(guard, GUARDED_SWAPPER.fns.seedPrice(ETHER))
+        await send(usd, ERC20.fns.approve(guard, 10_000 * ETHER))
+
+        await swap(10 * ETHER)  # clears; drifts the EMA down
+        assert await GUARDED_SWAPPER.fns.emaPrice().call(w3, to=guard) < ETHER
+        await swap(40 * ETHER, expect=0)  # below the price floor
+        # Over the size cap must revert on the cap specifically — the cap is checked before the
+        # swap, so a regression removing it would surface as a PriceBelowFloor revert instead.
+        # `sender` matters: the swap gate runs first, so an unset from-address would revert with
+        # NotAuthorized and mask whichever guard this is actually asserting.
+        err = await call_revert(
+            w3, guard, GUARDED_SWAPPER.fns.swap(usd, nvnm, 51 * ETHER, 0).data, sender=owner.address
+        )
+        assert ERR_AMOUNT_TOO_LARGE in err, f"expected AmountTooLarge, got {err}"
+
+        # With no router factory configured, the owner is the only caller: an open `swap` is
+        # near-free price manipulation, since a direct caller keeps the output.
+        stranger = new_account()
+        await fund(w3, stranger.address)
+        await _send(w3, chain_id, stranger, guard, GUARDED_SWAPPER.fns.swap(usd, nvnm, ETHER, 0), expect=0)
