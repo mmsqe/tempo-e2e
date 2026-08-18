@@ -1,6 +1,6 @@
 {
   "source": "git@github.com:NVNM-Chain/nvnmchain-contracts.git",
-  "commit": "be289fc95a203bbfab19bd217098c34b7da66fa9",
+  "commit": "cc047b3c38bbc7de1097ce9a50473e09d03a58e3",
   "note": "Regenerate with: make contract-artifacts",
   "record_categories": [
     "Unspecified",
