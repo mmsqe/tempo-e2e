@@ -38,6 +38,7 @@ from .abi import (
     VALIDATOR_CONFIG_V2,
 )
 from .conftest import _consensus_net_supervisord, _run_devnet_init
+from .keeper import keep
 from .network import FAUCET_PRIVATE_KEY, resolve_tempo_bin, resolve_xtask_bin
 from .utils import STATE_WRITE_GAS, call_revert, fund, gas_cost_in_token, new_account, send_calls
 
@@ -689,6 +690,33 @@ async def _traffic_until_fees(w3, faucet, recipients, tries=20):
     pytest.fail(f"no chain fees accrued to any of {recipients}")
 
 
+async def _fee_stack_with_traffic(w3, faucet, *, commission_bps=1_000, stake=100 * ETHER):
+    """The whole fee side stood up on the localnet, with real fees waiting on it.
+
+    Deploys a router per validator keyed to `GLOBAL_POOL`, repoints every fee recipient at its
+    own, then sends traffic until a proposer has actually earned. Returns everything the
+    assertions need: (staking, routers, payouts, treasury, buybacks).
+    """
+    owner = cs(await VALIDATOR_CONFIG_V2.fns.owner().call(w3, to=VALIDATOR_CONFIG_V2_ADDRESS))
+    assert owner == faucet.address, "faucet must own the registry to repoint fee recipients"
+
+    active = await VALIDATOR_CONFIG_V2.fns.getActiveValidators().call(w3, to=VALIDATOR_CONFIG_V2_ADDRESS)
+    treasury, buybacks = new_account().address, new_account().address
+    staking, routers, payouts = await _deploy_stack(
+        w3,
+        LOCALNET_CHAIN_ID,
+        faucet,
+        routers=len(active),
+        commission_bps=commission_bps,
+        stake=stake,
+        split=(treasury, buybacks),
+        validators=active,
+    )
+
+    await _traffic_until_fees(w3, faucet, routers)
+    return staking, routers, payouts, treasury, buybacks
+
+
 async def _committee(w3):
     """The live committee as (epoch, {pubkey bytes})."""
     epoch, keys = await CURRENT_COMMITTEE.fns.getCommitteeMembers().call(w3, to=CURRENT_COMMITTEE_ADDRESS)
@@ -811,3 +839,36 @@ class TestEpochFeed:
         await elect(ranked[3])
         expected = {key_by_addr[a] for a in ranked[:4]}
         await _wait_committee(w3, lambda _e, m: m == expected, "committee never matched the 4 elected")
+
+    async def test_keeper_pays_out_real_chain_fees(self, election_w3):
+        """The waterfall end to end on fees the chain actually produced, run by the keeper.
+
+        Every other FeeRouter test hand-transfers the stablecoin to a router and takes it on
+        faith that ``distributeFees`` is that same transfer. This closes the loop: the
+        validators' fee recipients point at real routers, real block fees accrue there, and the
+        shipped keeper pays them out and splits them.
+
+        Conservation rather than exact amounts, since blocks keep landing while the keeper runs
+        and what it moved is only knowable from what came out. The arithmetic is asserted on the
+        dev node, where the payout is controlled.
+
+        Runs last in the class — it repoints every validator's fee recipient, which the earlier
+        tests read.
+        """
+        w3 = election_w3
+        faucet = Account.from_key(FAUCET_PRIVATE_KEY)
+        staking, routers, payouts, treasury, buybacks = await _fee_stack_with_traffic(w3, faucet)
+
+        collected = [await keep(w3, LOCALNET_CHAIN_ID, faucet, router) for router in routers]
+        assert any(collected), "the keeper found nothing to pay out"
+
+        dev = await staking.balance(PATH_USD, treasury)
+        buy = await staking.balance(PATH_USD, buybacks)
+        ops = sum([await staking.balance(PATH_USD, p) for p in payouts])
+        pool = await staking.earned(GLOBAL_POOL, faucet.address)
+
+        assert dev == buy and dev > 0, "the two protocol cuts are the same 25%"
+        assert pool > 0 and ops > 0, "the keeper reached both the operators and the pool"
+        assert abs((dev + buy + ops + pool) // 4 - dev) <= len(routers), "a cut is a quarter, bar rounding"
+        for router in routers:
+            assert await staking.balance(PATH_USD, router) == 0, "the keeper left nothing on a router"
