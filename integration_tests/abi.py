@@ -155,6 +155,9 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         "function getNextNetworkIdentityRotationEpoch() view returns (uint64)",
         "function addValidator(address validatorAddress, bytes32 publicKey, string ingress, string egress,"
         " address feeRecipient, bytes signature) returns (uint64)",
+        # Owner or the validator itself. The recipient becomes the block beneficiary, so fees
+        # accrue in FeeManager under *it*, not under the validator address.
+        "function setFeeRecipient(uint64 idx, address feeRecipient)",
         "function transferOwnership(address newOwner)",
     ]
 )

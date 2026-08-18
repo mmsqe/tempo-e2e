@@ -9,18 +9,25 @@ including the shared pool NVM plans to run — bridge and swapper, and the node-
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
 import rlp
 from eth_abi.abi import encode
+from eth_account import Account
 from eth_contract.erc20 import ERC20
 from eth_utils import keccak
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, VALIDATOR_CONFIG_V2_ADDRESS
-from web3 import Web3
+from tempo.devnet.ports import find_free_base_ports
+from web3 import AsyncWeb3, Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 from .abi import (
     BRIDGED_NVNM,
+    CURRENT_COMMITTEE,
+    CURRENT_COMMITTEE_ADDRESS,
     FEE,
     FEE_ROUTER,
     FEE_ROUTER_FACTORY,
@@ -30,6 +37,8 @@ from .abi import (
     STAKING_DEPLOYER,
     VALIDATOR_CONFIG_V2,
 )
+from .conftest import _consensus_net_supervisord, _run_devnet_init
+from .network import FAUCET_PRIVATE_KEY, resolve_tempo_bin, resolve_xtask_bin
 from .utils import STATE_WRITE_GAS, call_revert, fund, gas_cost_in_token, new_account, send_calls
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
@@ -225,18 +234,16 @@ def _router_address(factory: str, validator: str, operator: str, commission_bps:
 
 
 async def _deploy_stack(w3, chain_id, deployer, *, routers, commission_bps, stake, split=None, validators=None):
-    """Stand the fee stack up in three txs, in the shape the phase plan calls for.
+    """Stand the fee stack up in three txs: one router per operator, all keyed to `GLOBAL_POOL`.
 
-    One router per operator, each paying its own entity, and all of them keyed to `GLOBAL_POOL`
-    — so every delegator share lands in the one pool a staker holds shares in, whichever
+    Every delegator share then lands in the one pool a staker holds shares in, whichever
     validator earned it. `split` applies the protocol cuts; `validators` repoints a registry's
-    fee recipients at the routers, one each, for the localnet that has one.
+    fee recipients at the routers, one each.
 
-    Three is the floor here, set by two limits rather than by needing a receipt: a 0x76 tx takes
-    at most one CREATE and only as its first call, so StakingDeployer and the factory cannot
-    share one; and a tx is capped at 30M gas, which a router per validator overruns at ~4.5M
-    each. Everything else batches — addresses are predictable (CREATE from a known nonce,
-    CREATE2 from the factory's salt), so nothing here waits on a receipt to know where to write.
+    Three is a floor, not a choice: a 0x76 takes at most one CREATE and only as its first call,
+    so StakingDeployer and the factory cannot share a tx, and the 30M gas cap fits only three
+    routers at ~4.5M each. Nothing waits on a receipt — CREATE and CREATE2 addresses are both
+    predictable, so the wiring batches with the deploys.
     """
     nonce = await w3.eth.get_transaction_count(deployer.address)
     nvnm, staking = _staking_deploys_from(deployer.address, nonce)
@@ -649,3 +656,158 @@ class TestBridgeAndSwapper:
         stranger = new_account()
         await fund(w3, stranger.address)
         await _send(w3, chain_id, stranger, guard, GUARDED_SWAPPER.fns.swap(usd, nvnm, ETHER, 0), expect=0)
+
+
+# -- native epoch feed (opt-in: --consensus + a feed-capable binary) -----------------------------
+# Genesis carries the precomputed proxy address; the node's feed eth_calls computeCommittee() at a
+# block hash from address(0). A binary without the feed keeps all validators and fails these.
+
+LOCALNET_CHAIN_ID = 1337  # the election localnet's genesis chain id
+N_ELECTION_VALIDATORS = 5  # elect 4 of 5: passes the node's min(4, registry) floor
+EPOCH_LENGTH = 20  # blocks; see the fixture — these tests are paced by epoch boundaries
+
+
+# Dedicated key, kept fresh so its nonce-0 create is StakingDeployer at a known address.
+ELECTION_DEPLOYER = Account.from_key(keccak(b"nvm-election-deployer"))
+
+
+def _staking_genesis_address() -> str:
+    return _create_address(_create_address(ELECTION_DEPLOYER.address, 0), _STAKING_PROXY_NONCE)
+
+
+async def _traffic_until_fees(w3, faucet, recipients, tries=20):
+    """Send cheap txs until one of `recipients` has collected, and return (it, its balance).
+
+    Fees only accrue when a proposer whose fee recipient is in the set actually builds a block,
+    so this polls rather than sending one tx.
+    """
+    for _ in range(tries):
+        await _send(w3, LOCALNET_CHAIN_ID, faucet, PATH_USD, ERC20.fns.transfer(faucet.address, 1))
+        for recipient in recipients:
+            if collected := await FEE.fns.collectedFees(recipient, PATH_USD).call(w3, to=FEE_MANAGER_ADDRESS):
+                return recipient, collected
+    pytest.fail(f"no chain fees accrued to any of {recipients}")
+
+
+async def _committee(w3):
+    """The live committee as (epoch, {pubkey bytes})."""
+    epoch, keys = await CURRENT_COMMITTEE.fns.getCommitteeMembers().call(w3, to=CURRENT_COMMITTEE_ADDRESS)
+    return epoch, {bytes(k) for k in keys}
+
+
+async def _wait_committee(w3, predicate, why, timeout=360):
+    """Poll the committee until ``predicate(epoch, members)`` holds; fail with context on timeout."""
+    deadline = time.time() + timeout
+    epoch, members = -1, set()
+    while time.time() < deadline:
+        epoch, members = await _committee(w3)
+        if predicate(epoch, members):
+            return epoch, members
+        await asyncio.sleep(3)
+    pytest.fail(f"{why} (block {await w3.eth.block_number}, epoch {epoch}, {len(members)} members)")
+
+
+@pytest.fixture(scope="module")
+def election_net(request, tmp_path_factory):
+    """A 5-validator supervisord localnet whose genesis carries `stakingElection`."""
+    if not request.config.getoption("--consensus"):
+        pytest.skip("staking-election feed test needs --consensus")
+    if request.config.getoption("--tempo-bin"):
+        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
+
+    base = tmp_path_factory.mktemp("staking-election")
+    config = {
+        "chain_id": LOCALNET_CHAIN_ID,
+        "accounts": 200,
+        # These tests are paced by epoch boundaries — the election is read at each one, and
+        # `test_committee_follows_staking_election` waits for three. At the usual 100 that is
+        # ~4 minutes of pure waiting on a localnet producing ~1.5 blocks/s. Short enough to be
+        # quick, long enough for the boundary DKG to finish before the next one opens.
+        "epoch_length": EPOCH_LENGTH,
+        "seed": 0,
+        "tempo_bin": resolve_tempo_bin(),
+        "tempo_xtask_bin": resolve_xtask_bin(),
+        "validators": [
+            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"}
+            for i, port in enumerate(find_free_base_ports(N_ELECTION_VALIDATORS))
+        ],
+        "patch_genesis": {"config": {"stakingElection": _staking_genesis_address()}},
+    }
+    data_dir = _run_devnet_init(base, config, gen_compose_file=False)
+    yield from _consensus_net_supervisord(request, base, data_dir)
+
+
+@pytest.fixture
+async def election_w3(election_net):
+    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(election_net.node_rpc_url("node0")))
+    # Genesis extraData holds the validator set and epoch-boundary headers the DKG outcome,
+    # both past web3.py's 32-byte cap. Without this, passing depends on which block is touched.
+    client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    yield client
+    await client.provider.disconnect()
+
+
+@pytest.mark.consensus
+@pytest.mark.slow
+class TestEpochFeed:
+    """The node-side staking-election feed driving the consensus committee."""
+
+    async def test_distribute_fees_pays_the_collected_amount(self, election_w3):
+        """Tx fees accrue under block proposers' fee recipients; distributeFees pays them out."""
+        w3 = election_w3
+        faucet = Account.from_key(FAUCET_PRIVATE_KEY)
+        active = await VALIDATOR_CONFIG_V2.fns.getActiveValidators().call(w3, to=VALIDATOR_CONFIG_V2_ADDRESS)
+        recipients = [cs(v[4]) for v in active if int(v[4], 16) != 0]
+        assert recipients, "localnet validators have no fee recipients"
+
+        pick, collected = await _traffic_until_fees(w3, faucet, recipients)
+
+        before = await ERC20.fns.balanceOf(pick).call(w3, to=PATH_USD)
+        await _send(w3, LOCALNET_CHAIN_ID, faucet, FEE_MANAGER_ADDRESS, FEE.fns.distributeFees(pick, PATH_USD))
+        # More fees may accrue for `pick` between the read and the payout, so >=.
+        assert await ERC20.fns.balanceOf(pick).call(w3, to=PATH_USD) - before >= collected
+
+    async def test_committee_follows_staking_election(self, election_w3):
+        """Below min(4, registry) the node keeps the full registry (fallback); at/above it, the
+        committee shrinks to exactly the elected set."""
+        w3 = election_w3
+        deployer, faucet = ELECTION_DEPLOYER, Account.from_key(FAUCET_PRIVATE_KEY)
+        # Fund fresh deployer, its nonce-0 create must land on the genesis-patched address.
+        await _send(w3, LOCALNET_CHAIN_ID, faucet, PATH_USD, ERC20.fns.transfer(deployer.address, 10**14))
+        assert await w3.eth.get_transaction_count(deployer.address) == 0, "election deployer must be fresh"
+        init = DEPLOYER_BYTECODE + encode(["address"], [PATH_USD]).hex()
+        d = await _create(w3, LOCALNET_CHAIN_ID, deployer, init)
+        staking_addr = cs(await STAKING_DEPLOYER.fns.staking().call(w3, to=d))
+        assert staking_addr == _staking_genesis_address(), "proxy != genesis stakingElection address"
+        nvnm = cs(await STAKING_DEPLOYER.fns.nvnm().call(w3, to=d))
+        staking = Staking(w3, LOCALNET_CHAIN_ID, staking_addr, nvnm, PATH_USD)
+
+        active = await VALIDATOR_CONFIG_V2.fns.getActiveValidators().call(w3, to=VALIDATOR_CONFIG_V2_ADDRESS)
+        assert len(active) == N_ELECTION_VALIDATORS
+        key_by_addr = {cs(v[1]): bytes(v[0]) for v in active}
+        ranked = sorted(key_by_addr)  # deterministic order by address
+        await staking.send(deployer, STAKING.fns.setCommitteeConfig(21, 1, 0))
+
+        async def elect(addr):
+            await staking.send(deployer, STAKING.fns.setCandidate(addr, True))
+            await staking.stake(deployer, addr, 100 * ETHER)
+
+        # Phase 1 — elect only 3 of 5: below the min(4, registry) floor, so the node must keep the
+        # full registry. Let two epoch boundaries pass (the election is read at each), then confirm
+        # the committee still holds all 5 — i.e. the read fell back rather than shrinking.
+        for addr in ranked[:3]:
+            await elect(addr)
+        start_epoch, _ = await _committee(w3)
+        _, members = await _wait_committee(
+            w3,
+            lambda e, _m: e >= start_epoch + 2,
+            "epoch did not advance to confirm the below-minimum election was read",
+        )
+        assert members == set(key_by_addr.values()), (
+            f"below-minimum election shrank committee to {len(members)}, expected fallback"
+        )
+
+        # Phase 2 — add the 4th: now at the floor, the committee shrinks to exactly those 4.
+        await elect(ranked[3])
+        expected = {key_by_addr[a] for a in ranked[:4]}
+        await _wait_committee(w3, lambda _e, m: m == expected, "committee never matched the 4 elected")
