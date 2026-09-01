@@ -1,12 +1,14 @@
-"""AnchoringRegistry wrapper over JSON-RPC: scoped RBAC, anchoring into the precompile.
+"""Registry contracts over JSON-RPC: scoped RBAC, anchoring into the precompile.
 
-The wrapper stores only counters and role membership; everything else is anchored under its
-own namespace. Roles are registry- or record-scoped (one checksum in one registry) over
-``admin`` and ``editor``, and the owner may grant a registry ``admin`` without holding one.
+One contract per registry, deployed by a factory; a record is ``keccak256(checksum)``, not an
+assigned id. The contract stores only role membership and a version count per record, and anchors
+under *its own address*, so the precompile's caller partition is what keeps registries apart --
+there is no registryId in any key, mapping or envelope.
+
+Roles are registry- or record-scoped (one checksum) over ``admin`` and ``editor``, and the
+owner may grant a registry ``admin`` without holding one. Role changes are not anchored:
+membership is contract state, history is the contract's own events.
 """
-
-import json
-from pathlib import Path
 
 import pytest
 from eth_abi.abi import decode
@@ -14,39 +16,78 @@ from eth_utils import keccak
 from hexbytes import HexBytes
 from web3 import Web3
 
-from .abi import ANCHORING, ANCHORING_ADDRESS, ANCHORING_DEPLOYER
-from .abi import ANCHORING_REGISTRY as REG
-from .utils import call_revert, error_selector, fund, new_account, send_call, send_calls
+from .abi import REGISTRY as REG
+from .abi import REGISTRY_FACTORY
+from .anchoring import anchored_logs, decode_payload, latest
+from .registry import ADMIN, EDITOR, RECORD_CATEGORY, REGISTRY_SCOPE, add_record_call
+from .utils import (
+    STATE_WRITE_GAS,
+    call_forwarder,
+    call_revert,
+    deploy_contract,
+    error_selector,
+    funded,
+    new_account,
+    send_call,
+    send_calls,
+)
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
 
-ADMIN = b"admin".ljust(32, b"\x00")
-EDITOR = b"editor".ljust(32, b"\x00")
 
-_ARTIFACT = json.loads((Path(__file__).parent / "artifacts" / "anchoring.json").read_text())
-
-
-UNAUTHORIZED = error_selector("Unauthorized()")  # solady Ownable's error, reused by the wrapper
+UNAUTHORIZED = error_selector("Unauthorized()")
 LAST_ADMIN = error_selector("LastAdmin()")
-REGISTRY_NOT_FOUND = error_selector("RegistryNotFound(uint256)")
-NO_RECORD_FOR_CHECKSUM = error_selector("NoRecordForChecksum(uint256,bytes32)")
+NO_RECORD_FOR_CHECKSUM = error_selector("NoRecordForChecksum(bytes32)")
 INVALID_ROLE = error_selector("InvalidRole(bytes32)")
 MISSING_ROLE = error_selector("MissingRole(address,bytes32)")
+EMPTY_NAME = error_selector("EmptyName()")
+EMPTY_CHECKSUM = error_selector("EmptyChecksum()")
+CANNOT_RENOUNCE = error_selector("OwnershipCannotBeRenounced()")
+NEW_OWNER_IS_ZERO = error_selector("NewOwnerIsZeroAddress()")
+EMPTY_URI = error_selector("EmptyUri()")
 
-ANCHORED_TOPIC = HexBytes(keccak(text="Anchored(address,bytes32,bytes32,bytes)"))
-# Every envelope leads with its kind, so an indexer classifies a payload from the log alone.
-# Spelled out because these literals are wire format, not an implementation detail;
-# ``TestAnchoredLog.test_kind_tags_are_the_wire_constants`` ties them to the contract's own.
-KINDS = {name: name.lower().encode().ljust(32, b"\x00") for name in ("REGISTRY", "RECORD", "STATUS", "ACL")}
-# The envelopes the wrapper anchors, in field order, each after its leading kind.
-REGISTRY_ENVELOPE = ["bytes32", "uint256", "string", "string", "string", "address", "uint256"]
-RECORD_ENVELOPE = ["bytes32", "uint256", "uint256", "uint256", "string", "string", "string", "string", "uint256"]
-STATUS_ENVELOPE = ["bytes32", "uint256", "uint256", "uint256", "string", "uint256"]
-# One grant's new state, keyed by aclKey(registryId, checksumHash, account, role).
-ACL_ENVELOPE = ["bytes32", "uint256", "bytes32", "address", "bytes32", "bool"]
+# Role values the x/anchoring module took and this contract does not: `viewer`, which has no
+# successor here because reads need no grant, and an empty role, which meant "editor, then
+# admin" to its revoke. Both now name nothing, and naming nothing has to fail rather than
+# resolve -- a migrated caller must not quietly grant or revoke `admin`.
+RETIRED_ROLES = {"viewer": b"viewer", "empty": b"", "unknown": b"root"}
+
+# The envelopes a registry anchors, field by field. Both lead with their kind, so an indexer
+# classifies a payload from the log alone, and the id in both is the checksum hash -- the
+# registry is the address it was anchored under, not a field. Both end with the account that
+# caused the change, because the precompile's caller is the registry contract, then a
+# discriminator keeping two otherwise identical payloads apart.
+#
+# This is wire format, not an implementation detail, so it is written out rather than read off
+# the contract; ``test_the_wire_constants_are_the_contracts_own`` is what ties the two together.
+ENVELOPE = {
+    "RECORD": {
+        "kind": "bytes32",
+        "checksum_hash": "bytes32",
+        "index": "uint256",
+        "uri": "string",
+        "checksum": "string",
+        "algo": "string",
+        "metadata": "string",
+        "category": "uint8",
+        "data_pointer": "string",
+        "author": "address",
+        "timestamp": "uint256",
+    },
+    "STATUS": {
+        "kind": "bytes32",
+        "checksum_hash": "bytes32",
+        "index": "uint256",
+        "status": "string",
+        "author": "address",
+        "seq": "uint256",
+    },
+}
+KINDS = {name: name.lower().encode().ljust(32, b"\x00") for name in ENVELOPE}
 
 
 def _topic(value) -> HexBytes:
+    """One indexed argument as the 32-byte word it is logged as; a ``0x`` string is an address."""
     if isinstance(value, int):
         return HexBytes(value.to_bytes(32, "big"))
     if isinstance(value, str) and value.startswith("0x"):
@@ -54,419 +95,505 @@ def _topic(value) -> HexBytes:
     return HexBytes(value)
 
 
-def assert_event(receipt, wrapper, signature: str, *, indexed: list, types: list, data: list):
+def assert_event(receipt, emitter, signature: str, *, indexed: list, types: list, data: list):
     topic0 = HexBytes(keccak(text=signature))
     for lg in receipt["logs"]:
-        if lg["address"].lower() != wrapper.address.lower():
+        if lg["address"].lower() != emitter.lower():
             continue
         if HexBytes(lg["topics"][0]) != topic0:
             continue
         assert [HexBytes(t) for t in lg["topics"][1:]] == [_topic(v) for v in indexed], signature
         assert list(decode(types, bytes(lg["data"]))) == data, signature
         return
-    raise AssertionError(f"{signature} not emitted by {wrapper.address}")
+    raise AssertionError(f"{signature} not emitted by {emitter}")
 
 
-async def anchored_logs(w3, wrapper, *, key=None, from_block=0):
-    topics = [ANCHORED_TOPIC, HexBytes(bytes(12) + bytes.fromhex(wrapper.address[2:]))]
-    if key is not None:
-        topics.append(HexBytes(key))
-    return await w3.eth.get_logs({"fromBlock": from_block, "address": ANCHORING_ADDRESS, "topics": topics})
-
-
-async def head(w3, namespace, key) -> bytes:
-    """The precompile's latest commitment for ``(namespace, key)``."""
-    return bytes(await ANCHORING.fns.latest(namespace, key).call(w3, to=ANCHORING_ADDRESS))
-
-
-async def envelopes(w3, wrapper, key, types, kind, *, from_block=0):
+async def envelopes(w3, registry, key, kind, *, from_block=0):
     """Envelopes anchored under ``key``, in log order, as ``(commitment, fields)`` pairs.
 
     Checks what holds for every kind on the way past: each commitment hashes its own payload,
     and the payload leads with the kind it was keyed under.
     """
+    schema = ENVELOPE[kind]
     out = []
-    for lg in await anchored_logs(w3, wrapper, key=key, from_block=from_block):
-        commitment, envelope = decode(["bytes32", "bytes"], bytes(lg["data"]))
-        assert keccak(envelope) == commitment, "anchorAndHash makes each event self-verifying"
-        fields = decode(types, envelope)
-        assert fields[0] == KINDS[kind], f"envelope under {HexBytes(key).hex()} is not a {kind}"
+    for lg in await anchored_logs(w3, registry.address, key=key, from_block=from_block):
+        commitment, payload = decode_payload(lg["data"])
+        assert keccak(payload) == commitment, "anchorAndHash makes each event self-verifying"
+        fields = dict(zip(schema, decode(list(schema.values()), payload)))
+        assert fields["kind"] == KINDS[kind], f"envelope under {HexBytes(key).hex()} is not a {kind}"
         out.append((commitment, fields))
     return out
 
 
-class Wrapper:
-    """A deployed registry bound to its node + address, wrapping call boilerplate."""
+class TestDeployment:
+    async def test_creator_becomes_registry_admin(self, factory, registry):
+        creator = registry.creator
+        assert await registry.has_role(creator, ADMIN) is True
+        assert await registry.has_role(factory.owner, ADMIN) is False
 
-    def __init__(self, w3, chain_id, address, owner):
-        self.w3, self.chain_id, self.address, self.owner = w3, chain_id, address, owner
+    async def test_names_may_repeat_and_the_address_is_canonical(self, w3, factory):
+        creator, other = await funded(w3), await funded(w3)
+        a = await factory.deploy(creator, "docs")
+        b = await factory.deploy(other, "docs")
+        assert a.address != b.address
+        assert await a.has_role(creator, ADMIN) is True
+        assert await b.has_role(creator, ADMIN) is False, "admin does not cross registries"
 
-    async def read(self, fn):
-        return await fn.call(self.w3, to=self.address)
+    async def test_deployment_event_records_the_creation(self, w3, factory):
+        """A registry's name, description and metadata live only in this event.
 
-    async def write(self, signer, fn):
-        return await send_call(self.w3, self.chain_id, signer, self.address, fn.data)
+        They are not anchored -- descriptive, set once, nothing to prove -- so the deployment
+        log is the whole on-chain record of what was created and by whom.
+        """
+        creator = await funded(w3)
+        registry = await factory.deploy(creator, "docs", "the docs", '{"src":"e2e"}')
+        assert_event(
+            registry.deployment,
+            factory.address,
+            "RegistryDeployed(address,address,string,string,string)",
+            indexed=[registry.address, creator.address],
+            types=["string", "string", "string"],
+            data=["docs", "the docs", '{"src":"e2e"}'],
+        )
 
-    async def expect_revert(self, sender, fn, selector):
-        err = await call_revert(self.w3, self.address, fn.data, sender=sender.address)
-        assert selector in err, err
+    async def test_an_empty_name_is_rejected(self, w3, factory):
+        creator = await funded(w3)
+        err = await call_revert(
+            w3,
+            factory.address,
+            REGISTRY_FACTORY.fns.deployRegistry("", "", "").data,
+            sender=creator.address,
+        )
+        assert EMPTY_NAME in err, err
 
-    async def grant(self, signer, registry_id, account, role, checksum=""):
-        return await self.write(signer, REG.fns.grantRole(registry_id, checksum, account.address, role))
+    async def test_registries_are_separate_namespaces_in_the_log(self, w3, factory):
+        """The whole design in one assertion: two registries, the same key, their own heads."""
+        creator = await funded(w3)
+        a = await factory.deploy(creator, "a")
+        b = await factory.deploy(creator, "b")
+        # The same checksum in both, so the same key -- it derives from the checksum and
+        # nothing else. Differing uris keep the payloads, and so the heads, apart.
+        await a.add_record(creator, "shared", uri="ipfs://in-a")
+        await b.add_record(creator, "shared", uri="ipfs://in-b")
 
-    async def revoke(self, signer, registry_id, account, role, checksum=""):
-        return await self.write(signer, REG.fns.revokeRole(registry_id, checksum, account.address, role))
-
-    async def has_role(self, registry_id, account, role, checksum="") -> bool:
-        return await self.read(REG.fns.hasRole(registry_id, checksum, account.address, role))
-
-    async def add_registry(self, signer, name="docs"):
-        await self.write(signer, REG.fns.addRegistry(name, "", ""))
-        return await self.read(REG.fns.registryCount())
-
-    async def add_record(self, signer, registry_id, checksum, uri="ipfs://a"):
-        await self.write(signer, REG.fns.addRecord(registry_id, uri, checksum, "sha256", "{}"))
-        record_id = await self.read(REG.fns.recordIdForChecksum(registry_id, checksum))
-        return record_id, await self.read(REG.fns.versionCount(registry_id, record_id))
-
-
-@pytest.fixture
-async def wrapper(w3, chain_id):
-    """A fresh wrapper per test; the deploying EOA becomes owner (break-glass admin)."""
-    owner = new_account()
-    await fund(w3, owner.address)
-    initcode = bytes.fromhex(_ARTIFACT["deployer_bytecode"][2:])
-    receipt = await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=owner.key.hex(),
-        calls=[{"to": None, "data": initcode}],
-        gas_limit=25_000_000,  # deploys two contracts (impl + proxy); far above the 2M default
-    )
-    assert receipt["status"] == 1, "deployer create reverted"
-    deployer = receipt["contractAddress"]
-    proxy = await ANCHORING_DEPLOYER.fns.registry().call(w3, to=deployer)
-    return Wrapper(w3, chain_id, Web3.to_checksum_address(proxy), owner)
-
-
-async def funded(w3):
-    account = new_account()
-    await fund(w3, account.address)
-    return account
+        key = await a.read(REG.fns.recordKey(keccak(text="shared")))
+        assert bytes(key) == bytes(await b.read(REG.fns.recordKey(keccak(text="shared")))), "the same key..."
+        head_a = await latest(w3, a.address, key)
+        head_b = await latest(w3, b.address, key)
+        assert head_a != b"\x00" * 32 and head_b != b"\x00" * 32
+        assert head_a != head_b, "...each holding its own head, because the caller partitions"
 
 
 class TestRecords:
-    async def test_creator_becomes_registry_admin(self, w3, wrapper):
-        creator = await funded(w3)
-        rid = await wrapper.add_registry(creator)
-        assert await wrapper.has_role(rid, creator, ADMIN) is True
-        assert await wrapper.has_role(rid, wrapper.owner, ADMIN) is False
+    async def test_writes_require_a_role(self, w3, registry):
+        stranger = await funded(w3)
+        await registry.expect_revert(stranger, add_record_call("abc"), UNAUTHORIZED)
 
-    async def test_writes_require_a_role(self, w3, wrapper):
-        creator, stranger = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
-        await wrapper.expect_revert(stranger, REG.fns.addRecord(rid, "ipfs://a", "abc", "sha256", "{}"), UNAUTHORIZED)
+    async def test_a_record_needs_both_a_checksum_and_a_uri(self, registry):
+        """The checksum *is* the record's identity and an empty uri anchors a version pointing
+        at nothing, so neither is something the contract could supply. Refused before the role
+        check, so an empty checksum is not a way to probe whether a stream exists either.
+        """
+        creator = registry.creator
 
-    async def test_update_record_status_is_idempotent_on_chain(self, w3, wrapper):
+        await registry.expect_revert(creator, add_record_call(""), EMPTY_CHECKSUM)
+        await registry.expect_revert(creator, add_record_call("abc", uri=""), EMPTY_URI)
+
+        assert await registry.versions("abc") == 0, "neither started a stream"
+
+    async def test_a_category_past_the_enum_is_rejected(self, w3, registry):
+        """The vendored enum is the suite's category mapping, so it has to be the real one.
+
+        The ABI carries `RecordCategory` as a bare uint8, so nothing about the names is
+        checkable from the ABI alone. What the chain does answer is the boundary: the enum's
+        last member is accepted and one past it is not, which pins the vendored list's length
+        to the deployed contract rather than to whenever it was last copied.
+        """
+        creator, last = registry.creator, len(RECORD_CATEGORY) - 1
+        assert RECORD_CATEGORY["unspecified"] == 0, "a record claiming no category says so"
+
+        await registry.add_record(creator, "abc", category=last)
+
+        # Identical bar the category, so the revert can only be the category.
+        err = await call_revert(
+            w3, registry.address, add_record_call("def", category=last + 1).data, sender=creator.address
+        )
+        assert err, "a category past the enum must revert"
+
+    async def test_update_record_status_is_idempotent_on_chain(self, w3, registry):
         """The envelope's sequence number keeps repeated status writes clear of the no-op rule.
 
         A moved head would also pass if the second write were dropped, so the test reads ``seq``
         out of both envelopes.
         """
-        creator = await funded(w3)
-        rid = await wrapper.add_registry(creator)
-        record_id, index = await wrapper.add_record(creator, rid, "abc")
+        creator, checksum_hash = registry.creator, keccak(text="abc")
+        await registry.add_record(creator, "abc")
 
-        await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, index, "redacted"))
-        await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, index, "redacted"))
+        await registry.set_status(creator, "abc", 1, "redacted")
+        await registry.set_status(creator, "abc", 1, "redacted")
 
-        key = await wrapper.read(REG.fns.statusKey(rid, record_id, index))
-        assert await head(w3, wrapper.address, key) != b"\x00" * 32
+        key = await registry.read(REG.fns.statusKey(checksum_hash, 1))
+        assert await latest(w3, registry.address, key) != b"\x00" * 32
 
-        anchored = [f for _, f in await envelopes(w3, wrapper, key, STATUS_ENVELOPE, "STATUS")]
+        anchored = [f for _, f in await envelopes(w3, registry, key, "STATUS")]
         assert len(anchored) == 2, "the identical repeat anchors again rather than reverting"
-        for _, registry_id, rec, idx, status, _ in anchored:
-            assert (registry_id, rec, idx, status) == (rid, record_id, index, "redacted")
-        assert anchored[1][-1] > anchored[0][-1], "seq is what makes the payloads differ"
+        for fields in anchored:
+            assert (fields["checksum_hash"], fields["index"], fields["status"]) == (checksum_hash, 1, "redacted")
+        assert anchored[1]["seq"] > anchored[0]["seq"], "seq is what makes the payloads differ"
 
 
 class TestRoles:
-    async def test_grant_and_revoke_registry_editor(self, w3, wrapper):
-        creator, editor = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
+    async def test_grant_and_revoke_registry_editor(self, w3, registry):
+        creator, editor = registry.creator, await funded(w3)
 
         # A non-admin cannot grant.
-        await wrapper.expect_revert(editor, REG.fns.grantRole(rid, "", editor.address, EDITOR), UNAUTHORIZED)
+        await registry.expect_revert(editor, REG.fns.grantRole("", editor.address, EDITOR), UNAUTHORIZED)
 
-        await wrapper.grant(creator, rid, editor, EDITOR)
-        await wrapper.add_record(editor, rid, "abc")
+        await registry.grant(creator, editor, EDITOR)
+        await registry.add_record(editor, "abc")
 
-        await wrapper.revoke(creator, rid, editor, EDITOR)
-        await wrapper.expect_revert(editor, REG.fns.addRecord(rid, "ipfs://a", "def", "sha256", "{}"), UNAUTHORIZED)
+        await registry.revoke(creator, editor, EDITOR)
+        await registry.expect_revert(editor, add_record_call("def"), UNAUTHORIZED)
 
-    async def test_record_role_is_scoped_to_checksum_and_registry(self, w3, wrapper):
-        """A record grant must not leak to another checksum, nor to another registry sharing it."""
+    async def test_record_role_is_scoped_to_checksum_and_registry(self, w3, factory):
+        """A record grant must not leak to another checksum, nor to another registry sharing it.
+
+        The second half is now the address doing the scoping rather than an id in the role key.
+        """
         creator, editor = await funded(w3), await funded(w3)
-        r1 = await wrapper.add_registry(creator, "a")
-        r2 = await wrapper.add_registry(creator, "b")
-        await wrapper.add_record(creator, r1, "shared")
-        await wrapper.add_record(creator, r1, "other")
-        await wrapper.add_record(creator, r2, "shared")
+        a = await factory.deploy(creator, "a")
+        b = await factory.deploy(creator, "b")
+        await a.add_record(creator, "shared")
+        await a.add_record(creator, "other")
+        await b.add_record(creator, "shared")
 
-        await wrapper.grant(creator, r1, editor, EDITOR, checksum="shared")
+        await a.grant(creator, editor, EDITOR, checksum="shared")
 
-        _, index = await wrapper.add_record(editor, r1, "shared")  # own scope: ok
-        assert index == 2
-        await wrapper.expect_revert(  # other checksum: no
-            editor, REG.fns.addRecord(r1, "ipfs://a", "other", "sha256", "{}"), UNAUTHORIZED
-        )
-        await wrapper.expect_revert(  # other registry, same checksum: no
-            editor, REG.fns.addRecord(r2, "ipfs://a", "shared", "sha256", "{}"), UNAUTHORIZED
-        )
+        await a.add_record(editor, "shared")  # own scope: ok
+        assert await a.versions("shared") == 2
+        await a.expect_revert(editor, add_record_call("other"), UNAUTHORIZED)  # other checksum: no
+        await b.expect_revert(editor, add_record_call("shared"), UNAUTHORIZED)  # other registry: no
 
-    async def test_grant_validates_scope_and_role(self, w3, wrapper):
-        creator, other = await funded(w3), new_account()
-        await wrapper.expect_revert(creator, REG.fns.grantRole(99, "", other.address, EDITOR), REGISTRY_NOT_FOUND)
-        rid = await wrapper.add_registry(creator)
-        await wrapper.expect_revert(
-            creator, REG.fns.grantRole(rid, "nope", other.address, EDITOR), NO_RECORD_FOR_CHECKSUM
-        )
-        await wrapper.expect_revert(
-            creator, REG.fns.grantRole(rid, "", other.address, b"root".ljust(32, b"\x00")), INVALID_ROLE
-        )
+    async def test_the_two_scopes_are_a_union_not_an_override(self, w3, registry):
+        """``_checkWriter`` is an OR, so the module's "record level overrides registry level"
+        has no successor: a record-scoped grant adds a writer to one stream and takes nothing
+        from a registry-scoped one. There is no way to deny.
+        """
+        creator, wide, narrow = registry.creator, await funded(w3), await funded(w3)
+        await registry.add_record(creator, "abc")
+        await registry.grant(creator, wide, EDITOR)
+        await registry.grant(creator, narrow, EDITOR, checksum="abc")
 
-    async def test_only_an_admin_may_revoke(self, w3, wrapper):
+        await registry.add_record(narrow, "abc")
+        await registry.add_record(wide, "abc")  # still writes the narrowed stream
+        await registry.add_record(wide, "def")  # and every other one
+
+        assert await registry.versions("abc") == 3
+        assert await registry.versions("def") == 1
+
+    async def test_granting_on_a_checksum_with_no_record_is_rejected(self, registry):
+        """A record scope is a stream that exists; naming one that does not is a typo, and a
+        role granted under it would sit there authorizing nothing."""
+        creator, other = registry.creator, new_account()
+
+        await registry.expect_revert(creator, REG.fns.grantRole("nope", other.address, EDITOR), NO_RECORD_FOR_CHECKSUM)
+
+    @pytest.mark.parametrize("role", list(RETIRED_ROLES), ids=list(RETIRED_ROLES))
+    async def test_a_role_this_contract_does_not_know_is_rejected(self, registry, role):
+        """Both directions: a role that cannot be granted must not look revocable either, and
+        ``revokeRole`` validates before it looks for a membership -- so an empty role fails
+        there rather than resolving the way the module's did."""
+        creator, other = registry.creator, new_account()
+        value = RETIRED_ROLES[role].ljust(32, b"\x00")
+
+        await registry.expect_revert(creator, REG.fns.grantRole("", other.address, value), INVALID_ROLE)
+        await registry.expect_revert(creator, REG.fns.revokeRole("", other.address, value), INVALID_ROLE)
+
+    async def test_only_an_admin_may_revoke(self, w3, registry):
         """Revoking is admin-only: holding a role is not enough to shed it."""
-        creator, editor = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
-        await wrapper.grant(creator, rid, editor, EDITOR)
+        creator, editor = registry.creator, await funded(w3)
+        await registry.grant(creator, editor, EDITOR)
 
         # Not even on itself.
-        await wrapper.expect_revert(editor, REG.fns.revokeRole(rid, "", editor.address, EDITOR), UNAUTHORIZED)
-        assert await wrapper.has_role(rid, editor, EDITOR) is True
+        await registry.expect_revert(editor, REG.fns.revokeRole("", editor.address, EDITOR), UNAUTHORIZED)
+        assert await registry.has_role(editor, EDITOR) is True
 
-        await wrapper.revoke(creator, rid, editor, EDITOR)
-        assert await wrapper.has_role(rid, editor, EDITOR) is False
+        await registry.revoke(creator, editor, EDITOR)
+        assert await registry.has_role(editor, EDITOR) is False
 
-    async def test_revoking_a_role_never_held_reverts(self, w3, wrapper):
+    async def test_revoking_a_role_never_held_reverts(self, registry):
         """A revoke names a specific grant, so a wrong one fails rather than no-opping."""
-        creator, stranger = await funded(w3), new_account()
-        rid = await wrapper.add_registry(creator)
+        creator, stranger = registry.creator, new_account()
 
-        await wrapper.expect_revert(creator, REG.fns.revokeRole(rid, "", stranger.address, EDITOR), MISSING_ROLE)
+        await registry.expect_revert(creator, REG.fns.revokeRole("", stranger.address, EDITOR), MISSING_ROLE)
 
-    async def test_roles_are_independent_across_accounts(self, w3, wrapper):
+    async def test_roles_are_independent_across_accounts(self, w3, registry):
         """Grants are per account: revoking one leaves the others holding theirs."""
-        creator, first, second = await funded(w3), await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
+        creator, first, second = registry.creator, await funded(w3), await funded(w3)
 
         for account in (first, second):
-            await wrapper.grant(creator, rid, account, EDITOR)
-        await wrapper.grant(creator, rid, second, ADMIN)
+            await registry.grant(creator, account, EDITOR)
+        await registry.grant(creator, second, ADMIN)
 
-        await wrapper.revoke(creator, rid, first, EDITOR)
+        await registry.revoke(creator, first, EDITOR)
 
-        assert await wrapper.has_role(rid, first, EDITOR) is False
-        assert await wrapper.has_role(rid, second, EDITOR) is True
-        assert await wrapper.has_role(rid, second, ADMIN) is True
+        assert await registry.has_role(first, EDITOR) is False
+        assert await registry.has_role(second, EDITOR) is True
+        assert await registry.has_role(second, ADMIN) is True
         # The surviving editor grant still authorizes a write.
-        await wrapper.add_record(second, rid, "abc")
+        await registry.add_record(second, "abc")
 
-    async def test_last_registry_admin_cannot_be_revoked(self, w3, wrapper):
-        creator, second = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
+    async def test_last_registry_admin_cannot_be_revoked(self, w3, registry):
+        creator, second = registry.creator, await funded(w3)
 
-        await wrapper.expect_revert(creator, REG.fns.revokeRole(rid, "", creator.address, ADMIN), LAST_ADMIN)
+        await registry.expect_revert(creator, REG.fns.revokeRole("", creator.address, ADMIN), LAST_ADMIN)
 
         # With a replacement in place the original can step down.
-        await wrapper.grant(creator, rid, second, ADMIN)
-        await wrapper.revoke(second, rid, creator, ADMIN)
-        assert await wrapper.has_role(rid, creator, ADMIN) is False
+        await registry.grant(creator, second, ADMIN)
+        await registry.revoke(second, creator, ADMIN)
+        assert await registry.has_role(creator, ADMIN) is False
 
-    async def test_repeated_grants_do_not_inflate_the_admin_count(self, w3, wrapper):
-        creator, second = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
+    async def test_repeated_grants_do_not_inflate_the_admin_count(self, w3, registry):
+        creator, second = registry.creator, await funded(w3)
         for _ in range(3):
-            await wrapper.grant(creator, rid, second, ADMIN)
+            await registry.grant(creator, second, ADMIN)
 
-        await wrapper.revoke(second, rid, creator, ADMIN)
+        await registry.revoke(second, creator, ADMIN)
         # Were the count inflated, this would still pass; it must hit LastAdmin.
-        await wrapper.expect_revert(second, REG.fns.revokeRole(rid, "", second.address, ADMIN), LAST_ADMIN)
+        await registry.expect_revert(second, REG.fns.revokeRole("", second.address, ADMIN), LAST_ADMIN)
 
-    async def test_owner_break_glass_grants_registry_admin_only(self, w3, wrapper):
+    async def test_the_factory_cannot_be_left_without_an_owner(self, w3, factory):
+        """The last-admin rule holds because break-glass does, so the rescuer cannot go away.
+        Both ways out are closed: `Ownable` refuses the zero address, this refuses to renounce.
+        """
+
+        async def refused(fn) -> str:
+            return await call_revert(w3, factory.address, fn.data, sender=factory.owner.address)
+
+        assert CANNOT_RENOUNCE in await refused(REGISTRY_FACTORY.fns.renounceOwnership())
+        zero = REGISTRY_FACTORY.fns.transferOwnership("0x" + "00" * 20)
+        assert NEW_OWNER_IS_ZERO in await refused(zero)
+
+    async def test_owner_break_glass_grants_registry_admin_only(self, factory, w3, registry):
         """The owner holds no role, yet may install a new admin — and exactly that."""
-        creator, rescuer = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
+        rescuer = await funded(w3)
+        assert Web3.to_checksum_address(await registry.read(REG.fns.owner())) == (factory.owner.address), (
+            "the factory hands its owner to every registry"
+        )
 
-        await wrapper.grant(wrapper.owner, rid, rescuer, ADMIN)
-        assert await wrapper.has_role(rid, rescuer, ADMIN) is True
+        await registry.grant(factory.owner, rescuer, ADMIN)
+        assert await registry.has_role(rescuer, ADMIN) is True
 
-        await wrapper.expect_revert(wrapper.owner, REG.fns.grantRole(rid, "", rescuer.address, EDITOR), UNAUTHORIZED)
-        await wrapper.expect_revert(wrapper.owner, REG.fns.revokeRole(rid, "", rescuer.address, ADMIN), UNAUTHORIZED)
+        await registry.expect_revert(factory.owner, REG.fns.grantRole("", rescuer.address, EDITOR), UNAUTHORIZED)
+        await registry.expect_revert(factory.owner, REG.fns.revokeRole("", rescuer.address, ADMIN), UNAUTHORIZED)
 
 
 class TestAnchoredLog:
-    async def test_anchors_land_in_the_precompile(self, w3, wrapper):
-        """The wrapper's writes are real anchors: a new version moves the head."""
-        creator = await funded(w3)
-        rid = await wrapper.add_registry(creator)
-        record_id, _ = await wrapper.add_record(creator, rid, "abc")
+    async def test_anchors_land_in_the_precompile(self, w3, registry):
+        """A registry's writes are real anchors: a new version moves the head."""
+        creator, checksum_hash = registry.creator, keccak(text="abc")
+        await registry.add_record(creator, "abc")
 
-        key = await wrapper.read(REG.fns.recordKey(rid, record_id))
-        before = await head(w3, wrapper.address, key)
+        key = await registry.read(REG.fns.recordKey(checksum_hash))
+        before = await latest(w3, registry.address, key)
         assert before != b"\x00" * 32
-        assert bytes(await wrapper.read(REG.fns.latestRecordDigest(rid, record_id))) == before
+        assert bytes(await registry.read(REG.fns.latestRecordDigest(checksum_hash))) == before
 
-        await wrapper.add_record(creator, rid, "abc")  # new version moves the head
-        assert await head(w3, wrapper.address, key) != before
+        await registry.add_record(creator, "abc")  # new version moves the head
+        assert await latest(w3, registry.address, key) != before
 
-    async def test_the_anchored_log_alone_reconstructs_a_record_stream(self, w3, wrapper):
-        """Version history is only in the log, since the wrapper keeps no record data.
+    async def test_the_anchored_log_alone_reconstructs_a_record_stream(self, w3, registry):
+        """Version history is only in the log, since the contract keeps no record data.
 
         Each envelope leads with its kind, so the key it was anchored under confirms the shape
         rather than being the only thing that identifies it.
         """
-        creator = await funded(w3)
-        rid = await wrapper.add_registry(creator, "docs")
-        await wrapper.add_record(creator, rid, "abc", uri="ipfs://v1")
-        record_id, _ = await wrapper.add_record(creator, rid, "abc", uri="ipfs://v2")
-        await wrapper.add_record(creator, rid, "def", uri="ipfs://other")
+        creator, checksum_hash = registry.creator, keccak(text="abc")
+        await registry.add_record(creator, "abc", uri="ipfs://v1")
+        await registry.add_record(
+            creator,
+            "abc",
+            uri="ipfs://v2",
+            category=RECORD_CATEGORY["regulated_bank_underwriting"],
+            data_pointer="loan-42",
+        )
+        await registry.add_record(creator, "def", uri="ipfs://other")
 
-        key = await wrapper.read(REG.fns.recordKey(rid, record_id))
+        key = await registry.read(REG.fns.recordKey(checksum_hash))
 
-        versions, commitments = {}, {}
-        for commitment, (_, _, _, index, uri, checksum, *_) in await envelopes(
-            w3, wrapper, key, RECORD_ENVELOPE, "RECORD"
-        ):
-            versions[index] = (uri, checksum)
+        versions, commitments, classified = {}, {}, {}
+        for commitment, fields in await envelopes(w3, registry, key, "RECORD"):
+            index = fields["index"]
+            versions[index] = (fields["uri"], fields["checksum"])
             commitments[index] = commitment
+            classified[index] = (fields["category"], fields["data_pointer"], Web3.to_checksum_address(fields["author"]))
 
         assert versions == {1: ("ipfs://v1", "abc"), 2: ("ipfs://v2", "abc")}
-        latest = max(versions)
-        assert latest == await wrapper.read(REG.fns.versionCount(rid, record_id))
-        digest = await wrapper.read(REG.fns.latestRecordDigest(rid, record_id))
-        assert bytes(digest) == commitments[latest]
+        # Category, pointer and author survive into the envelope, per version — the only place
+        # they exist, since the contract stores no record data.
+        assert classified == {
+            1: (RECORD_CATEGORY["unspecified"], "", creator.address),
+            2: (RECORD_CATEGORY["regulated_bank_underwriting"], "loan-42", creator.address),
+        }
+        newest = max(versions)
+        assert newest == await registry.versions("abc")
+        digest = await registry.read(REG.fns.latestRecordDigest(checksum_hash))
+        assert bytes(digest) == commitments[newest]
 
-    async def test_acl_changes_are_anchored(self, w3, wrapper):
-        """Permissions rebuild from the log too: every real grant or revoke anchors its state.
+    async def test_acl_changes_are_not_anchored(self, w3, registry):
+        """Role changes reach the log as events only.
 
-        A repeated grant stays a no-op, so granted and revoked alternate and no sequence number
-        is needed to clear the precompile's ``CommitmentUnchanged`` rule.
+        Membership is this contract's state and its history is RoleGranted/RoleRevoked, which
+        carry every field. A third copy in the anchored log would only be something to drift —
+        so a grant and a revoke must move the state while anchoring nothing at all.
         """
-        creator, editor = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
-        checksum_hash = keccak(text="")  # registry scope
-        key = await wrapper.read(REG.fns.aclKey(rid, checksum_hash, editor.address, EDITOR))
+        creator, editor = registry.creator, await funded(w3)
 
         before = await w3.eth.block_number
         receipts = [
-            await wrapper.grant(creator, rid, editor, EDITOR),
-            await wrapper.grant(creator, rid, editor, EDITOR),  # already a member: anchors nothing
-            await wrapper.revoke(creator, rid, editor, EDITOR),
+            await registry.grant(creator, editor, EDITOR),
+            await registry.revoke(creator, editor, EDITOR),
         ]
 
-        states = []
-        for _, (_, registry_id, scope, account, role, granted) in await envelopes(
-            w3, wrapper, key, ACL_ENVELOPE, "ACL", from_block=before + 1
-        ):
-            assert (registry_id, scope, role) == (rid, checksum_hash, EDITOR)
-            assert Web3.to_checksum_address(account) == editor.address
-            states.append(granted)
-
-        assert states == [True, False], "one anchor per real change; the repeated grant is a no-op"
-        assert await head(w3, wrapper.address, key) != b"\x00" * 32
+        anchored = await anchored_logs(w3, registry.address, from_block=before + 1)
+        assert anchored == [], f"a role change reached the anchored log: {anchored}"
+        assert await registry.has_role(editor, EDITOR) is False, "...but the state moved"
         for receipt in receipts:
-            assert any(lg["address"].lower() == wrapper.address.lower() for lg in receipt["logs"]), (
-                "the wrapper still emits its own role event"
+            assert any(lg["address"].lower() == registry.address.lower() for lg in receipt["logs"]), (
+                "the registry still emits its own role event"
             )
 
-    async def test_the_registry_envelope_records_its_creation(self, w3, wrapper):
-        """A registry's name, description, metadata and creator live only in its envelope.
+    async def test_the_wire_constants_are_the_contracts_own(self, registry):
+        """Every literal this suite writes down, read back off the contract.
 
-        The wrapper keeps a counter and nothing else, so this payload is the only on-chain
-        record of what was created and by whom.
+        The kind tags and the role values are wire format an indexer matches on, and
+        ``REGISTRY_SCOPE`` is what an empty checksum resolves to. Reading both sides is what
+        stops the two drifting apart.
         """
-        creator = await funded(w3)
-        await wrapper.write(creator, REG.fns.addRegistry("docs", "the docs", '{"src":"e2e"}'))
-        rid = await wrapper.read(REG.fns.registryCount())
-        key = await wrapper.read(REG.fns.registryKey(rid))
+        for name, value in [
+            *((f"KIND_{kind}", tag) for kind, tag in KINDS.items()),
+            ("ROLE_ADMIN", ADMIN),
+            ("ROLE_EDITOR", EDITOR),
+            ("REGISTRY_SCOPE", REGISTRY_SCOPE),
+        ]:
+            on_chain = await registry.read(getattr(REG.fns, name)())
+            assert bytes(on_chain) == value, f"{name} moved away from {value!r}"
 
-        anchored = await envelopes(w3, wrapper, key, REGISTRY_ENVELOPE, "REGISTRY")
-        assert len(anchored) == 1, "a registry is created once and never re-anchored"
-        _, (_, id_, name, description, metadata, account, timestamp) = anchored[0]
-        assert (id_, name, description, metadata) == (rid, "docs", "the docs", '{"src":"e2e"}')
-        assert Web3.to_checksum_address(account) == creator.address
-        assert timestamp > 0, "the envelope carries the block time, since the log does not repeat it"
 
-    async def test_kind_tags_are_the_wire_constants(self, wrapper):
-        """The tags indexers match on are the constants the contract exposes.
+class TestContractAccounts:
+    """Who a role can be held by, and how much fits in one transaction.
 
-        Reading both sides is what stops the wire format and the contract drifting apart.
-        """
-        for name, tag in KINDS.items():
-            on_chain = await wrapper.read(getattr(REG.fns, f"KIND_{name}")())
-            assert bytes(on_chain) == tag, f"KIND_{name} moved away from {name.lower()!r}"
+    The module refused contract callers outright -- ``sender not an eoa`` -- so a multisig had
+    to be a Cosmos one signing module messages. Here a role is held by an address and a
+    contract is an address; and a tempo tx carries several calls, which is what the module's
+    multi-message tx was for.
+    """
+
+    async def test_a_contract_can_hold_a_role_and_write_with_it(self, w3, chain_id, registry):
+        creator = registry.creator
+        _, safe = await deploy_contract(
+            w3, chain_id=chain_id, private_key=creator.key.hex(), bytecode=call_forwarder(registry.address)
+        )
+        write = add_record_call("abc").data
+
+        # Being a contract grants it nothing; the grant does.
+        assert UNAUTHORIZED in await call_revert(w3, registry.address, write, sender=safe)
+
+        await registry.write(creator, REG.fns.grantRole("", safe, EDITOR))
+        assert await registry.read(REG.fns.hasRole("", safe, EDITOR)) is True
+
+        # The EOA drives the contract; the contract is what the registry sees as its writer.
+        await send_call(w3, chain_id, creator, safe, write)
+
+        assert await registry.versions("abc") == 1
+        key = await registry.read(REG.fns.recordKey(keccak(text="abc")))
+        assert await latest(w3, registry.address, key) != b"\x00" * 32, (
+            "and the anchor is still the registry's, not the contract's that called it"
+        )
+        assert await latest(w3, safe, key) == b"\x00" * 32
+
+    async def test_one_transaction_carries_a_whole_change_or_none_of_it(self, w3, chain_id, registry):
+        """A grant, a record and its status in one tx -- and a call that reverts takes the
+        others with it, which is what made the module's multi-message tx worth using."""
+        creator, editor = registry.creator, await funded(w3)
+        calls = [
+            {"to": registry.address, "data": REG.fns.grantRole("", editor.address, EDITOR).data},
+            {"to": registry.address, "data": add_record_call("abc").data},
+            {"to": registry.address, "data": REG.fns.updateRecordStatus("abc", 1, "approved").data},
+        ]
+
+        receipt = await send_calls(
+            w3, chain_id=chain_id, private_key=creator.key.hex(), calls=calls, gas_limit=STATE_WRITE_GAS
+        )
+        assert receipt["status"] == 1
+        assert await registry.has_role(editor, EDITOR) is True
+        assert await registry.versions("abc") == 1
+
+        second = await funded(w3)
+        doomed = [
+            {"to": registry.address, "data": REG.fns.grantRole("", second.address, EDITOR).data},
+            # No version 9 of that record, so this one reverts.
+            {"to": registry.address, "data": REG.fns.updateRecordStatus("abc", 9, "approved").data},
+        ]
+        receipt = await send_calls(
+            w3, chain_id=chain_id, private_key=creator.key.hex(), calls=doomed, gas_limit=STATE_WRITE_GAS
+        )
+
+        assert receipt["status"] == 0
+        assert await registry.has_role(second, EDITOR) is False, "the grant before it did not land"
 
 
 class TestEvents:
-    async def test_record_events_carry_their_identifiers(self, w3, wrapper):
-        """RegistryAdded, RecordAdded and RecordStatusUpdated name what they changed."""
-        creator = await funded(w3)
+    async def test_record_events_carry_their_identifiers(self, registry):
+        """RecordAdded and RecordStatusUpdated name what they changed."""
+        creator = registry.creator
 
-        receipt = await wrapper.write(creator, REG.fns.addRegistry("docs", "", ""))
-        rid = await wrapper.read(REG.fns.registryCount())
+        # The author is indexed, so a consumer deduplicating an operator's attestations filters
+        # on it rather than reading every record in the registry.
+        receipt = await registry.add_record(
+            creator, "abc", category=RECORD_CATEGORY["agentic_ai"], data_pointer="did:x#1"
+        )
+        checksum_hash = keccak(text="abc")
         assert_event(
             receipt,
-            wrapper,
-            "RegistryAdded(uint256,string,address)",
-            indexed=[rid, creator.address],
-            types=["string"],
-            data=["docs"],
+            registry.address,
+            "RecordAdded(bytes32,uint256,string,uint8,string,address)",
+            indexed=[checksum_hash, creator.address],
+            types=["uint256", "string", "uint8", "string"],
+            data=[1, "abc", RECORD_CATEGORY["agentic_ai"], "did:x#1"],
         )
 
-        receipt = await wrapper.write(creator, REG.fns.addRecord(rid, "ipfs://a", "abc", "sha256", "{}"))
-        record_id = await wrapper.read(REG.fns.recordIdForChecksum(rid, "abc"))
+        receipt = await registry.set_status(creator, "abc", 1, "redacted")
         assert_event(
             receipt,
-            wrapper,
-            "RecordAdded(uint256,uint256,uint256,string)",
-            indexed=[rid, record_id],
-            types=["uint256", "string"],
-            data=[1, "abc"],
-        )
-
-        receipt = await wrapper.write(creator, REG.fns.updateRecordStatus(rid, record_id, 1, "redacted"))
-        assert_event(
-            receipt,
-            wrapper,
-            "RecordStatusUpdated(uint256,uint256,uint256,string)",
-            indexed=[rid, record_id],
+            registry.address,
+            "RecordStatusUpdated(bytes32,uint256,string)",
+            indexed=[checksum_hash],
             types=["uint256", "string"],
             data=[1, "redacted"],
         )
 
-    async def test_role_events_carry_the_grant(self, w3, wrapper):
-        """The event names the scope in readable form; the anchored envelope hashes it."""
-        creator, editor = await funded(w3), await funded(w3)
-        rid = await wrapper.add_registry(creator)
-        await wrapper.add_record(creator, rid, "abc")
+    async def test_role_events_carry_the_grant(self, w3, registry):
+        """The event names the scope in readable form; nothing else records it."""
+        creator, editor = registry.creator, await funded(w3)
+        await registry.add_record(creator, "abc")
 
-        receipt = await wrapper.grant(creator, rid, editor, EDITOR, checksum="abc")
+        receipt = await registry.grant(creator, editor, EDITOR, checksum="abc")
         assert_event(
             receipt,
-            wrapper,
-            "RoleGranted(uint256,bytes32,address,bytes32)",
-            indexed=[rid, editor.address],
-            types=["bytes32", "bytes32"],
-            data=[keccak(text="abc"), EDITOR],
+            registry.address,
+            "RoleGranted(bytes32,address,bytes32)",
+            indexed=[HexBytes(keccak(text="abc")), editor.address],
+            types=["bytes32"],
+            data=[EDITOR],
         )
 
-        receipt = await wrapper.revoke(creator, rid, editor, EDITOR, checksum="abc")
+        receipt = await registry.revoke(creator, editor, EDITOR, checksum="abc")
         assert_event(
             receipt,
-            wrapper,
-            "RoleRevoked(uint256,bytes32,address,bytes32)",
-            indexed=[rid, editor.address],
-            types=["bytes32", "bytes32"],
-            data=[keccak(text="abc"), EDITOR],
+            registry.address,
+            "RoleRevoked(bytes32,address,bytes32)",
+            indexed=[HexBytes(keccak(text="abc")), editor.address],
+            types=["bytes32"],
+            data=[EDITOR],
         )

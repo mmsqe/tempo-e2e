@@ -106,6 +106,13 @@ async def fund(w3: AsyncWeb3, address: str, timeout: float = 60.0):
     return result
 
 
+async def funded(w3: AsyncWeb3):
+    """A fresh account with a faucet balance. Called per subject, so a fixture will not do."""
+    account = new_account()
+    await fund(w3, account.address)
+    return account
+
+
 def build_tempo_tx(
     *,
     chain_id: int,
@@ -397,6 +404,34 @@ async def seed_fee_pool(
             {"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.mint(user_token, validator_token, amount, funder).data},
         ],
     )
+
+
+# A contract that forwards the calldata it is given to one address and answers with the
+# success flag, so a call the callee refused is distinguishable from one that returned a zero
+# word. `test_precompiles` has a forwarder returning the callee's output instead, which cannot
+# tell those apart.
+#
+#   calldatacopy(0, 0, calldatasize)     ; the call's data becomes the forwarded args
+#   call(gas, <target>, 0, 0, cds, 0, 0)
+#   mstore(0, success) ; return(0, 32)
+_FORWARDER_RUNTIME = "36 6000 6000 37  6000 6000 36 6000 6000  73{addr} 5a f1  6000 52  6020 6000 f3"
+
+
+def _forwarder(template: str, target: str) -> bytes:
+    """Init code deploying ``template`` pointed at ``target``: copy the runtime out from past
+    this 12-byte prefix, then return it."""
+    addr = target.removeprefix("0x")
+    assert len(addr) == 40, "the target must be a 20-byte address"
+    runtime = bytes.fromhex(template.format(addr=addr))
+    size = f"60{len(runtime):02x}"
+    return bytes.fromhex(f"{size} 600c 6000 39 {size} 6000 f3") + runtime
+
+
+def call_forwarder(target: str) -> bytes:
+    """Init code for a contract that CALLs ``target``: a caller that is not an EOA, which two
+    suites need -- one for the namespace a frame anchors under, one for a role held by a
+    contract."""
+    return _forwarder(_FORWARDER_RUNTIME, target)
 
 
 async def deploy_contract(w3: AsyncWeb3, *, chain_id: int, private_key: str, bytecode, nonce: int | None = None):
