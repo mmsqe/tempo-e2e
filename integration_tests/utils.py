@@ -51,6 +51,7 @@ DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
 DEFAULT_MAX_FEE_PER_GAS = 100_000_000_000
 # A tempo tx that writes new storage (DEX orders, token deploys) needs extra TIP-1060 state gas.
 STATE_WRITE_GAS = 8_000_000
+SET_CODE_GAS = 500_000  # a 7702 delegation, plus whatever the delegated code then does
 
 # Default KeyRestrictions expiry (year ~2096): the on-chain authorizeKey path needs a real
 # timestamp (0 is ExpiryInPast), unlike the inline sign path's never-expire sentinel.
@@ -415,6 +416,8 @@ async def seed_fee_pool(
 #   call(gas, <target>, 0, 0, cds, 0, 0)
 #   mstore(0, success) ; return(0, 32)
 _FORWARDER_RUNTIME = "36 6000 6000 37  6000 6000 36 6000 6000  73{addr} 5a f1  6000 52  6020 6000 f3"
+# The same in a read-only frame; STATICCALL takes no value argument.
+_PROBE_RUNTIME = "36 6000 6000 37  6000 6000 36 6000  73{addr} 5a fa  6000 52  6020 6000 f3"
 
 
 def _forwarder(template: str, target: str) -> bytes:
@@ -432,6 +435,47 @@ def call_forwarder(target: str) -> bytes:
     suites need -- one for the namespace a frame anchors under, one for a role held by a
     contract."""
     return _forwarder(_FORWARDER_RUNTIME, target)
+
+
+def staticcall_probe(target: str) -> bytes:
+    """The same, in a read-only frame."""
+    return _forwarder(_PROBE_RUNTIME, target)
+
+
+async def send_set_code_tx(
+    w3: AsyncWeb3,
+    *,
+    chain_id: int,
+    sponsor,
+    authority,
+    delegate: str,
+    auth_nonce: int,
+    to: str,
+    data=b"",
+    gas: int = SET_CODE_GAS,
+):
+    """Sponsor sends a type-0x04 tx delegating ``authority`` (which signs the authorization) to
+    ``delegate``; the sponsor pays gas and supplies the outer transaction.
+
+    Shared: one suite watches the delegation itself, one what the borrowed code does under the
+    authority's own address.
+    """
+    signed_auth = Account.sign_authorization(
+        {"chainId": chain_id, "address": AsyncWeb3.to_checksum_address(delegate), "nonce": auth_nonce}, authority.key
+    )
+    tx = {
+        "to": AsyncWeb3.to_checksum_address(to),
+        "value": 0,
+        "data": data,
+        "nonce": await w3.eth.get_transaction_count(sponsor.address),
+        "chainId": chain_id,
+        "gas": gas,
+        "maxFeePerGas": await suggested_max_fee(w3),
+        "maxPriorityFeePerGas": DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+        "authorizationList": [signed_auth],
+    }
+    signed = Account.sign_transaction(tx, sponsor.key)
+    return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(signed.raw_transaction))
 
 
 async def deploy_contract(w3: AsyncWeb3, *, chain_id: int, private_key: str, bytecode, nonce: int | None = None):
