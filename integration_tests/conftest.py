@@ -22,7 +22,8 @@ from .docker_cluster import DockerCluster
 from .drivers import get_driver
 from .drivers.base import CAP_CONSENSUS_NET, CAP_INDEXER, CAP_TEMPO_NATIVE
 from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin
-from .utils import new_account
+from .registry import deploy_factory
+from .utils import funded, new_account
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -148,6 +149,26 @@ def tidx(request, driver, tempo, tmp_path_factory):
 @pytest.fixture
 def account():
     return new_account()
+
+
+@pytest.fixture
+async def factory(w3, chain_id):
+    """A fresh anchoring factory per test; the deploying EOA becomes owner (break-glass admin).
+
+    Here rather than in either suite, because both deploy registries and a fixture defined in
+    a test module cannot be seen from another.
+    """
+    factory = await deploy_factory(w3, chain_id)
+    # Only knowable from a run, and captured by pytest unless ``-s`` -- which is exactly when
+    # someone is reading it to point a service at the chain a test just built.
+    print(f"  CHAIN_ID={chain_id} FACTORY_ADDRESS={factory.address}  # for nvnmchain-anchoring serve")
+    return factory
+
+
+@pytest.fixture
+async def registry(w3, factory):
+    """One registry from a funded creator. Tests wanting a name, or two, use `factory`."""
+    return await factory.deploy(await funded(w3))
 
 
 @pytest.fixture

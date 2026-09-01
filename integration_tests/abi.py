@@ -233,7 +233,7 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
 
 # Anchoring precompile (IAnchoring): a caller-partitioned commitment log, enshrined at T10.
 # The caller is the namespace, so there is no authorization surface and nothing to deploy.
-# Supersedes the withdrawn AnchoringRegistry: the address is inherited from the x/anchoring
+# Supersedes the withdrawn x/anchoring module: the address is inherited from that
 # precompile, but its selectors are gone and now revert UnknownFunctionSelector. Registry and
 # record reads become indexer queries over the Anchored log; roles have no successor at all --
 # there is no grantRole/hasRole here, and permissioning is a wrapper-contract concern.
@@ -247,45 +247,59 @@ ANCHORING = Contract.from_abi(
     ]
 )
 
-# AnchoringRegistry (app contract): registries of checksum records with scoped RBAC, anchored
-# through the precompile rather than stored on-chain -- the wrapper keeps only counters and role
-# membership, and latest(wrapper, key) in the precompile is the source of truth. Roles are
-# registry-scoped or record-scoped (one checksum within one registry) over "admin"/"editor",
-# passed as right-padded bytes32. Role changes anchor too, so permissions rebuild from the log
-# alone, and every envelope leads with a bytes32 kind (registry/record/status/acl) an indexer can
-# classify on. Deployed per test via the vendored one-shot deployer, whose initcode is pinned to
-# a nvnmchain-contracts commit in artifacts/anchoring.json.
-ANCHORING_REGISTRY = Contract.from_abi(
+# Registry (app contract): one deployment per registry -- checksum records with scoped RBAC,
+# anchored through the precompile rather than stored on-chain. There is no registryId anywhere:
+# the deployment address is the partition, because the precompile is a caller-partitioned log.
+# The contract keeps only role membership and a version count per record; latest(registry, key)
+# in the precompile is the source of truth, and every anchored envelope leads with a bytes32
+# kind (record/status) an indexer classifies on. Roles are registry- or record-scoped (one
+# checksum) over "admin"/"editor" as right-padded bytes32, and are not anchored: membership is
+# this contract's state, its history the contract's own events.
+REGISTRY = Contract.from_abi(
     [
-        "function addRegistry(string name, string description, string metadata) returns (uint256 id)",
-        "function addRecord(uint256 registryId, string uri, string checksum, string checksumAlgo, string metadata) returns (uint256 recordId, uint256 index)",
-        "function updateRecordStatus(uint256 registryId, uint256 recordId, uint256 index, string status)",
-        "function grantRole(uint256 registryId, string checksum, address account, bytes32 role)",
-        "function revokeRole(uint256 registryId, string checksum, address account, bytes32 role)",
-        "function hasRole(uint256 registryId, string checksum, address account, bytes32 role) view returns (bool)",
-        "function registryCount() view returns (uint256)",
-        "function recordCount(uint256 registryId) view returns (uint256)",
-        "function recordIdForChecksum(uint256 registryId, string checksum) view returns (uint256)",
-        "function versionCount(uint256 registryId, uint256 recordId) view returns (uint256)",
-        "function latestRecordDigest(uint256 registryId, uint256 recordId) view returns (bytes32)",
+        "function addRecord(string uri, string checksum, string checksumAlgo, string metadata,"
+        " uint8 category, string dataPointer) returns (bytes32 checksumHash, uint256 index)",
+        "function updateRecordStatus(string checksum, uint256 index, string status)",
+        "function grantRole(string checksum, address account, bytes32 role)",
+        "function revokeRole(string checksum, address account, bytes32 role)",
+        "function hasRole(string checksum, address account, bytes32 role) view returns (bool)",
+        "function versionCount(bytes32 checksumHash) view returns (uint256)",
+        "function latestRecordDigest(bytes32 checksumHash) view returns (bytes32)",
         # The kind tags leading every anchored envelope; indexers match these literals.
-        "function KIND_REGISTRY() pure returns (bytes32)",
         "function KIND_RECORD() pure returns (bytes32)",
         "function KIND_STATUS() pure returns (bytes32)",
-        "function KIND_ACL() pure returns (bytes32)",
-        "function registryKey(uint256 id) pure returns (bytes32)",
-        "function recordKey(uint256 registryId, uint256 recordId) pure returns (bytes32)",
-        "function statusKey(uint256 registryId, uint256 recordId, uint256 index) pure returns (bytes32)",
-        "function aclKey(uint256 registryId, bytes32 checksumHash, address account, bytes32 role) pure returns (bytes32)",
+        # keccak256(""), the checksumHash a registry-scoped role is announced under.
+        "function REGISTRY_SCOPE() pure returns (bytes32)",
+        "function recordKey(bytes32 checksumHash) pure returns (bytes32)",
+        "function statusKey(bytes32 checksumHash, uint256 index) pure returns (bytes32)",
+        "function ROLE_ADMIN() pure returns (bytes32)",
+        "function ROLE_EDITOR() pure returns (bytes32)",
         "function owner() view returns (address)",
-        "event RegistryAdded(uint256 indexed id, string name, address indexed creator)",
-        "event RecordAdded(uint256 indexed registryId, uint256 indexed recordId, uint256 index, string checksum)",
-        "event RecordStatusUpdated(uint256 indexed registryId, uint256 indexed recordId, uint256 index, string status)",
-        "event RoleGranted(uint256 indexed registryId, bytes32 checksumHash, address indexed account, bytes32 role)",
-        "event RoleRevoked(uint256 indexed registryId, bytes32 checksumHash, address indexed account, bytes32 role)",
+        "event RecordAdded(bytes32 indexed checksumHash, uint256 index, string checksum,"
+        " uint8 category, string dataPointer, address indexed author)",
+        "event RecordStatusUpdated(bytes32 indexed checksumHash, uint256 index, string status)",
+        "event RoleGranted(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
+        "event RoleRevoked(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
     ]
 )
 
-# Its one-shot deployer: a single create tx deploys impl + ERC-1967 proxy and initializes it
-# with the calling EOA as owner (upgrade authority + break-glass admin).
-ANCHORING_DEPLOYER = Contract.from_abi(["function registry() view returns (address)"])
+# The factory: deploys one Registry per registry, outright and immutable -- upgrading means a
+# new registry and its roles granted again. Registry name/description/metadata ride in the deployment
+# event rather than an anchor -- descriptive, set once, nothing to prove -- and there is no
+# on-chain set of registries either: the log is the record, so enumeration is an indexer's job.
+REGISTRY_FACTORY = Contract.from_abi(
+    [
+        "function deployRegistry(string name, string description, string metadata) returns (address registry)",
+        "function owner() view returns (address)",
+        # Ownable's. `renounceOwnership` is declared only so a test can watch it be refused.
+        "function transferOwnership(address newOwner)",
+        "function renounceOwnership()",
+        "event RegistryDeployed(address indexed registry, address indexed creator, string name, string description, string metadata)",
+    ]
+)
+
+# Its one-shot deployer: a single create tx deploys the factory outright -- no proxy and
+# nothing to upgrade, since a replacement registry splits history across two addresses rather
+# than invalidating any -- with the calling EOA as its owner, and so as every registry's
+# break-glass admin. Read the factory from `factory()`.
+REGISTRY_DEPLOYER = Contract.from_abi(["function factory() view returns (address)"])

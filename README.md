@@ -184,7 +184,8 @@ where `test_indexer.py` is still waiting on `eth_getTransactions`.
 | `test_current_committee.py` | TIP-1070 | current-committee precompile (T8+): read members, system-only writes, epoch boundary |
 | `test_validator_config.py` | TIP-1017 | ValidatorConfig V2 append-only registry: genesis state, owner-gated mutators |
 | `test_anchoring.py` | — | anchoring precompile (T10+): commitment log, head slot, retired-selector rejection, and the log read back through tidx (`--tidx`) |
-| `test_anchoring_registry.py` | — | `AnchoringRegistry` wrapper: scoped RBAC, envelopes anchored into the precompile |
+| `test_anchoring_registry.py` | — | `RegistryFactory` + `Registry`: one contract per registry, scoped RBAC, envelopes anchored into the precompile |
+| `test_anchoring_service.py` | — | nvnmchain-anchoring's HTTP service and CLI over that log: registry/record/role projections, failure modes, a migration plan (`--tidx`, and the binary on `$PATH`) |
 
 ### Consensus & networking (`consensus` marker)
 
