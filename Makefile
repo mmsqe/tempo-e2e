@@ -10,6 +10,16 @@ CONTRACTS_REF ?= registry_factory
 CONTRACTS_WORK := .cache/nvnmchain-contracts
 ARTIFACT := integration_tests/artifacts/registry.json
 
+# Where to fetch from, as opposed to what the artifact records. Defaults to the same place;
+# point it at a local checkout to regenerate against a commit that is not pushed yet:
+#
+#     make contract-artifacts CONTRACTS_ORIGIN=../nvnmchain-contracts
+#
+# Provenance still names CONTRACTS_REPO, because a path on one machine tells a later reader
+# nothing. That leaves CONTRACTS_REF the thing to check: until it is pushed, the artifact
+# records a commit no one else can fetch.
+CONTRACTS_ORIGIN ?= $(CONTRACTS_REPO)
+
 # The RecordCategory enum in declaration order. The ABI encodes it as a bare uint8, so the
 # names live only in the source; vendoring them beside the initcode they were built from is
 # what lets the suite derive its mapping instead of mirroring it by hand.
@@ -23,7 +33,7 @@ contract-artifacts:
 	rm -rf $(CONTRACTS_WORK)
 	# init+fetch rather than clone --branch so CONTRACTS_REF may be a branch, tag, or SHA.
 	git init -q $(CONTRACTS_WORK)
-	cd $(CONTRACTS_WORK) && git remote add origin $(CONTRACTS_REPO) && \
+	cd $(CONTRACTS_WORK) && git remote add origin $(CONTRACTS_ORIGIN) && \
 	  git fetch -q --depth 1 origin $(CONTRACTS_REF) && git checkout -q FETCH_HEAD && \
 	  git submodule update -q --init --depth 1
 	cd $(CONTRACTS_WORK) && forge build
