@@ -43,6 +43,8 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
+        "function distributeFees(address validator, address token)",  # permissionless payout to the fee recipient
+        "function collectedFees(address validator, address token) view returns (uint256)",
     ]
 )
 
@@ -153,6 +155,9 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         "function getNextNetworkIdentityRotationEpoch() view returns (uint64)",
         "function addValidator(address validatorAddress, bytes32 publicKey, string ingress, string egress,"
         " address feeRecipient, bytes signature) returns (uint64)",
+        # Owner or the validator itself. The recipient becomes the block beneficiary, so fees
+        # accrue in FeeManager under *it*, not under the validator address.
+        "function setFeeRecipient(uint64 idx, address feeRecipient)",
         "function transferOwnership(address newOwner)",
     ]
 )
@@ -303,3 +308,116 @@ REGISTRY_FACTORY = Contract.from_abi(
 # than invalidating any -- with the calling EOA as its owner, and so as every registry's
 # break-glass admin. Read the factory from `factory()`.
 REGISTRY_DEPLOYER = Contract.from_abi(["function factory() view returns (address)"])
+# Test mock ERC-20 (open mint), stood up wherever a plain token is needed.
+MOCK_ERC20 = Contract.from_abi(["function mint(address to, uint256 amount)"])
+
+# NVNMStaking (upgradeable app contract): delegated staking that shares chain fees with stakers.
+# Stake NVNM toward a validator, deposited reward-token (nvmnUSD) is split pro-rata per validator.
+STAKING = Contract.from_abi(
+    [
+        "function stake(address validator, uint256 amount)",
+        "function unstake(address validator, uint256 amount)",
+        "function depositReward(address validator, uint256 amount)",
+        "function compoundReward(address validator, uint256 amount)",
+        "function claim(address validator) returns (uint256 amount)",
+        "function earned(address validator, address user) view returns (uint256)",
+        "function stakedOf(address validator, address user) view returns (uint256)",
+        "function totalStaked(address validator) view returns (uint256)",
+        "function totalShares(address validator) view returns (uint256)",
+        "function stakeToken() view returns (address)",
+        "function rewardToken() view returns (address)",
+        # election: top-`maxSeats` by acquired*acquiredWeight + delegated, one equal
+        # seat each — the consensus engine is unit-weighted, so the committee is just the
+        # address list. Seating fewer than `minSeats` members elects nobody (registry
+        # fallback on every node at once).
+        "function setCandidate(address validator, bool active)",
+        "function setCommitteeConfig(uint256 maxSeats, uint256 acquiredWeight, uint256 maxDelegated)",
+        "function candidates() view returns (address[])",
+        "function computeCommittee() view returns (address[] vals)",
+        "function setMinSeats(uint256 minSeats)",
+        "function minSeats() view returns (uint256)",
+        # candidacy: self-register against an NVNM bond. `minAcquired` is the 1M NVNM floor —
+        # below it, delegated stake alone never buys a seat.
+        "function setCandidacyBond(uint256 bond)",
+        "function registerCandidate()",
+        "function resignCandidate()",
+        "function bondOf(address validator) view returns (uint256)",
+        "function setMinAcquired(uint256 minAcquired)",
+        "function minAcquired() view returns (uint256)",
+        # slashing: system caller (address(0)) or owner seizes the candidacy bond, including one
+        # unbonding after a resignation. Delegated stake is never slashed.
+        "function slash(address validator, uint256 bps, address recipient) returns (uint256 seized)",
+        # unbonding: with a period set, exiting stake and a resigned bond each park in a pending
+        # bucket until their own withdrawal.
+        "function setUnbondingPeriod(uint256 period)",
+        "function withdraw(address validator) returns (uint256 amount)",
+        "function pendingUnstakeOf(address validator, address user) view returns (uint256 amount, uint256 releaseAt)",
+        "function withdrawBond() returns (uint256 amount)",
+        "function pendingBondOf(address validator) view returns (uint256 amount, uint256 releaseAt)",
+    ]
+)
+
+# Its one-shot deployer (nvnmchain-contracts StakingDeployer.sol): stands up mock NVNM + reward
+# tokens and the staking proxy, and exposes their addresses.
+STAKING_DEPLOYER = Contract.from_abi(
+    [
+        "function staking() view returns (address)",
+        "function nvnm() view returns (address)",
+        "function usd() view returns (address)",
+    ]
+)
+
+# FeeRouter: protocol cuts (devshare/buybacks) then validator remainder → commission + delegators.
+FEE_ROUTER = Contract.from_abi(
+    [
+        # FeeManager swaps each payer's fee into the recipient's preferred token, so a router
+        # normally holds one and the bare overload covers it. `flush(token)` routes anything
+        # else — a preferred token pointed away from the pool's reward token, or a transfer in.
+        "function flush() returns (uint256 deposited)",
+        "function flush(address token) returns (uint256 deposited)",
+        "function validator() view returns (address)",
+        "function commissionBps() view returns (uint256)",
+        # Read live off the staking proxy, so it follows a reward-token migration.
+        "function rewardToken() view returns (address)",
+        # Delegator share held for a token the pool cannot account in, kept out of the
+        # flushable balance so a permissionless re-flush cannot cut it twice.
+        "function heldForDelegators(address token) view returns (uint256)",
+    ]
+)
+FEE_ROUTER_FACTORY = Contract.from_abi(
+    [
+        "function create(address validator, address operator, uint256 commissionBps) returns (address router)",
+        "function setSwapper(address swapper)",
+        "function setProtocolSplit(address devshare, address buyback, uint256 devshareBps, uint256 buybackBps)",
+        # GuardedSwapper reads this to decide who may move its reference price.
+        "function isRouter(address account) view returns (bool)",
+        "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps)",
+    ]
+)
+
+# GuardedSwapper: the buyback-market wrapper the factory's `swapper` points at.
+GUARDED_SWAPPER = Contract.from_abi(
+    [
+        "function setGuards(address inner, uint256 maxAmountIn, uint256 maxDeviationBps, uint256 emaAlphaBps)",
+        # Two-sided floor: `maxDeviationBps` against the EMA absorbs honest drift, `maxDriftBps`
+        # against the seeded `refPrice` caps how far it accumulates. Without the second leg the
+        # EMA is walked down a swap at a time.
+        "function setDriftBand(uint256 maxDriftBps)",
+        # Owner and this factory's routers only — a router's output goes to the buyback wallet,
+        # so moving the price costs the full amount rather than being ~free.
+        "function setRouterFactory(address routerFactory)",
+        "function seedPrice(uint256 price)",
+        "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) returns (uint256 out)",
+        "function emaPrice() view returns (uint256)",
+        "function refPrice() view returns (uint256)",
+    ]
+)
+
+# BridgedNVNM: BRIDGE=1 role holders mint/burn; owner curates the role (setRole from EnumerableRoles).
+BRIDGED_NVNM = Contract.from_abi(
+    [
+        "function setRole(address holder, uint256 role, bool active)",
+        "function bridgeMint(address to, uint256 amount)",
+        "function bridgeBurn(address from, uint256 amount)",
+    ]
+)
