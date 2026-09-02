@@ -326,12 +326,12 @@ STAKING = Contract.from_abi(
         "function totalShares(address validator) view returns (uint256)",
         "function stakeToken() view returns (address)",
         "function rewardToken() view returns (address)",
-        # election: top-`maxCommittee` by acquired*acquiredWeight + delegated, one equal
+        # election: top-`maxSeats` by acquired*acquiredWeight + delegated, one equal
         # seat each — the consensus engine is unit-weighted, so the committee is just the
         # address list. Seating fewer than `minSeats` members elects nobody (registry
         # fallback on every node at once).
         "function setCandidate(address validator, bool active)",
-        "function setCommitteeConfig(uint256 maxCommittee, uint256 acquiredWeight, uint256 maxDelegated)",
+        "function setCommitteeConfig(uint256 maxSeats, uint256 acquiredWeight, uint256 maxDelegated)",
         "function candidates() view returns (address[])",
         "function computeCommittee() view returns (address[] vals)",
         "function setMinSeats(uint256 minSeats)",

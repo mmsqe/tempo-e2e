@@ -7,7 +7,7 @@ BIN := .venv/bin
 # no toolchain. The repo is private, so this uses SSH; override CONTRACTS_REPO/CONTRACTS_REF to
 # point elsewhere or pin a commit.
 CONTRACTS_REPO ?= git@github.com:NVNM-Chain/nvnmchain-contracts.git
-CONTRACTS_REF ?= staking
+CONTRACTS_REF ?= main
 CONTRACTS_WORK := .cache/nvnmchain-contracts
 ARTIFACT := integration_tests/artifacts/registry.json
 
