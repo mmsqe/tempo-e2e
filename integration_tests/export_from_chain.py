@@ -11,6 +11,7 @@ import io
 import json
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,14 +19,18 @@ NODE = "https://rpc.nvnmchain.io"
 BINARY = "nvnmchaind"
 PAGE = 200
 WAVE = 8
+BACKOFF = (1, 2, 4, 8)
 
 
 def query(what: str, *flags: str, node: str, binary: str) -> dict:
     argv = [binary, "query", "anchoring", what, "--node", node, "--output", "json", *flags]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"{' '.join(argv[2:])}: {proc.stderr.strip()}")
-    return json.loads(proc.stdout)
+    for wait in (*BACKOFF, None):
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
+        if proc.returncode == 0:
+            return json.loads(proc.stdout)
+        if wait:
+            time.sleep(wait)
+    raise RuntimeError(f"{' '.join(argv[2:])}: {proc.stderr.strip()}")
 
 
 def paged(what: str, field: str, *flags: str, node: str, binary: str, said: str = "") -> list[dict]:
@@ -84,11 +89,16 @@ def tranche(name: str, records: list[dict]) -> tuple[bytes, bytes]:
     return buffer.getvalue(), content
 
 
+def kept(path: Path, sha256_gz: str) -> bool:
+    return path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == sha256_gz
+
+
 def build(out: Path, names: list[str], *, node: str = NODE, binary: str = BINARY, verify: Path | None = None) -> Path:
     """Write a complete export -- listing, manifest, one file per registry -- for ``names``.
 
     With ``verify``, every file is checked against that manifest and takes its entry from it,
-    path included.
+    path included; one already there with the manifest's digest is kept rather than pulled
+    again, which is how a run that stopped resumes.
     """
     expected = {}
     if verify:
@@ -103,13 +113,18 @@ def build(out: Path, names: list[str], *, node: str = NODE, binary: str = BINARY
     files = []
     for at, name in enumerate(names, 1):
         where = f"{at}/{len(names)} {name}"
+        entry = expected.get(name)
+        if entry and kept(out / entry["file"], entry["sha256_gz"]):
+            files.append(entry)
+            print(f"{where}: kept", file=sys.stderr)
+            continue
         records = rows_of(listing[name]["id"], node=node, binary=binary, said=where)
         archive, content = tranche(name, records)
         digests = {
             "sha256_gz": hashlib.sha256(archive).hexdigest(),
             "sha256_uncompressed": hashlib.sha256(content).hexdigest(),
         }
-        entry = expected.get(name) or {
+        entry = entry or {
             "registry": name,
             "records": len(records),
             "file": f"from-chain/{name}.jsonl.gz",
