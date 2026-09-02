@@ -5,7 +5,9 @@ directly. These tests run *its* implementation instead, against the same oracle 
 checked by: what ``/roles`` serves is what ``hasRole`` answers. Nothing is lost by not writing
 the query twice, and these are now the only tests over the projections.
 
-Needs ``--tidx`` and the service binary; ``binary`` says what a missing one does.
+Needs ``--tidx`` and the service binary; ``binary`` says what a missing one does. Two tests
+migrate a real export where ``NVNM_EXPORT_DIR`` says it is; ``real_export`` says what they do
+without it.
 """
 
 import gzip
@@ -18,6 +20,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from eth_utils import keccak
@@ -198,6 +201,48 @@ def planned(tempo, tidx, factory, export: str, *flags) -> tuple[list[dict], Path
     plan = Path(export) / "plan.jsonl"
     plan.write_text(printed)
     return [json.loads(line) for line in printed.splitlines()], plan
+
+
+class Export(NamedTuple):
+    """A real export: its directory, its manifest files smallest first, its listing by name."""
+
+    dir: Path
+    files: list[dict]
+    registries: dict[str, dict]
+
+
+def real_export() -> Export:
+    """Where ``$NVNM_EXPORT_DIR`` says it is; a skip otherwise. The listing and manifest are
+    enough to plan by sha256 root; replaying needs the tranche files beside them."""
+    staged = os.environ.get("NVNM_EXPORT_DIR")
+    if not staged:
+        pytest.skip("NVNM_EXPORT_DIR is unset: no real export to migrate")
+    directory = Path(staged)
+    files = sorted(json.loads((directory / "manifest.json").read_text())["files"], key=lambda f: f["records"])
+    registries = {r["name"]: r for r in json.loads((directory / "registries.json").read_text())}
+    return Export(directory, files, registries)
+
+
+def smallest_and_largest(files: list[dict]) -> list[dict]:
+    """The three smallest registries and the largest; under four, all of them, so none is
+    named twice -- a duplicate is a listing the planner refuses."""
+    return files if len(files) <= 4 else files[:3] + files[-1:]
+
+
+def subset_of(export: Export, directory: Path, chosen: list[dict]) -> str:
+    """The export cut down to the manifest files ``chosen``, totals to match -- the planner
+    refuses a listing and manifest that disagree -- and any staged tranche linked in."""
+    directory.mkdir(parents=True, exist_ok=True)
+    listing = [export.registries[f["registry"]] for f in chosen]
+    (directory / "registries.json").write_text(json.dumps(listing))
+    totals = {"registries": len(chosen), "records": sum(f["records"] for f in chosen)}
+    (directory / "manifest.json").write_text(json.dumps({"totals": totals, "files": chosen}))
+    for f in chosen:
+        if (export.dir / f["file"]).exists():
+            link = directory / f["file"]
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(export.dir / f["file"])
+    return str(directory)
 
 
 class Migration:
@@ -667,6 +712,73 @@ class TestService:
         (divergence,) = answer["divergences"]
         assert "a step sent twice" in divergence["detail"], divergence
         assert answer["remaining"] == 0 and left.read_text() == "", "a version too many is not fixed by sending"
+
+    async def test_the_real_export_lands_rooted_by_the_digests_it_carries(
+        self, w3, chain_id, tempo, tidx, factory, service, tmp_path
+    ):
+        """A real listing and manifest against the real contracts: names, descriptions and
+        metadata as calldata, each file rooted by the sha256 the manifest carries, so no
+        tranche is needed. A subset, since a deploy is a transaction each: the three smallest
+        registries and the largest."""
+        export = real_export()
+        chosen = smallest_and_largest(export.files)
+        steps, plan = planned(tempo, tidx, factory, subset_of(export, tmp_path / "export", chosen), "--root=sha256")
+        assert [s["kind"] for s in steps] == ["deploy", "record"] * len(chosen)
+
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
+        await migration.send(steps)
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+        listed = {r["name"]: r for r in get(f"{service}/registries")["registries"]}
+        for f in chosen:
+            name, source = f["registry"], export.registries[f["registry"]]
+            assert listed[name]["description"] == source["description"]
+            assert listed[name]["metadata"] == source["metadata"]
+            (record,) = get(f"{service}/registries/{migration.deployed[name]}/records")["records"]
+            assert record["checksum_algo"] == "sha256"
+            assert record["checksum"].lower() == "0x" + f["sha256_uncompressed"]
+            assert json.loads(record["metadata"])["legacy"]["records"] == f["records"]
+
+    async def test_the_real_exports_rows_replay_and_its_files_root(
+        self, w3, chain_id, tempo, tidx, factory, service, tmp_path
+    ):
+        """The planner's default over the tranche files: the three smallest registries replayed
+        row by row, the largest verified against the manifest and rooted by merkle."""
+        export = real_export()
+        chosen = smallest_and_largest(export.files)
+        if len(chosen) < 4:
+            pytest.skip(f"{export.dir} has {len(chosen)} registries: too few to replay three and root one")
+        replayed, rooted = chosen[:3], chosen[3]
+        if not all((export.dir / f["file"]).exists() for f in chosen):
+            pytest.skip(f"{export.dir} holds no tranche files: nothing to replay")
+        threshold = max(f["records"] for f in replayed)
+        if rooted["records"] <= threshold:
+            pytest.skip(f"{export.dir}: no registry larger than the three replayed, nothing to root")
+        steps, plan = planned(
+            tempo, tidx, factory, subset_of(export, tmp_path / "export", chosen), f"--threshold={threshold}"
+        )
+        assert sum(s["kind"] == "deploy" for s in steps) == len(chosen)
+        assert sum(s["kind"] == "record" for s in steps) == sum(f["records"] for f in replayed) + 1, "one root"
+
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
+        await migration.send(steps)
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+        for f in replayed:
+            with gzip.open(export.dir / f["file"], "rt") as lines:
+                rows = {
+                    row["checksum"]: (row["uri"], row["checksumAlgo"], row["metadata"], row.get("status") or None)
+                    for row in map(json.loads, lines)
+                }
+            records = get(f"{service}/registries/{migration.deployed[f['registry']]}/records")["records"]
+            served = {r["checksum"]: (r["uri"], r["checksum_algo"], r["metadata"], r["status"]) for r in records}
+            assert served == rows, f["registry"]
+
+        (root,) = get(f"{service}/registries/{migration.deployed[rooted['registry']]}/records")["records"]
+        committed = next(s for s in steps if s["registry"] == rooted["registry"] and s["kind"] == "record")
+        assert root["checksum_algo"] == "keccak256-merkle"
+        assert root["checksum"] == committed["checksum"], "the root the plan committed to"
+        assert json.loads(root["metadata"])["legacy"]["records"] == rooted["records"]
 
     async def test_a_malformed_address_is_refused_rather_than_queried(self, service):
         # A filtered address would query a real-looking other one and answer
