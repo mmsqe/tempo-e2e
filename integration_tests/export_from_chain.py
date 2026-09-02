@@ -8,6 +8,7 @@ import argparse
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import subprocess
 import sys
@@ -20,20 +21,28 @@ BINARY = "nvnmchaind"
 PAGE = 200
 WAVE = 8
 BACKOFF = (1, 2, 4, 8)
+THROTTLED = (60,) * 10
 
 
 def query(what: str, *flags: str, node: str, binary: str) -> dict:
+    """One query, asked again on failure: a 503 with ``BACKOFF`` between tries, a 429 with
+    ``THROTTLED`` -- the node is asking for less, not failing, and a run of hours is worth
+    minutes of patience. Lower ``--wave`` if 429s keep coming."""
     argv = [binary, "query", "anchoring", what, "--node", node, "--output", "json", *flags]
-    for wait in (*BACKOFF, None):
+    for attempt in itertools.count():
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
         if proc.returncode == 0:
             return json.loads(proc.stdout)
-        if wait:
-            time.sleep(wait)
+        waits = THROTTLED if "429 Too Many Requests" in proc.stderr else BACKOFF
+        if attempt >= len(waits):
+            break
+        if waits is THROTTLED:
+            print(f"\r{what}: 429, waiting {waits[attempt]}s", file=sys.stderr)
+        time.sleep(waits[attempt])
     raise RuntimeError(f"{' '.join(argv[2:])}: {proc.stderr.strip()}")
 
 
-def paged(what: str, field: str, *flags: str, node: str, binary: str, said: str = "") -> list[dict]:
+def paged(what: str, field: str, *flags: str, node: str, binary: str, said: str = "", wave: int = WAVE) -> list[dict]:
     """Every page of one query, a wave of offsets at a time; a short page is the end. ``said``
     names what is being counted on stderr, so a long pull is a line that moves."""
 
@@ -43,21 +52,21 @@ def paged(what: str, field: str, *flags: str, node: str, binary: str, said: str 
 
     collected: list[dict] = []
     start = 0
-    with ThreadPoolExecutor(max_workers=WAVE) as pool:
+    with ThreadPoolExecutor(max_workers=wave) as pool:
         while True:
-            for page in pool.map(page_at, range(start, start + WAVE * PAGE, PAGE)):
+            for page in pool.map(page_at, range(start, start + wave * PAGE, PAGE)):
                 collected += page
                 if len(page) < PAGE:
                     return collected
-            start += WAVE * PAGE
+            start += wave * PAGE
             if said:
                 print(f"\r{said}: {len(collected)} records...", end="", file=sys.stderr, flush=True)
 
 
-def rows_of(registry_id: str, *, node: str, binary: str, said: str = "") -> list[dict]:
+def rows_of(registry_id: str, *, node: str, binary: str, said: str = "", wave: int = WAVE) -> list[dict]:
     """One registry's records in the order the export carries them: the ids the module
     assigned, so a record's versions come oldest first. Sorted here because a wave does not."""
-    records = paged("records", "records", "--registry-id", registry_id, node=node, binary=binary, said=said)
+    records = paged("records", "records", "--registry-id", registry_id, node=node, binary=binary, said=said, wave=wave)
     records.sort(key=lambda r: (int(r["record_id"]), int(r["index"])))
     return records
 
@@ -93,7 +102,15 @@ def kept(path: Path, sha256_gz: str) -> bool:
     return path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == sha256_gz
 
 
-def build(out: Path, names: list[str], *, node: str = NODE, binary: str = BINARY, verify: Path | None = None) -> Path:
+def build(
+    out: Path,
+    names: list[str],
+    *,
+    node: str = NODE,
+    binary: str = BINARY,
+    verify: Path | None = None,
+    wave: int = WAVE,
+) -> Path:
     """Write a complete export -- listing, manifest, one file per registry -- for ``names``.
 
     With ``verify``, every file is checked against that manifest and takes its entry from it,
@@ -105,7 +122,7 @@ def build(out: Path, names: list[str], *, node: str = NODE, binary: str = BINARY
         expected = {f["registry"]: f for f in json.loads(verify.read_text())["files"]}
         if unknown := [name for name in names if name not in expected]:
             raise SystemExit(f"{verify} describes no registry named: {', '.join(unknown)}")
-    listing = {r["name"]: r for r in paged("registries", "registries", node=node, binary=binary)}
+    listing = {r["name"]: r for r in paged("registries", "registries", node=node, binary=binary, wave=wave)}
     if missing := [name for name in names if name not in listing]:
         raise SystemExit(f"the chain carries no registry named: {', '.join(missing)}")
 
@@ -118,7 +135,7 @@ def build(out: Path, names: list[str], *, node: str = NODE, binary: str = BINARY
             files.append(entry)
             print(f"{where}: kept", file=sys.stderr)
             continue
-        records = rows_of(listing[name]["id"], node=node, binary=binary, said=where)
+        records = rows_of(listing[name]["id"], node=node, binary=binary, said=where, wave=wave)
         archive, content = tranche(name, records)
         digests = {
             "sha256_gz": hashlib.sha256(archive).hexdigest(),
@@ -168,12 +185,17 @@ def main() -> None:
     parser.add_argument("--node", default=NODE, help=f"the chain to read the corpus from (default {NODE})")
     parser.add_argument("--binary", default=BINARY, help="the module's own client (default nvnmchaind)")
     parser.add_argument("--verify", type=Path, help="the export's manifest.json, to check every rebuild against")
+    parser.add_argument(
+        "--wave", type=int, default=WAVE, help=f"pages asked for at once (default {WAVE}); lower it if 429s keep coming"
+    )
     args = parser.parse_args()
     if not args.names:
         if not args.verify:
             parser.error("name the registries to rebuild, or --verify <manifest> to rebuild every one it names")
         args.names = [f["registry"] for f in json.loads(args.verify.read_text())["files"]]
-    print(f"wrote {build(args.out, args.names, node=args.node, binary=args.binary, verify=args.verify)}")
+    print(
+        f"wrote {build(args.out, args.names, node=args.node, binary=args.binary, verify=args.verify, wave=args.wave)}"
+    )
 
 
 if __name__ == "__main__":
