@@ -260,6 +260,13 @@ REGISTRY = Contract.from_abi(
         "function addRecord(string uri, string checksum, string checksumAlgo, string metadata,"
         " uint8 category, string dataPointer) returns (bytes32 checksumHash, uint256 index)",
         "function updateRecordStatus(string checksum, uint256 index, string status)",
+        # Leaves: off-chain records committed to the registry's MMR, one word of state.
+        "function appendLeaf(bytes32 commitment, bytes32[] peaks, uint256 count, bytes metadata)",
+        "function appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes32[] peaks,"
+        " uint256 count, bytes metadata)",
+        "function mmrRoot() view returns (bytes32)",
+        "function KIND_MMR() pure returns (bytes32)",
+        "function MMR_KEY() pure returns (bytes32)",
         "function grantRole(string checksum, address account, bytes32 role)",
         "function revokeRole(string checksum, address account, bytes32 role)",
         "function hasRole(string checksum, address account, bytes32 role) view returns (bool)",
@@ -302,4 +309,14 @@ REGISTRY_FACTORY = Contract.from_abi(
 # nothing to upgrade, since a replacement registry splits history across two addresses rather
 # than invalidating any -- with the calling EOA as its owner, and so as every registry's
 # break-glass admin. Read the factory from `factory()`.
-REGISTRY_DEPLOYER = Contract.from_abi(["function factory() view returns (address)"])
+REGISTRY_DEPLOYER = Contract.from_abi(
+    ["function factory() view returns (address)", "function verifier() view returns (address)"]
+)
+
+# Inclusion proofs against any registry's MMR root; deployed once, beside the factory.
+MMR_VERIFIER = Contract.from_abi(
+    [
+        "function verify(bytes32 root, bytes32 commitment, uint256 index, bytes32[] siblings,"
+        " bytes32[] peaks, uint256 count) pure returns (bool)",
+    ]
+)

@@ -51,6 +51,8 @@ DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
 DEFAULT_MAX_FEE_PER_GAS = 100_000_000_000
 # A tempo tx that writes new storage (DEX orders, token deploys) needs extra TIP-1060 state gas.
 STATE_WRITE_GAS = 8_000_000
+# A Registry deploys at 8.79M with its MMR code; a write's limit no longer covers one.
+DEPLOY_GAS = 12_000_000
 SET_CODE_GAS = 500_000  # a 7702 delegation, plus whatever the delegated code then does
 
 # Default KeyRestrictions expiry (year ~2096): the on-chain authorizeKey path needs a real
