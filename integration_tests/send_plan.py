@@ -2,6 +2,9 @@
 
 PRIVATE_KEY=0x… python -m integration_tests.send_plan --plan todo.jsonl \\
   --rpc http://127.0.0.1:8545 --chain-id 1337 --factory 0x…
+
+`PRIVATE_KEYS`, comma separated, sends from several accounts at once: measured 5x on one
+big registry, and the sweet spot moves with the chain's block time.
 """
 
 import argparse
@@ -14,7 +17,8 @@ from pathlib import Path
 from eth_account import Account
 from web3 import AsyncWeb3
 
-from .registry import deployed_addresses
+from .abi import REGISTRY as REG
+from .registry import EDITOR, deployed_addresses
 from .utils import send_calls
 
 MAX_CALLS = 32
@@ -57,9 +61,92 @@ def target(step: dict, factory: str, deployed: dict[str, str]) -> str:
     return step.get("to") or deployed[step["registry"]]
 
 
-async def send(w3, *, chain_id: int, key: str, factory: str, steps: list[dict]) -> int:
-    """Send every batch, stopping at the first receipt with status 0: out of gas is a receipt, not an error."""
+def shares(steps: list[dict], keys: int) -> list[list[dict]]:
+    """The steps dealt round robin, whole registries at a time.
+
+    Used for the deploys, where a registry's sender becomes its admin, so the split has
+    to follow registries. Sorted by name, so a resumed run deals the same way.
+    """
+    names = sorted({s["registry"] for s in steps})
+    at = {name: i % keys for i, name in enumerate(names)}
+    lots: list[list[dict]] = [[] for _ in range(keys)]
+    for step in steps:
+        lots[at[step["registry"]]].append(step)
+    return lots
+
+
+def evenly(steps: list[dict], keys: int) -> list[list[dict]]:
+    """The steps dealt one at a time, ignoring registries: after the grants, any sender may
+    write any of them."""
+    lots: list[list[dict]] = [[] for _ in range(keys)]
+    for i, step in enumerate(steps):
+        lots[i % keys].append(step)
+    return lots
+
+
+def opening(registries: dict[str, str], mine: set[str], others: list[str]) -> list[dict]:
+    """Editor at registry scope, for every other sender, on every registry this key deployed.
+
+    Without them only the deployer writes a registry, and the corpus's largest holds a tenth
+    of it -- a serial tail no split can shorten.
+    """
+    return [
+        {"to": registries[name], "data": REG.fns.grantRole("", address, EDITOR).data}
+        for name in sorted(mine)
+        for address in others
+    ]
+
+
+async def send(w3, *, chain_id: int, keys: list[str], factory: str, steps: list[dict]) -> int:
+    """Deploys first, one key per registry; then the rest from every key at once.
+
+    The grants between the two are what let the second half ignore registries, so the
+    work is dealt evenly however lopsided they are.
+    """
+    deploys = [s for s in steps if s["kind"] == "deploy"]
+    rest = [s for s in steps if s["kind"] != "deploy"]
+    mine = [Account.from_key(k).address for k in keys]
     deployed: dict[str, str] = {}
+
+    async def together(lots, run) -> int:
+        return sum(await asyncio.gather(*(run(k, lot) for k, lot in zip(keys, lots, strict=True))))
+
+    def sending(k, lot):
+        return stream(w3, chain_id=chain_id, key=k, factory=factory, steps=lot, deployed=deployed)
+
+    spent = 0
+    if deploys:
+        lots = shares(deploys, len(keys))
+        spent += await together(lots, sending)
+        if len(keys) > 1:
+            spent += await together(
+                [
+                    opening(deployed, {s["registry"] for s in lot}, [a for a in mine if a != me])
+                    for lot, me in zip(lots, mine, strict=True)
+                ],
+                lambda k, payload: granting(w3, chain_id=chain_id, key=k, payload=payload),
+            )
+    if rest:
+        spent += await together(evenly(rest, len(keys)), sending)
+    print(file=sys.stderr)
+    return spent
+
+
+async def granting(w3, *, chain_id: int, key: str, payload: list[dict]) -> int:
+    """The grants, batched: plain calls rather than plan steps, so `batched` does not fit."""
+    spent = 0
+    for i in range(0, len(payload), MAX_CALLS):
+        receipt = await send_calls(
+            w3, chain_id=chain_id, private_key=key, calls=payload[i : i + MAX_CALLS], gas_limit=GAS_CAP
+        )
+        if receipt["status"] != 1:
+            raise SystemExit(f"granting editor reverted at {receipt['gasUsed']:,} gas")
+        spent += receipt["gasUsed"]
+    return spent
+
+
+async def stream(w3, *, chain_id: int, key: str, factory: str, steps: list[dict], deployed: dict) -> int:
+    """One key's steps, stopping at the first receipt with status 0: out of gas is a receipt, not an error."""
     spent = 0
     for at, batch in enumerate(batches(steps), 1):
         calls = [{"to": target(s, factory, deployed), "data": bytes.fromhex(s["data"][2:])} for s in batch]
@@ -75,8 +162,7 @@ async def send(w3, *, chain_id: int, key: str, factory: str, steps: list[dict]) 
             if len(addresses) != len(batch):
                 raise SystemExit(f"tx {at}: {len(batch)} deploys announced {len(addresses)} registries")
             deployed.update(zip((s["registry"] for s in batch), addresses, strict=True))
-        print(f"\r  tx {at}: {len(batch)} calls, {spent:,} gas so far", end="", file=sys.stderr, flush=True)
-    print(file=sys.stderr)
+        print(f"\r  {Account.from_key(key).address[:10]} tx {at}: {spent:,} gas", end="", file=sys.stderr, flush=True)
     return spent
 
 
@@ -89,7 +175,10 @@ async def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="report the batching and stop")
     args = parser.parse_args()
 
-    steps = [json.loads(line) for line in args.plan.read_text().splitlines() if line.strip()]
+    # Read line by line: a full replay's plan is tens of gigabytes, and `read_text`
+    # would hold the whole file as one string before any of it is parsed.
+    with args.plan.open() as lines:
+        steps = [json.loads(line) for line in lines if line.strip()]
     kinds = {k: sum(1 for s in steps if s["kind"] == k) for k in ("deploy", "record", "status")}
     print(f"{len(steps)} steps: " + ", ".join(f"{n} {k}" for k, n in kinds.items() if n))
     if not steps:
@@ -102,15 +191,16 @@ async def main() -> None:
         print(f"~{sum(cost(s) for s in steps):,} gas planned, nothing sent")
         return
 
-    key = os.environ.get("PRIVATE_KEY")
-    if not key:
+    raw = os.environ.get("PRIVATE_KEYS") or os.environ.get("PRIVATE_KEY") or ""
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
         raise SystemExit("PRIVATE_KEY is unset: pass the sending key in the environment, not on the command line")
     w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(args.rpc))
     try:
-        spent = await send(w3, chain_id=args.chain_id, key=key, factory=args.factory, steps=steps)
+        spent = await send(w3, chain_id=args.chain_id, keys=keys, factory=args.factory, steps=steps)
     finally:
         await w3.provider.disconnect()
-    print(f"sent {len(steps)} steps from {Account.from_key(key).address}, {spent:,} gas")
+    print(f"sent {len(steps)} steps from {len(keys)} sender(s), {spent:,} gas")
 
 
 if __name__ == "__main__":
