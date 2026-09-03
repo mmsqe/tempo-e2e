@@ -26,11 +26,11 @@ import pytest
 from eth_utils import keccak
 from hexbytes import HexBytes
 
-from .abi import ANCHORING, ANCHORING_ADDRESS
+from .abi import ANCHORING, ANCHORING_ADDRESS, MMR_VERIFIER
 from .abi import REGISTRY as REG
 from .network import _resolve_bin, free_port
 from .registry import ADMIN, EDITOR, deployed_address
-from .utils import STATE_WRITE_GAS, funded, new_account, send_call, send_calls
+from .utils import DEPLOY_GAS, STATE_WRITE_GAS, funded, new_account, send_call, send_calls
 
 pytestmark = pytest.mark.tempo
 
@@ -245,6 +245,25 @@ def subset_of(export: Export, directory: Path, chosen: list[dict]) -> str:
     return str(directory)
 
 
+def mmr_siblings(commitments: list[bytes], index: int) -> list[bytes]:
+    """The proof of leaf ``index`` in the MMR over ``commitments``: its siblings up to its peak,
+    lowest first, hashed as the contract hashes -- `leaf`, `merge` -- with the peaks aligned to
+    leaf positions."""
+    leaf = lambda c: keccak(b"leaf" + c)  # noqa: E731
+    merge = lambda a, b: keccak(b"merge" + a + b)  # noqa: E731
+    n, start = len(commitments), 0
+    for h in range(63, -1, -1):
+        if n >> h & 1:
+            if index < start + (1 << h):
+                break
+            start += 1 << h
+    nodes, at, siblings = [leaf(c) for c in commitments[start : start + (1 << h)]], index - start, []
+    while len(nodes) > 1:
+        siblings.append(nodes[at ^ 1])
+        nodes, at = [merge(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)], at // 2
+    return siblings
+
+
 class Migration:
     """A plan being sent, and the addresses its deploys hand back.
 
@@ -269,7 +288,7 @@ class Migration:
                 chain_id=self.chain_id,
                 private_key=self.sender.key.hex(),
                 calls=[{"to": to, "data": bytes.fromhex(step["data"][2:])}],
-                gas_limit=STATE_WRITE_GAS,
+                gas_limit=DEPLOY_GAS if step["kind"] == "deploy" else STATE_WRITE_GAS,
             )
             assert receipt["status"] == 1, step
             if step["kind"] == "deploy":
@@ -688,6 +707,52 @@ class TestService:
 
         # And a rooted plan reconciles like any other.
         assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+    async def test_a_registry_over_the_threshold_can_load_as_leaves(
+        self, w3, chain_id, tempo, tidx, factory, service, tmp_path
+    ):
+        """`--root=mmr`: the whole file as leaves of the registry's MMR in one call, one word of
+        state, where the merkle root above is one record. Nothing lands as a record; what the
+        registry holds is the root, and that is what reconcile judges the step by."""
+        rows = [("abc", "ipfs://v1", ""), ("abc", "ipfs://v2", "approved"), ("def", "ipfs://d", "")]
+        export = staged_export(tmp_path, "docs", rows)
+        steps, plan = planned(tempo, tidx, factory, export, "--root=mmr")
+        assert [s["kind"] for s in steps] == ["deploy", "leaves"], "three rows, one call"
+
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
+        await migration.send(steps)
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+        registry = migration.deployed["docs"]
+        held = get(f"{service}/registries/{registry}/mmr")
+        assert held["root"].lower() == steps[1]["checksum"].lower(), "the root the plan committed to"
+        assert held["count"] == len(rows) and len(held["peaks"]) == 2, "three leaves: a pair and one"
+        assert json.loads(held["metadata"])["legacy"]["mode"] == "leaves", "the plan's provenance"
+        assert get(f"{service}/registries/{registry}/records")["records"] == [], "leaves are not records"
+        assert "error" in get(f"{service}/registries/{'0x' + 'ad' * 20}/mmr", expect=404)
+
+        # The point of the structure: a record added later is one more leaf, appended from what
+        # the service serves, and it proves against the new root through the one verifier.
+        later = keccak(b"a record added after the migration")
+        peaks, count = [bytes(HexBytes(p)) for p in held["peaks"]], held["count"]
+        tidx.bounded(
+            await send_call(w3, chain_id, migration.sender, registry, REG.fns.appendLeaf(later, peaks, count, b"").data)
+        )
+        after = get(f"{service}/registries/{registry}/mmr")
+        assert after["count"] == count + 1 and after["root"] != held["root"]
+
+        with gzip.open(Path(export) / "docs.jsonl.gz", "rt") as lines:
+            leaves = [keccak(line.rstrip("\n").encode()) for line in lines] + [later]
+        siblings = mmr_siblings(leaves, count)
+        root, peaks = bytes(HexBytes(after["root"])), [bytes(HexBytes(p)) for p in after["peaks"]]
+        proof = MMR_VERIFIER.fns.verify(root, later, count, siblings, peaks, after["count"])
+        assert await proof.call(w3, to=factory.verifier) is True, "the later leaf proves"
+        wrong = MMR_VERIFIER.fns.verify(root, keccak(b"another"), count, siblings, peaks, after["count"])
+        assert await wrong.call(w3, to=factory.verifier) is False
+
+        # The plan is superseded: it loaded into an empty MMR, and the MMR has moved on.
+        answer = cli(tempo, tidx, factory, "reconcile", f"--plan={plan}", expect=1)
+        assert answer["remaining"] == 0 and "MMR" in answer["divergences"][0]["detail"], answer
 
     async def test_a_step_sent_twice_is_reported_and_not_resent(self, w3, chain_id, tempo, tidx, factory, tmp_path):
         """The divergence that says a run was resumed by count rather than by chain state.
