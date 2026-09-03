@@ -84,18 +84,24 @@ class Deployed:
         return await self.read(REG.fns.versionCount(keccak(text=checksum)))
 
 
-def deployed_address(receipt, factory: str) -> str:
-    """The registry a `deployRegistry` created, out of the log that announces it.
-
-    From the log because there is no on-chain set to read it from -- and this is how any
-    consumer that is not itself a contract learns the address, a migration step included.
+def deployed_addresses(receipt, factory: str) -> list[str]:
+    """Every registry a transaction deployed, in call order, out of the log that announces
+    them: there is no on-chain set to read, and one transaction may deploy several. This is
+    how any consumer that is not itself a contract learns an address, a migration included.
     The topic comes off the ABI declaration; the event test spells it out independently.
     """
     topic0 = HexBytes(REGISTRY_FACTORY.events.RegistryDeployed.topic)
-    for log in receipt["logs"]:
-        if log["address"].lower() == factory.lower() and HexBytes(log["topics"][0]) == topic0:
-            return Web3.to_checksum_address(bytes(HexBytes(log["topics"][1]))[-20:])
-    raise AssertionError("deployRegistry emitted no RegistryDeployed")
+    return [
+        Web3.to_checksum_address(bytes(HexBytes(log["topics"][1]))[-20:])
+        for log in receipt["logs"]
+        if log["address"].lower() == factory.lower() and HexBytes(log["topics"][0]) == topic0
+    ]
+
+
+def deployed_address(receipt, factory: str) -> str:
+    """The one registry a `deployRegistry` created."""
+    (address,) = deployed_addresses(receipt, factory)
+    return address
 
 
 class Factory:

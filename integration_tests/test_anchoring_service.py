@@ -5,7 +5,9 @@ directly. These tests run *its* implementation instead, against the same oracle 
 checked by: what ``/roles`` serves is what ``hasRole`` answers. Nothing is lost by not writing
 the query twice, and these are now the only tests over the projections.
 
-Needs ``--tidx`` and the service binary; ``binary`` says what a missing one does.
+Needs ``--tidx`` and the service binary; ``binary`` says what a missing one does. Two tests
+migrate a real export where ``NVNM_EXPORT_DIR`` says it is; ``real_export`` says what they do
+without it.
 """
 
 import gzip
@@ -17,14 +19,18 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from eth_utils import keccak
 from hexbytes import HexBytes
 
+from .abi import ANCHORING, ANCHORING_ADDRESS
+from .abi import REGISTRY as REG
 from .network import _resolve_bin, free_port
 from .registry import ADMIN, EDITOR, deployed_address
-from .utils import STATE_WRITE_GAS, funded, new_account, send_calls
+from .utils import STATE_WRITE_GAS, funded, new_account, send_call, send_calls
 
 pytestmark = pytest.mark.tempo
 
@@ -89,16 +95,27 @@ def staged_export(directory, name: str, rows) -> str:
     return str(directory)
 
 
-def get(url: str, *, expect: int = 200) -> dict:
-    """A JSON GET, asserting the status. A failure here is a JSON body with an
-    ``error`` key rather than an empty result, which is the service's contract."""
+def _answer(request: urllib.request.Request, *, expect: int) -> dict:
+    """The JSON a request came back with, asserting the status. A failure is a JSON body
+    with an ``error`` key rather than an empty result, which is the service's contract."""
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 - fixed localhost URL
+        with urllib.request.urlopen(request, timeout=30) as resp:  # noqa: S310 - fixed localhost URL
             body, status = json.load(resp), resp.status
     except urllib.error.HTTPError as e:
         body, status = json.load(e), e.code
-    assert status == expect, f"{url} -> {status}: {body}"
+    assert status == expect, f"{request.full_url} -> {status}: {body}"
     return body
+
+
+def get(url: str, *, expect: int = 200) -> dict:
+    return _answer(urllib.request.Request(url), expect=expect)
+
+
+def post(url: str, body, *, expect: int = 200) -> dict:
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST"
+    )
+    return _answer(request, expect=expect)
 
 
 def records_of(base: str, registry) -> list[dict]:
@@ -151,8 +168,8 @@ def settings(tempo, tidx, factory, **env) -> dict:
 
 
 def cli(tempo, tidx, factory, *args, expect: int = 0, raw: bool = False):
-    """One projection from the command line: the JSON it printed, or its message when it
-    was asked for something it does not have. ``raw`` for a plan, which is JSON per line."""
+    """What one command printed: its JSON if it printed one, else the message it printed
+    instead -- a refusal, a missing argument. ``raw`` for a plan, which is JSON per line."""
     proc = subprocess.run(  # noqa: S603 - a binary this suite resolved itself
         [binary(), *args],
         env=settings(tempo, tidx, factory),
@@ -161,9 +178,103 @@ def cli(tempo, tidx, factory, *args, expect: int = 0, raw: bool = False):
         timeout=60,
     )
     assert proc.returncode == expect, f"{args} -> {proc.returncode}: {proc.stderr}"
-    if expect != 0:
-        return proc.stderr
-    return proc.stdout if raw else json.loads(proc.stdout)
+    if raw:
+        return proc.stdout
+    printed = proc.stdout.strip()
+    return json.loads(printed) if printed else proc.stderr
+
+
+def planned(tempo, tidx, factory, export: str, *flags) -> tuple[list[dict], Path]:
+    """A staged export's migration plan: its steps, and the file ``reconcile`` reads them
+    back from. No ``--threshold`` roots everything, which is the planner's own default."""
+    printed = cli(
+        tempo,
+        tidx,
+        factory,
+        "migrate",
+        f"--registries={export}/registries.json",
+        f"--manifest={export}/manifest.json",
+        f"--export={export}",
+        *flags,
+        raw=True,
+    )
+    plan = Path(export) / "plan.jsonl"
+    plan.write_text(printed)
+    return [json.loads(line) for line in printed.splitlines()], plan
+
+
+class Export(NamedTuple):
+    """A real export: its directory, its manifest files smallest first, its listing by name."""
+
+    dir: Path
+    files: list[dict]
+    registries: dict[str, dict]
+
+
+def real_export() -> Export:
+    """Where ``$NVNM_EXPORT_DIR`` says it is; a skip otherwise. The listing and manifest are
+    enough to plan by sha256 root; replaying needs the tranche files beside them."""
+    staged = os.environ.get("NVNM_EXPORT_DIR")
+    if not staged:
+        pytest.skip("NVNM_EXPORT_DIR is unset: no real export to migrate")
+    directory = Path(staged)
+    files = sorted(json.loads((directory / "manifest.json").read_text())["files"], key=lambda f: f["records"])
+    registries = {r["name"]: r for r in json.loads((directory / "registries.json").read_text())}
+    return Export(directory, files, registries)
+
+
+def smallest_and_largest(files: list[dict]) -> list[dict]:
+    """The three smallest registries and the largest; under four, all of them, so none is
+    named twice -- a duplicate is a listing the planner refuses."""
+    return files if len(files) <= 4 else files[:3] + files[-1:]
+
+
+def subset_of(export: Export, directory: Path, chosen: list[dict]) -> str:
+    """The export cut down to the manifest files ``chosen``, totals to match -- the planner
+    refuses a listing and manifest that disagree -- and any staged tranche linked in."""
+    directory.mkdir(parents=True, exist_ok=True)
+    listing = [export.registries[f["registry"]] for f in chosen]
+    (directory / "registries.json").write_text(json.dumps(listing))
+    totals = {"registries": len(chosen), "records": sum(f["records"] for f in chosen)}
+    (directory / "manifest.json").write_text(json.dumps({"totals": totals, "files": chosen}))
+    for f in chosen:
+        if (export.dir / f["file"]).exists():
+            link = directory / f["file"]
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(export.dir / f["file"])
+    return str(directory)
+
+
+class Migration:
+    """A plan being sent, and the addresses its deploys hand back.
+
+    Steps go in plan order because they depend on it: every step under a registry names
+    it by the name its deploy carried, and the address exists once that deploy has landed.
+    """
+
+    def __init__(self, w3, chain_id, factory, tidx, sender):
+        self.w3, self.chain_id, self.factory, self.tidx, self.sender = w3, chain_id, factory, tidx, sender
+        self.deployed: dict[str, str] = {}
+
+    async def send(self, steps):
+        """One call per transaction, then waits for the index to cover them. A step
+        ``reconcile`` hands back names its target; one straight from the plan is routed
+        by what this run has deployed so far."""
+        for step in steps:
+            to = step.get("to") or (
+                self.factory.address if step["kind"] == "deploy" else self.deployed[step["registry"]]
+            )
+            receipt = await send_calls(
+                self.w3,
+                chain_id=self.chain_id,
+                private_key=self.sender.key.hex(),
+                calls=[{"to": to, "data": bytes.fromhex(step["data"][2:])}],
+                gas_limit=STATE_WRITE_GAS,
+            )
+            assert receipt["status"] == 1, step
+            if step["kind"] == "deploy":
+                self.deployed[step["registry"]] = deployed_address(receipt, self.factory.address)
+        self.tidx.bounded(receipt)
 
 
 @contextmanager
@@ -529,54 +640,145 @@ class TestService:
         """
         rows = [("abc", "ipfs://v1", ""), ("abc", "ipfs://v2", "approved"), ("def", "ipfs://d", "")]
         export = staged_export(tmp_path, "docs", rows)
-        steps = [
-            json.loads(line)
-            for line in cli(
-                tempo,
-                tidx,
-                factory,
-                "migrate",
-                f"--registries={export}/registries.json",
-                f"--manifest={export}/manifest.json",
-                f"--export={export}",
-                "--threshold=100",
-                raw=True,
-            ).splitlines()
-        ]
+        steps, plan = planned(tempo, tidx, factory, export, "--threshold=100")
         assert [s["kind"] for s in steps] == ["deploy", "record", "record", "status", "record"]
 
-        # Sent exactly as planned, in order: the deploy names the registry the rest target.
-        creator, deployed = await funded(w3), {}
-
-        async def send(those):
-            receipt = None
-            for step in those:
-                to = factory.address if step["kind"] == "deploy" else deployed[step["registry"]]
-                receipt = await send_calls(
-                    w3,
-                    chain_id=chain_id,
-                    private_key=creator.key.hex(),
-                    calls=[{"to": to, "data": bytes.fromhex(step["data"][2:])}],
-                    gas_limit=STATE_WRITE_GAS,
-                )
-                assert receipt["status"] == 1, step
-                if step["kind"] == "deploy":
-                    deployed[step["registry"]] = deployed_address(receipt, factory.address)
-            tidx.bounded(receipt)
-
-        plan = tmp_path / "plan.jsonl"
-        plan.write_text("\n".join(json.dumps(step) for step in steps))
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
 
         # A run that stops halfway resumes from what the chain holds, never from how far it
-        # got: `addRecord` appends every time, so re-sending a landed step would leave a
-        # version too many rather than doing nothing.
-        await send(steps[:2])
+        # got. Steps still owed are not a failure -- exit 0 -- so a loop can run on the exit
+        # code and the file alone.
+        await migration.send(steps[:2])
         left = tmp_path / "left.jsonl"
-        message = cli(tempo, tidx, factory, "reconcile", f"--plan={plan}", f"--remaining={left}", expect=1)
-        assert "step(s) still to send" in message, message
-        await send([json.loads(line) for line in left.read_text().splitlines()])
+        answer = cli(tempo, tidx, factory, "reconcile", f"--plan={plan}", f"--remaining={left}")
+        assert answer == {"divergences": [], "remaining": 3}, answer
+        # What it hands back names its target -- the registry the first half deployed -- so
+        # a sender resuming needs no log of its own.
+        owed = [json.loads(line) for line in left.read_text().splitlines()]
+        assert {s["to"].lower() for s in owed} == {migration.deployed["docs"].lower()}, owed
+        await migration.send(owed)
 
-        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == []
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+    async def test_a_registry_over_the_threshold_lands_as_one_merkle_root(
+        self, w3, chain_id, tempo, tidx, factory, service, tmp_path
+    ):
+        """The planner's other half, and its default: above the threshold a whole export
+        file lands as one record -- a merkle root over its lines, under an algo naming the
+        tree, with the file it commits to in the metadata -- and none of its rows do."""
+        rows = [("abc", "ipfs://v1", ""), ("abc", "ipfs://v2", "approved"), ("def", "ipfs://d", "")]
+        export = staged_export(tmp_path, "docs", rows)
+        steps, plan = planned(tempo, tidx, factory, export)  # no --threshold: everything roots
+
+        assert [s["kind"] for s in steps] == ["deploy", "record"], "three rows, one record"
+
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
+        await migration.send(steps)
+
+        (record,) = get(f"{service}/registries/{migration.deployed['docs']}/records")["records"]
+        assert record["checksum_algo"] == "keccak256-merkle"
+        assert record["checksum"] == steps[1]["checksum"], "the root the plan committed to"
+        assert record["version"] == 1
+        # The metadata is what makes the root redeemable: it names the file it stands for.
+        legacy = json.loads(record["metadata"])["legacy"]
+        assert legacy["registry"] == "docs"
+        assert legacy["records"] == len(rows), "the rows it stands for, none of them anchored"
+        assert legacy["file"] == "docs.jsonl.gz"
+        assert record["uri"].endswith("/docs.jsonl.gz"), record["uri"]
+
+        # And a rooted plan reconciles like any other.
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+    async def test_a_step_sent_twice_is_reported_and_not_resent(self, w3, chain_id, tempo, tidx, factory, tmp_path):
+        """The divergence that says a run was resumed by count rather than by chain state.
+
+        `addRecord` appends a version every time it is called, so a re-sent step leaves the
+        record one version past what the plan writes. That is reported and *not* put in
+        `--remaining`: sending it again would only make it worse.
+        """
+        export = staged_export(tmp_path, "docs", [("abc", "ipfs://v1", "")])
+        steps, plan = planned(tempo, tidx, factory, export, "--threshold=100")
+
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
+        await migration.send(steps)
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}, (
+            "clean once"
+        )
+
+        await migration.send([s for s in steps if s["kind"] == "record"])  # the same step again
+
+        left = tmp_path / "left.jsonl"
+        answer = cli(tempo, tidx, factory, "reconcile", f"--plan={plan}", f"--remaining={left}", expect=1)
+        (divergence,) = answer["divergences"]
+        assert "a step sent twice" in divergence["detail"], divergence
+        assert answer["remaining"] == 0 and left.read_text() == "", "a version too many is not fixed by sending"
+
+    async def test_the_real_export_lands_rooted_by_the_digests_it_carries(
+        self, w3, chain_id, tempo, tidx, factory, service, tmp_path
+    ):
+        """A real listing and manifest against the real contracts: names, descriptions and
+        metadata as calldata, each file rooted by the sha256 the manifest carries, so no
+        tranche is needed. A subset, since a deploy is a transaction each: the three smallest
+        registries and the largest."""
+        export = real_export()
+        chosen = smallest_and_largest(export.files)
+        steps, plan = planned(tempo, tidx, factory, subset_of(export, tmp_path / "export", chosen), "--root=sha256")
+        assert [s["kind"] for s in steps] == ["deploy", "record"] * len(chosen)
+
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
+        await migration.send(steps)
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+        listed = {r["name"]: r for r in get(f"{service}/registries")["registries"]}
+        for f in chosen:
+            name, source = f["registry"], export.registries[f["registry"]]
+            assert listed[name]["description"] == source["description"]
+            assert listed[name]["metadata"] == source["metadata"]
+            (record,) = get(f"{service}/registries/{migration.deployed[name]}/records")["records"]
+            assert record["checksum_algo"] == "sha256"
+            assert record["checksum"].lower() == "0x" + f["sha256_uncompressed"]
+            assert json.loads(record["metadata"])["legacy"]["records"] == f["records"]
+
+    async def test_the_real_exports_rows_replay_and_its_files_root(
+        self, w3, chain_id, tempo, tidx, factory, service, tmp_path
+    ):
+        """The planner's default over the tranche files: the three smallest registries replayed
+        row by row, the largest verified against the manifest and rooted by merkle."""
+        export = real_export()
+        chosen = smallest_and_largest(export.files)
+        if len(chosen) < 4:
+            pytest.skip(f"{export.dir} has {len(chosen)} registries: too few to replay three and root one")
+        replayed, rooted = chosen[:3], chosen[3]
+        if not all((export.dir / f["file"]).exists() for f in chosen):
+            pytest.skip(f"{export.dir} holds no tranche files: nothing to replay")
+        threshold = max(f["records"] for f in replayed)
+        if rooted["records"] <= threshold:
+            pytest.skip(f"{export.dir}: no registry larger than the three replayed, nothing to root")
+        steps, plan = planned(
+            tempo, tidx, factory, subset_of(export, tmp_path / "export", chosen), f"--threshold={threshold}"
+        )
+        assert sum(s["kind"] == "deploy" for s in steps) == len(chosen)
+        assert sum(s["kind"] == "record" for s in steps) == sum(f["records"] for f in replayed) + 1, "one root"
+
+        migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
+        await migration.send(steps)
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
+
+        for f in replayed:
+            with gzip.open(export.dir / f["file"], "rt") as lines:
+                rows = {
+                    row["checksum"]: (row["uri"], row["checksumAlgo"], row["metadata"], row.get("status") or None)
+                    for row in map(json.loads, lines)
+                }
+            records = get(f"{service}/registries/{migration.deployed[f['registry']]}/records")["records"]
+            served = {r["checksum"]: (r["uri"], r["checksum_algo"], r["metadata"], r["status"]) for r in records}
+            assert served == rows, f["registry"]
+
+        (root,) = get(f"{service}/registries/{migration.deployed[rooted['registry']]}/records")["records"]
+        committed = next(s for s in steps if s["registry"] == rooted["registry"] and s["kind"] == "record")
+        assert root["checksum_algo"] == "keccak256-merkle"
+        assert root["checksum"] == committed["checksum"], "the root the plan committed to"
+        assert json.loads(root["metadata"])["legacy"]["records"] == rooted["records"]
 
     async def test_a_malformed_address_is_refused_rather_than_queried(self, service):
         # A filtered address would query a real-looking other one and answer
@@ -650,6 +852,36 @@ class TestService:
         # registry, there is no announcement that would have said it exists.
         assert get(f"{service}/records/never-anchored")["records"] == []
 
+    async def test_a_strangers_anchor_under_the_same_key_is_counted_not_served(
+        self, w3, chain_id, registry, service, tidx
+    ):
+        """A record's key derives from its checksum and nothing else, and the precompile
+        lets anyone anchor under any key — so a stranger can write at the exact key a
+        registry's record lives at, from their own namespace.
+
+        The lookup counts what does not decode as a record instead of failing on it. It
+        has to: one stranger would otherwise take the answer down for every registry
+        sharing that key, and this is the query that spans all of them.
+        """
+        creator, stranger = registry.creator, await funded(w3)
+        await registry.add_record(creator, "shared-key", uri="ipfs://mine")
+
+        key = await registry.read(REG.fns.recordKey(keccak(text="shared-key")))
+        receipt = await send_call(
+            w3,
+            chain_id,
+            stranger,
+            ANCHORING_ADDRESS,
+            ANCHORING.fns.anchor(key, b"\xee" * 32, b"not an envelope").data,
+        )
+        tidx.bounded(receipt)
+
+        answer = get(f"{service}/records/shared-key")
+        held = {r["registry"].lower(): r for r in answer["records"]}
+        assert set(held) == {registry.address.lower()}, "the stranger is not served as a record"
+        assert held[registry.address.lower()]["uri"] == "ipfs://mine"
+        assert answer["other"] == 1, "...but it is counted, since silence would hide it"
+
     async def test_an_address_the_factory_never_deployed_is_not_found(self, factory, registry, service, tidx):
         """The module's "registry 999 does not exist", restored where the log can still say it:
         an address is a registry only because the factory announced it.
@@ -663,6 +895,29 @@ class TestService:
             for path in ("records", "roles", "records/abc"):
                 assert "error" in get(f"{service}/registries/{address}/{path}", expect=404)
         assert len(roles_of(service, registry)) == 1, "...while the registry beside it answers"
+
+    async def test_several_registries_records_come_back_in_one_answer(self, w3, factory, service, tidx):
+        """The bulk form ``reconcile`` reads with: many registries in one walk.
+
+        Unnumbered, like the cross-registry lookup: a number is a walk of one registry's
+        ordering, and the caller this exists for never reads it. An address the factory
+        never announced fails the whole request by name, and no addresses is an empty
+        answer rather than a walk of every namespace there is.
+        """
+        creator = await funded(w3)
+        a = await factory.deploy(creator, "a")
+        b = await factory.deploy(creator, "b")
+        await a.add_record(creator, "in-a")
+        tidx.bounded(await b.add_record(creator, "in-b"))
+
+        answer = post(f"{service}/registries/records", [a.address, b.address])
+        held = {address.lower(): [r["checksum"] for r in records] for address, records in answer["registries"].items()}
+        assert held == {a.address.lower(): ["in-a"], b.address.lower(): ["in-b"]}, answer
+        assert all(r["number"] is None for records in answer["registries"].values() for r in records), "unnumbered"
+
+        assert post(f"{service}/registries/records", [])["registries"] == {}
+        stranger = "0x" + "ad" * 20
+        assert "error" in post(f"{service}/registries/records", [a.address, stranger], expect=404)
 
     async def test_an_empty_registry_is_an_empty_list_and_not_an_error(self, registry, service, tidx):
         tidx.bounded(registry.deployment)
