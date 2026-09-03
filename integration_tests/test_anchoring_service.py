@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -53,45 +54,47 @@ def binary() -> str:
 
 
 def staged_export(directory, name: str, rows) -> str:
-    """A mainnet-full-export subset of one registry, as the migration reads it: the tranche
-    file on disk, the manifest that has to match it byte for byte, and the registry listing."""
+    """A mainnet-full-export subset of one registry, as the migration reads it."""
+    return staged_exports(directory, {name: rows})
+
+
+def staged_exports(directory, registries: dict) -> str:
+    """An export of several registries, as the migration reads it: a tranche file per registry,
+    the manifest that has to match each byte for byte, and the listing."""
     directory.mkdir(parents=True, exist_ok=True)
-    lines = [
-        json.dumps(
+    files = []
+    for name, rows in registries.items():
+        lines = [
+            json.dumps(
+                {
+                    "registry": name,
+                    "uri": uri,
+                    "checksum": checksum,
+                    "checksumAlgo": "sha256",
+                    "metadata": "{}",
+                    "status": status,
+                }
+            )
+            for checksum, uri, status in rows
+        ]
+        content = ("\n".join(lines) + "\n").encode()
+        archive = gzip.compress(content, mtime=0)
+        (directory / f"{name}.jsonl.gz").write_bytes(archive)
+        files.append(
             {
                 "registry": name,
-                "uri": uri,
-                "checksum": checksum,
-                "checksumAlgo": "sha256",
-                "metadata": "{}",
-                "status": status,
+                "records": len(lines),
+                "file": f"{name}.jsonl.gz",
+                "tranche": 1,
+                "sha256_gz": hashlib.sha256(archive).hexdigest(),
+                "sha256_uncompressed": hashlib.sha256(content).hexdigest(),
             }
         )
-        for checksum, uri, status in rows
-    ]
-    content = ("\n".join(lines) + "\n").encode()
-    archive = gzip.compress(content, mtime=0)
-    (directory / f"{name}.jsonl.gz").write_bytes(archive)
     (directory / "registries.json").write_text(
-        json.dumps([{"name": name, "description": "the docs", "metadata": "{}"}])
+        json.dumps([{"name": name, "description": "the docs", "metadata": "{}"} for name in registries])
     )
-    (directory / "manifest.json").write_text(
-        json.dumps(
-            {
-                "totals": {"registries": 1, "records": len(lines)},
-                "files": [
-                    {
-                        "registry": name,
-                        "records": len(lines),
-                        "file": f"{name}.jsonl.gz",
-                        "tranche": 1,
-                        "sha256_gz": hashlib.sha256(archive).hexdigest(),
-                        "sha256_uncompressed": hashlib.sha256(content).hexdigest(),
-                    }
-                ],
-            }
-        )
-    )
+    totals = {"registries": len(files), "records": sum(f["records"] for f in files)}
+    (directory / "manifest.json").write_text(json.dumps({"totals": totals, "files": files}))
     return str(directory)
 
 
@@ -249,8 +252,13 @@ def mmr_siblings(commitments: list[bytes], index: int) -> list[bytes]:
     """The proof of leaf ``index`` in the MMR over ``commitments``: its siblings up to its peak,
     lowest first, hashed as the contract hashes -- `leaf`, `merge` -- with the peaks aligned to
     leaf positions."""
-    leaf = lambda c: keccak(b"leaf" + c)  # noqa: E731
-    merge = lambda a, b: keccak(b"merge" + a + b)  # noqa: E731
+
+    def leaf(c: bytes) -> bytes:
+        return keccak(b"leaf" + c)
+
+    def merge(a: bytes, b: bytes) -> bytes:
+        return keccak(b"merge" + a + b)
+
     n, start = len(commitments), 0
     for h in range(63, -1, -1):
         if n >> h & 1:
@@ -753,6 +761,30 @@ class TestService:
         # The plan is superseded: it loaded into an empty MMR, and the MMR has moved on.
         answer = cli(tempo, tidx, factory, "reconcile", f"--plan={plan}", expect=1)
         assert answer["remaining"] == 0 and "MMR" in answer["divergences"][0]["detail"], answer
+
+    async def test_a_plan_sent_batched_reconciles_clean(self, w3, chain_id, tempo, tidx, factory, tmp_path):
+        """The plan sender as an operator runs it: several registries, deploys batched three to a
+        transaction and the rest up to thirty-two, every receipt checked, reconciled clean.
+        Three registries replay and two load as leaves, so both paths go through it."""
+        one, two = [("a", "ipfs://a", "Active")], [("a", "ipfs://a", "Active"), ("b", "ipfs://b", "")]
+        export = staged_exports(tmp_path / "export", {"r0": one, "r1": one, "r2": one, "r3": two, "r4": two})
+        steps, plan = planned(tempo, tidx, factory, export, "--threshold=1", "--root=mmr")
+        kinds = {k: sum(1 for s in steps if s["kind"] == k) for k in ("deploy", "record", "status", "leaves")}
+        assert kinds == {"deploy": 5, "record": 3, "status": 3, "leaves": 2}, kinds
+
+        sender = await funded(w3)
+        argv = [sys.executable, "-m", "integration_tests.send_plan", f"--plan={plan}", f"--rpc={tempo.rpc_url}"]
+        argv += [f"--chain-id={chain_id}", f"--factory={factory.address}"]
+        env = {**os.environ, "PRIVATE_KEY": sender.key.hex()}
+        dry = subprocess.run([*argv, "--dry-run"], capture_output=True, text=True, env=env, timeout=120)  # noqa: S603
+        assert dry.returncode == 0, dry.stderr
+        assert "tx 1: 3 deploys" in dry.stdout and "tx 2: 2 deploys" in dry.stdout, dry.stdout
+        sent = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=600)  # noqa: S603
+        assert sent.returncode == 0, sent.stderr
+        assert "sent 13 steps" in sent.stdout, sent.stdout
+
+        tidx.bounded((await factory.deploy(sender, "bound")).deployment)  # a later block: the index covers the sends
+        assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
 
     async def test_a_step_sent_twice_is_reported_and_not_resent(self, w3, chain_id, tempo, tidx, factory, tmp_path):
         """The divergence that says a run was resumed by count rather than by chain state.

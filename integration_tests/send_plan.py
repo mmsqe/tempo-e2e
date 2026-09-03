@@ -20,14 +20,14 @@ from .utils import send_calls
 MAX_CALLS = 32
 GAS_CAP = 30_000_000
 BUDGET = 27_000_000  # planned per transaction, headroom under the cap
-GAS = {"deploy": 7_400_000, "first": 526_679, "later": 54_107, "status": 269_688}  # measured on a devnet
+GAS = {"deploy": 7_400_000, "first": 526_679, "later": 54_107, "status": 269_688, "leaves": 320_000}  # devnet
 
 
 def cost(step: dict) -> int:
     if step["kind"] == "deploy":
         return GAS["deploy"]
-    if step["kind"] == "status":
-        return GAS["status"]
+    if step["kind"] in ("status", "leaves"):
+        return GAS[step["kind"]]
     return GAS["first"] if step.get("version", 1) == 1 else GAS["later"]
 
 
