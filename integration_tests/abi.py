@@ -285,6 +285,8 @@ REGISTRY = Contract.from_abi(
         "event RecordAdded(bytes32 indexed checksumHash, uint256 index, string checksum,"
         " uint8 category, string dataPointer, address indexed author)",
         "event RecordStatusUpdated(bytes32 indexed checksumHash, uint256 index, string status)",
+        # A leaf holds no key, so this is the only word that any arrived.
+        "event LeavesAppended(uint256 indexed firstLeaf, uint256 appended, bytes32 root)",
         "event RoleGranted(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
         "event RoleRevoked(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
     ]

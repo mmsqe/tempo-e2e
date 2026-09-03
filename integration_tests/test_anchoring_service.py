@@ -302,6 +302,7 @@ class Migration:
             if step["kind"] == "deploy":
                 self.deployed[step["registry"]] = deployed_address(receipt, self.factory.address)
         self.tidx.bounded(receipt)
+        return receipt  # the last step's, which is the one a caller has anything to read
 
 
 @contextmanager
@@ -728,10 +729,13 @@ class TestService:
         assert [s["kind"] for s in steps] == ["deploy", "leaves"], "three rows, one call"
 
         migration = Migration(w3, chain_id, factory, tidx, await funded(w3))
-        await migration.send(steps)
+        loaded = await migration.send(steps)
         assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
 
         registry = migration.deployed["docs"]
+        # No leaf holds a key, so the log is the only word on where they landed.
+        (batch,) = REG.events.LeavesAppended.parse_logs(loaded["logs"])
+        assert (batch["args"]["firstLeaf"], batch["args"]["appended"]) == (0, len(rows)), "into an empty MMR"
         held = get(f"{service}/registries/{registry}/mmr")
         assert held["root"].lower() == steps[1]["checksum"].lower(), "the root the plan committed to"
         assert held["count"] == len(rows) and len(held["peaks"]) == 2, "three leaves: a pair and one"
@@ -743,11 +747,14 @@ class TestService:
         # the service serves, and it proves against the new root through the one verifier.
         later = keccak(b"a record added after the migration")
         peaks, count = [bytes(HexBytes(p)) for p in held["peaks"]], held["count"]
-        tidx.bounded(
-            await send_call(w3, chain_id, migration.sender, registry, REG.fns.appendLeaf(later, peaks, count, b"").data)
-        )
+        append = REG.fns.appendLeaf(later, peaks, count, b"").data
+        one = await send_call(w3, chain_id, migration.sender, registry, append)
+        tidx.bounded(one)
         after = get(f"{service}/registries/{registry}/mmr")
         assert after["count"] == count + 1 and after["root"] != held["root"]
+        (appended,) = REG.events.LeavesAppended.parse_logs(one["logs"])
+        assert (appended["args"]["firstLeaf"], appended["args"]["appended"]) == (count, 1), "on from the batch"
+        assert HexBytes(appended["args"]["root"]) == HexBytes(after["root"]), "the root the envelope serves"
 
         with gzip.open(Path(export) / "docs.jsonl.gz", "rt") as lines:
             leaves = [keccak(line.rstrip("\n").encode()) for line in lines] + [later]
