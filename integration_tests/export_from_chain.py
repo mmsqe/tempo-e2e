@@ -8,8 +8,9 @@ import argparse
 import gzip
 import hashlib
 import io
-import itertools
 import json
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -20,53 +21,93 @@ NODE = "https://rpc.nvnmchain.io"
 BINARY = "nvnmchaind"
 PAGE = 200
 WAVE = 8
-BACKOFF = (1, 2, 4, 8)
-THROTTLED = (60,) * 10
+WAITS = (1, 2, 4, 8, *[60] * 10)
+BUDGET = 12.0
+"""Seconds of node time a wave may spend together."""
 
 
-def query(what: str, *flags: str, node: str, binary: str) -> dict:
-    """One query, asked again on failure: a 503 with ``BACKOFF`` between tries, a 429 with
-    ``THROTTLED`` -- the node is asking for less, not failing, and a run of hours is worth
-    minutes of patience. Lower ``--wave`` if 429s keep coming."""
+def status_of(stderr: str) -> str:
+    """HTTP status from a failed query, if there is one."""
+    if found := re.search(r"Status: (\d{3}[^,)]*)", stderr):
+        return found.group(1)
+    return stderr.strip()[-60:]
+
+
+def query(what: str, *flags: str, node: str, binary: str) -> tuple[dict, int]:
+    """One query and how many tries it took: asked again on failure, seconds apart then a minute
+    at a time."""
     argv = [binary, "query", "anchoring", what, "--node", node, "--output", "json", *flags]
-    for attempt in itertools.count():
+    for tries, wait in enumerate((*WAITS, None), 1):
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
         if proc.returncode == 0:
-            return json.loads(proc.stdout)
-        waits = THROTTLED if "429 Too Many Requests" in proc.stderr else BACKOFF
-        if attempt >= len(waits):
+            return json.loads(proc.stdout), tries
+        if wait is None:
             break
-        if waits is THROTTLED:
-            print(f"\r{what}: 429, waiting {waits[attempt]}s", file=sys.stderr)
-        time.sleep(waits[attempt])
+        if wait >= 60:
+            print(f"\r{what} {' '.join(flags)}: {status_of(proc.stderr)}, waiting {wait}s", file=sys.stderr)
+        time.sleep(wait)
     raise RuntimeError(f"{' '.join(argv[2:])}: {proc.stderr.strip()}")
 
 
-def paged(what: str, field: str, *flags: str, node: str, binary: str, said: str = "", wave: int = WAVE) -> list[dict]:
-    """Every page of one query, a wave of offsets at a time; a short page is the end. ``said``
-    names what is being counted on stderr, so a long pull is a line that moves."""
+def paged(
+    what: str,
+    field: str,
+    *flags: str,
+    node: str,
+    binary: str,
+    said: str = "",
+    wave: int = WAVE,
+    cache: Path | None = None,
+) -> list[dict]:
+    """Every page of one query, a wave of offsets at a time; a short page is the end.
 
-    def page_at(offset: int) -> list[dict]:
-        answer = query(what, *flags, "--page-limit", str(PAGE), "--page-offset", str(offset), node=node, binary=binary)
-        return answer.get(field) or []
+    Each wave is sized to ``BUDGET`` from the slowest page before it. With ``cache``, each
+    page lands on disk as it arrives and is read back next time.
+    """
+
+    def page_at(offset: int) -> tuple[list[dict], float, bool]:
+        hit = cache / f"{offset}.json" if cache else None
+        if hit and hit.exists():
+            return json.loads(hit.read_text()), 0.0, False
+        started = time.monotonic()
+        answer, tries = query(
+            what, *flags, "--page-limit", str(PAGE), "--page-offset", str(offset), node=node, binary=binary
+        )
+        page = answer.get(field) or []
+        if hit:
+            hit.parent.mkdir(parents=True, exist_ok=True)
+            part = hit.with_suffix(".part")
+            part.write_text(json.dumps(page))
+            part.replace(hit)
+        return page, time.monotonic() - started, tries > 1
 
     collected: list[dict] = []
-    start = 0
-    with ThreadPoolExecutor(max_workers=wave) as pool:
+    start, most = 0, wave
+    with ThreadPoolExecutor(max_workers=most) as pool:
         while True:
-            for page in pool.map(page_at, range(start, start + wave * PAGE, PAGE)):
+            slowest, tripped = 0.0, False
+            for page, took, retried in pool.map(page_at, range(start, start + wave * PAGE, PAGE)):
                 collected += page
+                slowest, tripped = max(slowest, took), tripped or retried
                 if len(page) < PAGE:
                     return collected
             start += wave * PAGE
+            fits = int(BUDGET / slowest) if slowest else most
+            if tripped:
+                fits = min(fits, wave // 2)
+            wave = max(1, min(most, fits))
             if said:
-                print(f"\r{said}: {len(collected)} records...", end="", file=sys.stderr, flush=True)
+                print(f"\r{said}: {len(collected)} records, wave {wave}...", end="", file=sys.stderr, flush=True)
 
 
-def rows_of(registry_id: str, *, node: str, binary: str, said: str = "", wave: int = WAVE) -> list[dict]:
+def rows_of(
+    registry_id: str, *, node: str, binary: str, said: str = "", wave: int = WAVE, cache: Path | None = None
+) -> list[dict]:
     """One registry's records in the order the export carries them: the ids the module
     assigned, so a record's versions come oldest first. Sorted here because a wave does not."""
-    records = paged("records", "records", "--registry-id", registry_id, node=node, binary=binary, said=said, wave=wave)
+    records = paged(
+        "records", "records", "--registry-id", registry_id, node=node, binary=binary, said=said, wave=wave, cache=cache
+    )
     records.sort(key=lambda r: (int(r["record_id"]), int(r["index"])))
     return records
 
@@ -115,7 +156,7 @@ def build(
 
     With ``verify``, every file is checked against that manifest and takes its entry from it,
     path included; one already there with the manifest's digest is kept rather than pulled
-    again, which is how a run that stopped resumes.
+    again. Pages under ``.pages`` let a run resume mid-registry.
     """
     expected = {}
     if verify:
@@ -135,7 +176,8 @@ def build(
             files.append(entry)
             print(f"{where}: kept", file=sys.stderr)
             continue
-        records = rows_of(listing[name]["id"], node=node, binary=binary, said=where, wave=wave)
+        pages = out / ".pages" / listing[name]["id"]
+        records = rows_of(listing[name]["id"], node=node, binary=binary, said=where, wave=wave, cache=pages)
         archive, content = tranche(name, records)
         digests = {
             "sha256_gz": hashlib.sha256(archive).hexdigest(),
@@ -156,6 +198,7 @@ def build(
         path = out / entry["file"]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(archive)
+        shutil.rmtree(pages, ignore_errors=True)
         files.append(entry)
         verified = ", verified" if name in expected else ""
         print(f"\r{where}: {len(records)} records, {len(archive)} bytes gz{verified}", file=sys.stderr)
@@ -185,9 +228,7 @@ def main() -> None:
     parser.add_argument("--node", default=NODE, help=f"the chain to read the corpus from (default {NODE})")
     parser.add_argument("--binary", default=BINARY, help="the module's own client (default nvnmchaind)")
     parser.add_argument("--verify", type=Path, help="the export's manifest.json, to check every rebuild against")
-    parser.add_argument(
-        "--wave", type=int, default=WAVE, help=f"pages asked for at once (default {WAVE}); lower it if 429s keep coming"
-    )
+    parser.add_argument("--wave", type=int, default=WAVE, help=f"the most pages asked for at once (default {WAVE})")
     args = parser.parse_args()
     if not args.names:
         if not args.verify:
