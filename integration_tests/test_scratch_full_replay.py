@@ -26,6 +26,9 @@ BIN = S / "skip-wt/target/release/nvnmchain-anchoring"
 CHUNKS = sorted((S / "chunks").iterdir())
 PROGRESS = S / "replay-progress.jsonl"
 SENDERS = 8
+# Statuses the planner leaves out, as the corpus holds one value and it carries nothing.
+# Empty replays them too, which doubles the corpus and is the other half worth measuring.
+SKIP_STATUS = os.environ.get("REPLAY_SKIP_STATUS", "Active")
 
 
 async def test_full_replay(w3, chain_id, tempo, factory):
@@ -38,7 +41,7 @@ async def test_full_replay(w3, chain_id, tempo, factory):
     print(f"{len(accounts)} senders funded, smallest holds {min(held):,}", flush=True)
     env = {**os.environ, "PRIVATE_KEYS": ",".join(a.key.hex() for a in accounts)}
     PROGRESS.write_text("")  # the node is built fresh per run, so the file describes this run only
-    began, done_steps, done_gas, failed = time.monotonic(), 0, 0, []
+    began, done_steps, done_gas, done_bytes, failed = time.monotonic(), 0, 0, 0, []
 
     for i, chunk in enumerate(CHUNKS, 1):
         plan = S / "chunk-plan.jsonl"
@@ -52,7 +55,7 @@ async def test_full_replay(w3, chain_id, tempo, factory):
                     f"--manifest={chunk}/manifest.json",
                     "--export=/tmp/from-chain",
                     "--threshold=99999999",
-                    "--skip-status=Active",
+                    *([f"--skip-status={SKIP_STATUS}"] if SKIP_STATUS else []),
                 ],
                 stdout=fh,
                 stderr=subprocess.PIPE,
@@ -63,7 +66,9 @@ async def test_full_replay(w3, chain_id, tempo, factory):
         assert planned.returncode == 0, planned.stderr[-400:]
         with plan.open("rb") as fh:
             steps = sum(1 for _ in fh)
-        line = {"chunk": i, "of": len(CHUNKS), "steps": steps, "plan_secs": round(time.monotonic() - t0, 1)}
+        done_bytes += plan.stat().st_size
+        line = {"chunk": i, "of": len(CHUNKS), "steps": steps, "plan_bytes": plan.stat().st_size}
+        line["plan_secs"] = round(time.monotonic() - t0, 1)
 
         t0 = time.monotonic()
         argv = [sys.executable, "-m", "integration_tests.send_plan", f"--plan={plan}", f"--rpc={tempo.rpc_url}"]
@@ -79,7 +84,8 @@ async def test_full_replay(w3, chain_id, tempo, factory):
             # A chunk failing costs that chunk, not the hours before it: note it and carry on.
             failed.append(i)
             line["failed"] = sent.stderr.strip()[-200:]
-        line |= {"done_steps": done_steps, "done_gas": done_gas, "elapsed": round(time.monotonic() - began, 1)}
+        line |= {"done_steps": done_steps, "done_gas": done_gas, "done_bytes": done_bytes}
+        line["elapsed"] = round(time.monotonic() - began, 1)
         with PROGRESS.open("a") as fh:
             fh.write(json.dumps(line) + "\n")
         print(json.dumps(line), flush=True)
@@ -88,6 +94,7 @@ async def test_full_replay(w3, chain_id, tempo, factory):
     summary = {
         "steps": done_steps,
         "gas": done_gas,
+        "plan_bytes": done_bytes,
         "seconds": round(total, 1),
         "steps_per_sec": round(done_steps / total, 1),
     }
