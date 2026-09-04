@@ -85,12 +85,30 @@ def shares(steps: list[dict], keys: int) -> list[list[dict]]:
     return lots
 
 
+def records(steps: list[dict]) -> list[list[dict]]:
+    """Steps grouped by the record they touch, keeping the planner's order within a group.
+
+    One record's steps depend on each other: `updateRecordStatus` reverts unless the record
+    is already there, and a later version has to follow the earlier one to be numbered
+    right. Only steps of *different* records are free to race.
+    """
+    lots: list[list[dict]] = []
+    at: dict[tuple, int] = {}
+    for step in steps:
+        key = (step["registry"], step.get("checksum"))
+        if step.get("checksum") is None or key not in at:
+            at[key] = len(lots)
+            lots.append([])
+        lots[at[key]].append(step)
+    return lots
+
+
 def evenly(steps: list[dict], keys: int) -> list[list[dict]]:
-    """The steps dealt one at a time, ignoring registries: after the grants, any sender may
-    write any of them."""
+    """The steps dealt a record at a time, ignoring registries: after the grants, any sender
+    may write any of them."""
     lots: list[list[dict]] = [[] for _ in range(keys)]
-    for i, step in enumerate(steps):
-        lots[i % keys].append(step)
+    for i, one in enumerate(records(steps)):
+        lots[i % keys].extend(one)
     return lots
 
 
