@@ -12,19 +12,29 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from eth_account import Account
+from tempo import Signer, serialize, sign_transaction
 from web3 import AsyncWeb3
+from web3.exceptions import TransactionNotFound, Web3RPCError
 
 from .abi import REGISTRY as REG
 from .registry import EDITOR, deployed_addresses
-from .utils import send_calls
+from .utils import DEFAULT_MAX_PRIORITY_FEE_PER_GAS, build_tempo_tx, get_nonce
 
 MAX_CALLS = 32
 GAS_CAP = 30_000_000
 BUDGET = 27_000_000  # planned per transaction, headroom under the cap
 GAS = {"deploy": 7_400_000, "first": 526_679, "later": 54_107, "status": 269_688, "leaves": 320_000}  # devnet
+# Multiples of the base fee to bid. `suggested_max_fee` bids two, which a long burst outruns:
+# a full block raises the base fee 12.5%, so six of them double it. Overbidding costs only
+# balance held while the transaction is out; the base fee is burned at its actual value.
+FEE_HEADROOM = 8
+# A transaction not mined in this long is re-priced and sent again, up to this many times.
+RECEIPT_WAIT = 90.0
+ATTEMPTS = 5
 
 
 def cost(step: dict) -> int:
@@ -132,13 +142,61 @@ async def send(w3, *, chain_id: int, keys: list[str], factory: str, steps: list[
     return spent
 
 
+async def first_receipt(w3, hashes: list, timeout: float):
+    """The receipt of whichever of ``hashes`` is mined first; None if none is within ``timeout``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for tx_hash in hashes:
+            try:
+                return await w3.eth.get_transaction_receipt(tx_hash)
+            except TransactionNotFound:
+                pass
+        await asyncio.sleep(0.1)
+    return None
+
+
+async def landed(w3, *, chain_id: int, key: str, calls: list[dict]):
+    """One transaction, re-priced and sent again at the same nonce until it lands.
+
+    Priced when it is built, a transaction is left behind by a rising base fee, and then it
+    holds its sender's nonce: everything queued behind it is refused as an underpriced
+    replacement, which is how one stuck transaction stops a run. Every attempt keeps the
+    nonce and outbids the last, so the node may mine whichever it kept -- they carry the
+    same calls, and any one receipt is the answer.
+    """
+    sender = Account.from_key(key).address
+    nonce = await get_nonce(w3, sender)
+    sent, bid, tip = [], 0, 0
+    for _ in range(ATTEMPTS):
+        base = (await w3.eth.get_block("latest")).get("baseFeePerGas") or 0
+        tip = max(DEFAULT_MAX_PRIORITY_FEE_PER_GAS, tip * 2)
+        bid = max(base * FEE_HEADROOM + tip, bid * 2)
+        tx = build_tempo_tx(
+            chain_id=chain_id,
+            calls=calls,
+            nonce=nonce,
+            gas_limit=GAS_CAP,
+            max_fee_per_gas=bid,
+            max_priority_fee_per_gas=tip,
+        )
+        try:
+            sent.append(await w3.eth.send_raw_transaction(serialize(sign_transaction(tx, Signer(key)))))
+        except Web3RPCError as refused:
+            # With a bid out, a refusal is the nonce spent or a bump that fell short, and waiting
+            # on what is out answers both. With none out, there is nothing to wait for.
+            if not sent:
+                raise SystemExit(f"{sender[:10]} nonce {nonce} refused: {refused}") from None
+        receipt = await first_receipt(w3, sent, RECEIPT_WAIT)
+        if receipt is not None:
+            return receipt
+    raise SystemExit(f"{sender[:10]} nonce {nonce} never landed in {ATTEMPTS} tries")
+
+
 async def granting(w3, *, chain_id: int, key: str, payload: list[dict]) -> int:
     """The grants, batched: plain calls rather than plan steps, so `batched` does not fit."""
     spent = 0
     for i in range(0, len(payload), MAX_CALLS):
-        receipt = await send_calls(
-            w3, chain_id=chain_id, private_key=key, calls=payload[i : i + MAX_CALLS], gas_limit=GAS_CAP
-        )
+        receipt = await landed(w3, chain_id=chain_id, key=key, calls=payload[i : i + MAX_CALLS])
         if receipt["status"] != 1:
             raise SystemExit(f"granting editor reverted at {receipt['gasUsed']:,} gas")
         spent += receipt["gasUsed"]
@@ -150,7 +208,7 @@ async def stream(w3, *, chain_id: int, key: str, factory: str, steps: list[dict]
     spent = 0
     for at, batch in enumerate(batches(steps), 1):
         calls = [{"to": target(s, factory, deployed), "data": bytes.fromhex(s["data"][2:])} for s in batch]
-        receipt = await send_calls(w3, chain_id=chain_id, private_key=key, calls=calls, gas_limit=GAS_CAP)
+        receipt = await landed(w3, chain_id=chain_id, key=key, calls=calls)
         if receipt["status"] != 1:
             raise SystemExit(
                 f"tx {at} reverted at {receipt['gasUsed']:,} gas, steps {batch[0]['step']}-{batch[-1]['step']}: "
