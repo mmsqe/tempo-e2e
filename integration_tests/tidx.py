@@ -286,15 +286,30 @@ def _platform_args() -> list[str]:
     return ["--platform", TIDX_PLATFORM] if TIDX_PLATFORM else []
 
 
+DOCKER_WAITS = (1, 2, 4, 8)
+
+
+def _docker(*args: str) -> subprocess.CompletedProcess[str]:
+    """One docker command, asked again on failure over ``DOCKER_WAITS``."""
+    for wait in (*DOCKER_WAITS, None):
+        probe = subprocess.run(["docker", *args], capture_output=True, text=True)
+        if probe.returncode == 0 or wait is None:
+            return probe
+        time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
 def preflight() -> None:
     """Raise ``TidxUnavailable`` unless docker and the tidx image are both usable."""
     if shutil.which("docker") is None:
         raise TidxUnavailable("the docker CLI is not available")
-    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+    if _docker("info").returncode != 0:
         raise TidxUnavailable("the docker daemon is not running")
-    if subprocess.run(["docker", "image", "inspect", TIDX_IMAGE], capture_output=True).returncode != 0:
+    # docker's own words: only one of its failures is worth pulling for.
+    found = _docker("image", "inspect", TIDX_IMAGE)
+    if found.returncode != 0:
         raise TidxUnavailable(
-            f"tidx image {TIDX_IMAGE!r} not found locally. Pull it first:\n"
+            f"tidx image {TIDX_IMAGE!r} not usable: {found.stderr.strip()}\n"
             f"  {' '.join(['docker', 'pull', *_platform_args(), TIDX_IMAGE])}\n"
             f"(or point $TIDX_IMAGE at an image you have)"
         )
