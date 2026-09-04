@@ -192,8 +192,8 @@ def test_anchoring_precompile_installs_at_its_boundary(tmp_path):
     assert ANCHORING_ADDRESS.lower() not in {a.lower() for a in _read_alloc(node.genesis)}, (
         "anchoring must not be in the alloc; it is installed at the boundary"
     )
-    # `latest` on a never-anchored key: a zero word from a precompile, nothing from an account.
-    probe = {"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.latest(ANCHORING_ADDRESS, b"\x00" * 32).data}
+    # `root` of a namespace that never appended: a zero word from a precompile, nothing from an account.
+    probe = {"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.root(ANCHORING_ADDRESS).data}
 
     forks = xtask_forks()
     with _running(node) as w3:

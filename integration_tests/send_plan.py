@@ -27,7 +27,10 @@ from .utils import DEFAULT_MAX_PRIORITY_FEE_PER_GAS, build_tempo_tx, get_nonce
 MAX_CALLS = 32
 GAS_CAP = 30_000_000
 BUDGET = 27_000_000  # planned per transaction, headroom under the cap
-GAS = {"deploy": 7_400_000, "first": 526_679, "later": 54_107, "status": 269_688, "leaves": 320_000}  # devnet
+GAS = {"deploy": 5_500_000, "first": 330_000, "later": 60_000, "status": 300_000}  # devnet
+# A `leaves` step is mostly state: the precompile creates a slot per chunk, each a peak, and
+# one for the count -- TIP-1000's 250k each -- plus the call itself.
+FRESH_SLOT, LEAVES_CALL = 250_000, 80_000
 # Multiples of the base fee to bid. `suggested_max_fee` bids two, which a long burst outruns:
 # a full block raises the base fee 12.5%, so six of them double it. Overbidding costs only
 # balance held while the transaction is out; the base fee is burned at its actual value.
@@ -38,10 +41,20 @@ ATTEMPTS = 5
 
 
 def cost(step: dict) -> int:
+    """What a step is planned at. A leaf may also open a peak height at `FRESH_SLOT`, which is
+    not in these figures: that happens `log2(n)` times over a namespace's life, so at most six
+    times in a transaction of `MAX_CALLS`, and the gap between `BUDGET` and `GAS_CAP` covers it.
+    """
     if step["kind"] == "deploy":
         return GAS["deploy"]
-    if step["kind"] in ("status", "leaves"):
-        return GAS[step["kind"]]
+    if step["kind"] == "leaves":
+        # `appendLeaves(bytes32[] chunkRoots, …)`: the roots' length word sits right after the
+        # three-word head, so the chunk count is read off the calldata rather than guessed.
+        data = bytes.fromhex(step["data"][2:])
+        chunks = int.from_bytes(data[4 + 96 : 4 + 128], "big")
+        return FRESH_SLOT * (chunks + 1) + LEAVES_CALL
+    if step["kind"] == "status":
+        return GAS["status"]
     return GAS["first"] if step.get("version", 1) == 1 else GAS["later"]
 
 

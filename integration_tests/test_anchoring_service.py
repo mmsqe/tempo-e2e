@@ -27,8 +27,9 @@ import pytest
 from eth_utils import keccak
 from hexbytes import HexBytes
 
-from .abi import ANCHORING, ANCHORING_ADDRESS, MMR_VERIFIER
+from .abi import MMR_VERIFIER
 from .abi import REGISTRY as REG
+from .anchoring import batches_of, leaves_of
 from .network import _resolve_bin, free_port
 from .registry import ADMIN, EDITOR, deployed_address
 from .utils import DEPLOY_GAS, STATE_WRITE_GAS, funded, new_account, send_call, send_calls
@@ -720,8 +721,8 @@ class TestService:
     async def test_a_registry_over_the_threshold_can_load_as_leaves(
         self, w3, chain_id, tempo, tidx, factory, service, tmp_path
     ):
-        """`--root=mmr`: the whole file as leaves of the registry's MMR in one call, one word of
-        state, where the merkle root above is one record. Nothing lands as a record; what the
+        """`--root=mmr`: the whole file as leaves of the registry's MMR in one call, the bulk
+        anchor, where the merkle root above is one record. Nothing lands as a record; what the
         registry holds is the root, and that is what reconcile judges the step by."""
         rows = [("abc", "ipfs://v1", ""), ("abc", "ipfs://v2", "approved"), ("def", "ipfs://d", "")]
         export = staged_export(tmp_path, "docs", rows)
@@ -733,28 +734,31 @@ class TestService:
         assert cli(tempo, tidx, factory, "reconcile", f"--plan={plan}") == {"divergences": [], "remaining": 0}
 
         registry = migration.deployed["docs"]
-        # No leaf holds a key, so the log is the only word on where they landed.
-        (batch,) = REG.events.LeavesAppended.parse_logs(loaded["logs"])
-        assert (batch["args"]["firstLeaf"], batch["args"]["appended"]) == (0, len(rows)), "into an empty MMR"
+        # No leaf holds a key, so the precompile's log is the only word on where they landed.
+        (batch,) = batches_of(loaded)
+        assert (batch.namespace.lower(), batch.first, batch.count) == (registry.lower(), 0, len(rows)), (
+            "into an empty MMR"
+        )
         held = get(f"{service}/registries/{registry}/mmr")
         assert held["root"].lower() == steps[1]["checksum"].lower(), "the root the plan committed to"
         assert held["count"] == len(rows) and len(held["peaks"]) == 2, "three leaves: a pair and one"
         assert json.loads(held["metadata"])["legacy"]["mode"] == "leaves", "the plan's provenance"
-        assert get(f"{service}/registries/{registry}/records")["records"] == [], "leaves are not records"
+        listing = get(f"{service}/registries/{registry}/records")
+        assert listing["records"] == [] and listing["other"] == 0, "leaves are not records, and not leaves either"
         assert "error" in get(f"{service}/registries/{'0x' + 'ad' * 20}/mmr", expect=404)
 
-        # The point of the structure: a record added later is one more leaf, appended from what
-        # the service serves, and it proves against the new root through the one verifier.
+        # The point of the structure: a record added later is one more leaf, with nothing to
+        # carry from the batch, and it proves against the new root through the one verifier.
         later = keccak(b"a record added after the migration")
-        peaks, count = [bytes(HexBytes(p)) for p in held["peaks"]], held["count"]
-        append = REG.fns.appendLeaf(later, peaks, count, b"").data
-        one = await send_call(w3, chain_id, migration.sender, registry, append)
+        count = held["count"]
+        one = await send_call(w3, chain_id, migration.sender, registry, REG.fns.appendLeaf(later, b"").data)
         tidx.bounded(one)
         after = get(f"{service}/registries/{registry}/mmr")
         assert after["count"] == count + 1 and after["root"] != held["root"]
-        (appended,) = REG.events.LeavesAppended.parse_logs(one["logs"])
-        assert (appended["args"]["firstLeaf"], appended["args"]["appended"]) == (count, 1), "on from the batch"
-        assert HexBytes(appended["args"]["root"]) == HexBytes(after["root"]), "the root the envelope serves"
+        (appended,) = leaves_of(one)
+        assert (appended.index, appended.commitment) == (count, later), "on from the batch"
+        assert HexBytes(appended.root) == HexBytes(after["root"]), "the root the event carries is served"
+        assert get(f"{service}/registries/{registry}/records")["other"] == 1, "a bare leaf, counted"
 
         with gzip.open(Path(export) / "docs.jsonl.gz", "rt") as lines:
             leaves = [keccak(line.rstrip("\n").encode()) for line in lines] + [later]
@@ -770,9 +774,13 @@ class TestService:
         assert answer["remaining"] == 0 and "MMR" in answer["divergences"][0]["detail"], answer
 
     async def test_a_plan_sent_batched_reconciles_clean(self, w3, chain_id, tempo, tidx, factory, tmp_path):
-        """The plan sender as an operator runs it: several registries, deploys batched three to a
+        """The plan sender as an operator runs it: several registries, deploys batched four to a
         transaction and the rest up to thirty-two, every receipt checked, reconciled clean.
-        Three registries replay and two load as leaves, so both paths go through it."""
+        Three registries replay and two load as leaves, so both paths go through it.
+
+        Four rather than three since the MMR left the contract: a registry deploys at about
+        5.4M where it cost 7.4M, so one more fits under the sender's per-transaction budget.
+        """
         one, two = [("a", "ipfs://a", "Active")], [("a", "ipfs://a", "Active"), ("b", "ipfs://b", "")]
         export = staged_exports(tmp_path / "export", {"r0": one, "r1": one, "r2": one, "r3": two, "r4": two})
         steps, plan = planned(tempo, tidx, factory, export, "--threshold=1", "--root=mmr")
@@ -785,7 +793,7 @@ class TestService:
         env = {**os.environ, "PRIVATE_KEY": sender.key.hex()}
         dry = subprocess.run([*argv, "--dry-run"], capture_output=True, text=True, env=env, timeout=120)  # noqa: S603
         assert dry.returncode == 0, dry.stderr
-        assert "tx 1: 3 deploys" in dry.stdout and "tx 2: 2 deploys" in dry.stdout, dry.stdout
+        assert "tx 1: 4 deploys" in dry.stdout and "tx 2: 1 deploys" in dry.stdout, dry.stdout
         sent = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=600)  # noqa: S603
         assert sent.returncode == 0, sent.stderr
         assert "sent 13 steps" in sent.stdout, sent.stdout
@@ -892,8 +900,8 @@ class TestService:
             assert "error" in body, body
 
     async def test_a_records_versions_come_back_from_the_log(self, registry, service, tidx):
-        """History is the half of a record the chain does not keep: state is one word per key,
-        so every version but the newest exists only as the log row the head replaced.
+        """History is the half of a record the chain does not keep as such: every version is a
+        leaf, and the listing shows the newest.
 
         Each version carries its own envelope, so the fields differ down the list -- and the
         status here is the one the listing cannot show, against a version no longer current.
@@ -913,6 +921,7 @@ class TestService:
         assert [v["metadata"] for v in versions] == ['{"v":1}', '{"v":2}']
         assert [v["status"] for v in versions] == ["approved", None], "each version's own"
         assert versions[0]["block_num"] <= versions[1]["block_num"]
+        assert [v["leaf"] for v in versions] == [0, 2], "the leaf each version is; the status between them"
 
         # The listing still answers at the head, and the two agree on which that is -- and on
         # the number, which both pay a walk of the registry's ordering for.
@@ -926,9 +935,9 @@ class TestService:
     async def test_one_checksum_answers_across_every_registry(self, w3, factory, service, tidx):
         """The lookup no per-registry path can serve: the module's `records(0, checksum, …)`.
 
-        A record's key derives from its checksum and nothing else, so the same checksum in two
-        registries is one key under two namespaces, kept apart by the address each was anchored
-        under. The status is anchored in one of them only, so a fold across namespaces shows.
+        `RecordAdded` indexes the checksum hash, so the same checksum in two registries is one
+        topic under two emitters, kept apart by the address each was added under. The status is
+        set in one of them only, so a fold across registries shows.
         """
         # A checksum of this test's own: the lookup is over the whole chain rather than one
         # factory's registries, so anything else anchoring the same one is a real answer.
@@ -943,7 +952,7 @@ class TestService:
 
         answer = get(f"{service}/records/{checksum}")
         assert HexBytes(answer["checksum_hash"]) == HexBytes(keccak(text=checksum))
-        assert answer["other"] == 0, "nothing else is anchored under this key"
+        assert answer["other"] == 0, "every RecordAdded has its leaf beside it"
 
         held = {r["registry"].lower(): r for r in answer["records"]}
         assert set(held) == {a.address.lower(), b.address.lower()}, held
@@ -956,35 +965,28 @@ class TestService:
         # registry, there is no announcement that would have said it exists.
         assert get(f"{service}/records/never-anchored")["records"] == []
 
-    async def test_a_strangers_anchor_under_the_same_key_is_counted_not_served(
-        self, w3, chain_id, registry, service, tidx
-    ):
-        """A record's key derives from its checksum and nothing else, and the precompile
-        lets anyone anchor under any key — so a stranger can write at the exact key a
-        registry's record lives at, from their own namespace.
+    async def test_a_bare_leaf_beside_the_records_is_counted_not_served(self, w3, chain_id, registry, service, tidx):
+        """A registry-scoped writer may append a leaf committing to anything -- a record that
+        lives off-chain -- and it sits among the record leaves in the same MMR.
 
-        The lookup counts what does not decode as a record instead of failing on it. It
-        has to: one stranger would otherwise take the answer down for every registry
-        sharing that key, and this is the query that spans all of them.
+        The projections count what does not decode as a record instead of failing on it,
+        and say so: a listing that silently dropped a leaf would look like a registry with
+        fewer leaves than it has.
         """
-        creator, stranger = registry.creator, await funded(w3)
+        creator = registry.creator
         await registry.add_record(creator, "shared-key", uri="ipfs://mine")
+        bare = REG.fns.appendLeaf(b"\xee" * 32, b"not an envelope").data
+        tidx.bounded(await send_call(w3, chain_id, creator, registry.address, bare))
 
-        key = await registry.read(REG.fns.recordKey(keccak(text="shared-key")))
-        receipt = await send_call(
-            w3,
-            chain_id,
-            stranger,
-            ANCHORING_ADDRESS,
-            ANCHORING.fns.anchor(key, b"\xee" * 32, b"not an envelope").data,
-        )
-        tidx.bounded(receipt)
+        listing = get(f"{service}/registries/{registry.address}/records")
+        assert [r["checksum"] for r in listing["records"]] == ["shared-key"], "the bare leaf is not a record"
+        assert listing["other"] == 1, "...but it is counted, since silence would hide it"
 
         answer = get(f"{service}/records/shared-key")
         held = {r["registry"].lower(): r for r in answer["records"]}
-        assert set(held) == {registry.address.lower()}, "the stranger is not served as a record"
+        assert set(held) == {registry.address.lower()}
         assert held[registry.address.lower()]["uri"] == "ipfs://mine"
-        assert answer["other"] == 1, "...but it is counted, since silence would hide it"
+        assert answer["other"] == 0, "no RecordAdded without its leaf"
 
     async def test_an_address_the_factory_never_deployed_is_not_found(self, factory, registry, service, tidx):
         """The module's "registry 999 does not exist", restored where the log can still say it:
