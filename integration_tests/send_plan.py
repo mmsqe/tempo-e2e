@@ -38,6 +38,9 @@ FEE_HEADROOM = 8
 # A transaction not mined in this long is re-priced and sent again, up to this many times.
 RECEIPT_WAIT = 90.0
 ATTEMPTS = 5
+# How long to wait between asking whether a receipt has landed. A send costs one round trip
+# plus however long this sleeps, so against a 10ms chain the default of 100ms *is* the rate.
+RECEIPT_POLL = float(os.environ.get("RECEIPT_POLL", "0.02"))
 
 
 def cost(step: dict) -> int:
@@ -182,7 +185,7 @@ async def first_receipt(w3, hashes: list, timeout: float):
                 return await w3.eth.get_transaction_receipt(tx_hash)
             except TransactionNotFound:
                 pass
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(RECEIPT_POLL)
     return None
 
 
