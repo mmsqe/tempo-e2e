@@ -29,7 +29,7 @@ from hexbytes import HexBytes
 
 from .abi import MMR_VERIFIER
 from .abi import REGISTRY as REG
-from .anchoring import batches_of, leaves_of
+from .anchoring import batches_of, hash_leaf, hash_merge, leaves_of
 from .network import _resolve_bin, free_port
 from .registry import ADMIN, EDITOR, deployed_address
 from .utils import DEPLOY_GAS, STATE_WRITE_GAS, funded, new_account, send_call, send_calls
@@ -251,25 +251,17 @@ def subset_of(export: Export, directory: Path, chosen: list[dict]) -> str:
 
 def mmr_siblings(commitments: list[bytes], index: int) -> list[bytes]:
     """The proof of leaf ``index`` in the MMR over ``commitments``: its siblings up to its peak,
-    lowest first, hashed as the contract hashes -- `leaf`, `merge` -- with the peaks aligned to
-    leaf positions."""
-
-    def leaf(c: bytes) -> bytes:
-        return keccak(b"leaf" + c)
-
-    def merge(a: bytes, b: bytes) -> bytes:
-        return keccak(b"merge" + a + b)
-
+    lowest first, hashed as the precompile hashes, with the peaks aligned to leaf positions."""
     n, start = len(commitments), 0
     for h in range(63, -1, -1):
         if n >> h & 1:
             if index < start + (1 << h):
                 break
             start += 1 << h
-    nodes, at, siblings = [leaf(c) for c in commitments[start : start + (1 << h)]], index - start, []
+    nodes, at, siblings = [hash_leaf(c) for c in commitments[start : start + (1 << h)]], index - start, []
     while len(nodes) > 1:
         siblings.append(nodes[at ^ 1])
-        nodes, at = [merge(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)], at // 2
+        nodes, at = [hash_merge(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)], at // 2
     return siblings
 
 
