@@ -360,7 +360,8 @@ class TestRefusedCalls:
         assert await succeeds(A.fns.root(anchorer.address).data), "root must serve a staticcall"
         assert await succeeds(A.fns.state(anchorer.address).data), "state must serve a staticcall"
         assert not await succeeds(A.fns.appendLeaf(c(2), b"").data), "appendLeaf must refuse one"
-        assert not await succeeds(A.fns.appendLeaves([], [], b"").data), "appendLeaves must refuse one"
+        # One aligned chunk: an empty batch is refused in any frame, so it would prove nothing.
+        assert not await succeeds(A.fns.appendLeaves([hash_leaf(c(2))], [0], b"").data), "appendLeaves must refuse one"
 
         assert await root(w3, anchorer.address) == ROOTS[0], "the MMR is untouched"
 
