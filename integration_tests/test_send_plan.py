@@ -1,10 +1,45 @@
 """How a plan is dealt across senders. Pure functions, so no chain and no fixtures."""
 
-from .send_plan import evenly, shares
+from .send_plan import BUDGET, BYTES_BUDGET, CALL_OVERHEAD, GAS, MAX_CALLS, batched, evenly, shares
 
 
 def record(registry, checksum, version=1):
     return {"kind": "record", "registry": registry, "checksum": checksum, "version": version}
+
+
+def sized(kind, calldata_bytes, **fields):
+    """A step carrying `calldata_bytes` of data, for what the batching weighs."""
+    return {"kind": kind, "registry": "r", "data": "0x" + "00" * calldata_bytes, **fields}
+
+
+def test_records_fill_a_transaction_to_the_call_cap():
+    """A first version is cheap enough that the gas budget would take eighty-odd, but the pool
+    refuses a transaction past `MAX_AA_CALLS`, so the cap is what bounds the batch."""
+    plan = [sized("record", 500, checksum=str(i), version=1) for i in range(300)]
+    lots = list(batched(plan))
+    assert BUDGET // GAS["first"] > MAX_CALLS, "gas would not be what binds"
+    assert len(lots[0]) == MAX_CALLS
+    assert all(len(lot) * GAS["first"] <= BUDGET for lot in lots)
+    assert sum(len(lot) for lot in lots) == 300
+
+
+def test_statuses_fill_a_transaction_to_the_call_cap():
+    """A status is cheap in both gas and calldata, so neither budget is what stops the batch."""
+    plan = [sized("status", 230, checksum=str(i), version=1, status="Active") for i in range(2000)]
+    lots = list(batched(plan))
+    assert BYTES_BUDGET // (230 + CALL_OVERHEAD) > MAX_CALLS, "calldata would not be what binds"
+    assert len(lots[0]) == MAX_CALLS
+    assert sum(len(lot) for lot in lots) == 2000
+
+
+def test_deploys_are_bound_by_gas_below_the_cap():
+    """The one step the budget still bounds: a deploy is dear enough that a transaction fills
+    on gas well before it reaches the call cap, which is what keeps `BUDGET` load-bearing."""
+    plan = [sized("deploy", 500, registry=str(i)) for i in range(60)]
+    lots = list(batched(plan))
+    assert len(lots[0]) == BUDGET // GAS["deploy"] < MAX_CALLS
+    assert all(len(lot) * GAS["deploy"] <= BUDGET for lot in lots)
+    assert sum(len(lot) for lot in lots) == 60
 
 
 def status(registry, checksum, version=1):

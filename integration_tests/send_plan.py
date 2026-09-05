@@ -24,13 +24,24 @@ from .abi import REGISTRY as REG
 from .registry import EDITOR, deployed_addresses
 from .utils import DEFAULT_MAX_PRIORITY_FEE_PER_GAS, build_tempo_tx, get_nonce
 
+# The most calls one transaction carries. The pool sets this, not us: `MAX_AA_CALLS` in
+# tempo's crates/transaction-pool/src/validator.rs, which refuses a 33rd outright. It is
+# what binds for everything but deploys, however much room the budgets below leave.
+# The pool refuses a 33rd call outright -- `MAX_AA_CALLS` in tempo's transaction-pool
+# validator -- so this binds for everything but deploys, whatever the budgets below allow.
 MAX_CALLS = 32
 GAS_CAP = 30_000_000
 BUDGET = 27_000_000  # planned per transaction, headroom under the cap
-GAS = {"deploy": 5_500_000, "first": 330_000, "later": 60_000, "status": 300_000}  # devnet
+# What a step costs, measured on the devnet over the corpus: a first version creates its
+# version-count slot, a later one and a status only append a leaf, at 34k and 21k.
+GAS = {"deploy": 5_500_000, "first": 330_000, "later": 60_000, "status": 30_000}
 # A `leaves` step is mostly state: the precompile creates a slot per chunk, each a peak, and
 # one for the count -- TIP-1000's 250k each -- plus the call itself.
 FRESH_SLOT, LEAVES_CALL = 250_000, 80_000
+# The pool also refuses a transaction past its input limit, 128 KiB by reth's default. Thirty-two
+# of the corpus's largest records come to 81 KiB, so this only guards the batch that would run
+# past it; `MAX_CALLS` is what fills a transaction in practice.
+BYTES_BUDGET, CALL_OVERHEAD = 96 * 1024, 64
 # Multiples of the base fee to bid. `suggested_max_fee` bids two, which a long burst outruns:
 # a full block raises the base fee 12.5%, so six of them double it. Overbidding costs only
 # balance held while the transaction is out; the base fee is burned at its actual value.
@@ -45,8 +56,8 @@ RECEIPT_POLL = float(os.environ.get("RECEIPT_POLL", "0.02"))
 
 def cost(step: dict) -> int:
     """What a step is planned at. A leaf may also open a peak height at `FRESH_SLOT`, which is
-    not in these figures: that happens `log2(n)` times over a namespace's life, so at most six
-    times in a transaction of `MAX_CALLS`, and the gap between `BUDGET` and `GAS_CAP` covers it.
+    not in these figures: it happens `log2(n)` times over a namespace's life, and the headroom
+    in these costs plus the gap between `BUDGET` and `GAS_CAP` covers it.
     """
     if step["kind"] == "deploy":
         return GAS["deploy"]
@@ -61,15 +72,24 @@ def cost(step: dict) -> int:
     return GAS["first"] if step.get("version", 1) == 1 else GAS["later"]
 
 
+def size(step: dict) -> int:
+    """The calldata a step puts in a transaction, with the envelope around one call."""
+    return len(step["data"]) // 2 - 1 + CALL_OVERHEAD
+
+
 def batched(steps: list[dict]):
-    """Steps grouped into transactions, by both limits at once."""
-    batch, planned = [], 0
+    """Steps grouped into transactions, by every limit at once. The call cap is what fills one
+    in practice; the gas budget bounds deploys, which are dear enough to fill one first, and the
+    calldata budget guards a batch of unusually large records."""
+    batch, planned, carried = [], 0, 0
     for step in steps:
-        if batch and (len(batch) == MAX_CALLS or planned + cost(step) > BUDGET):
+        full = len(batch) == MAX_CALLS or planned + cost(step) > BUDGET or carried + size(step) > BYTES_BUDGET
+        if batch and full:
             yield batch
-            batch, planned = [], 0
+            batch, planned, carried = [], 0, 0
         batch.append(step)
         planned += cost(step)
+        carried += size(step)
     if batch:
         yield batch
 
