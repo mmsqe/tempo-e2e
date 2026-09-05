@@ -5,6 +5,7 @@ from web3 import AsyncWeb3
 from web3.exceptions import Web3RPCError
 
 from .abi import ANCHORING, ANCHORING_ADDRESS
+from .anchoring import hash_leaf
 from .network import dev_node
 from .utils import fund, new_account, send_call
 
@@ -38,11 +39,11 @@ class TestUnclaimedChainId:
 
             signer = new_account()
             await fund(w3, signer.address)
-            key, commitment = b"\x11" * 32, b"\x22" * 32
-            anchor = ANCHORING.fns.anchor(key, commitment, b"").data
+            commitment = b"\x22" * 32
+            anchor = ANCHORING.fns.appendLeaf(commitment, b"").data
             await send_call(w3, UNCLAIMED_CHAIN_ID, signer, ANCHORING_ADDRESS, anchor)
-            read = ANCHORING.fns.latest(signer.address, key)
-            assert bytes(await read.call(w3, to=ANCHORING_ADDRESS)) == commitment
+            read = ANCHORING.fns.root(signer.address)
+            assert bytes(await read.call(w3, to=ANCHORING_ADDRESS)) == hash_leaf(commitment), "one leaf is its own root"
 
             # Signed one id over, the same write has to bounce.
             with pytest.raises(Web3RPCError, match="chain ID"):

@@ -1,9 +1,9 @@
-"""Registry contracts over JSON-RPC: scoped RBAC, anchoring into the precompile.
+"""Registry contracts over JSON-RPC: scoped RBAC, leaves in the precompile's MMR.
 
 One contract per registry, deployed by a factory; a record is ``keccak256(checksum)``, not an
-assigned id. The contract stores only role membership and a version count per record, and anchors
-under *its own address*, so the precompile's caller partition is what keeps registries apart --
-there is no registryId in any key, mapping or envelope.
+assigned id. The contract stores only role membership and a version count per record, and
+appends under *its own address*, so the precompile's caller partition is what keeps registries
+apart -- there is no registryId in any mapping or envelope.
 
 Roles are registry- or record-scoped (one checksum) over ``admin`` and ``editor``, and the
 owner may grant a registry ``admin`` without holding one. Role changes are not anchored:
@@ -18,7 +18,7 @@ from web3 import Web3
 
 from .abi import REGISTRY as REG
 from .abi import REGISTRY_FACTORY
-from .anchoring import anchored_logs, decode_payload, latest
+from .anchoring import append_logs, decode_leaf, leaf_logs, root, state
 from .registry import ADMIN, EDITOR, RECORD_CATEGORY, REGISTRY_SCOPE, add_record_call
 from .utils import (
     STATE_WRITE_GAS,
@@ -52,9 +52,9 @@ EMPTY_URI = error_selector("EmptyUri()")
 # resolve -- a migrated caller must not quietly grant or revoke `admin`.
 RETIRED_ROLES = {"viewer": b"viewer", "empty": b"", "unknown": b"root"}
 
-# The envelopes a registry anchors, field by field. Both lead with their kind, so an indexer
-# classifies a payload from the log alone, and the id in both is the checksum hash -- the
-# registry is the address it was anchored under, not a field. Both end with the account that
+# The envelopes a registry commits to, field by field. Both lead with their kind, so an indexer
+# classifies a leaf's payload from the log alone, and the id in both is the checksum hash -- the
+# registry is the namespace it was appended under, not a field. Both end with the account that
 # caused the change, because the precompile's caller is the registry contract, then a
 # discriminator keeping two otherwise identical payloads apart.
 #
@@ -108,20 +108,21 @@ def assert_event(receipt, emitter, signature: str, *, indexed: list, types: list
     raise AssertionError(f"{signature} not emitted by {emitter}")
 
 
-async def envelopes(w3, registry, key, kind, *, from_block=0):
-    """Envelopes anchored under ``key``, in log order, as ``(commitment, fields)`` pairs.
+async def envelopes(w3, registry, kind, checksum_hash, *, from_block=0):
+    """The ``kind`` envelopes for one record among the registry's leaves, in log order, as
+    ``(commitment, fields)`` pairs.
 
-    Checks what holds for every kind on the way past: each commitment hashes its own payload,
-    and the payload leads with the kind it was keyed under.
+    Checks what holds for every record leaf on the way past: the commitment hashes its own
+    payload, and the payload leads with its kind.
     """
     schema = ENVELOPE[kind]
     out = []
-    for lg in await anchored_logs(w3, registry.address, key=key, from_block=from_block):
-        commitment, payload = decode_payload(lg["data"])
-        assert keccak(payload) == commitment, "anchorAndHash makes each event self-verifying"
-        fields = dict(zip(schema, decode(list(schema.values()), payload)))
-        assert fields["kind"] == KINDS[kind], f"envelope under {HexBytes(key).hex()} is not a {kind}"
-        out.append((commitment, fields))
+    for lg in await leaf_logs(w3, registry.address, from_block=from_block):
+        commitment, _, _, payload = decode_leaf(lg["data"])
+        if payload[:32] != KINDS[kind] or payload[32:64] != checksum_hash:
+            continue
+        assert keccak(payload) == commitment, "a record leaf is self-verifying"
+        out.append((commitment, dict(zip(schema, decode(list(schema.values()), payload)))))
     return out
 
 
@@ -167,21 +168,18 @@ class TestDeployment:
         assert EMPTY_NAME in err, err
 
     async def test_registries_are_separate_namespaces_in_the_log(self, w3, factory):
-        """The whole design in one assertion: two registries, the same key, their own heads."""
+        """The whole design in one assertion: two registries, the same checksum, their own MMRs."""
         creator = await funded(w3)
         a = await factory.deploy(creator, "a")
         b = await factory.deploy(creator, "b")
-        # The same checksum in both, so the same key -- it derives from the checksum and
-        # nothing else. Differing uris keep the payloads, and so the heads, apart.
+        # The same checksum in both; differing uris keep the leaves, and so the roots, apart.
         await a.add_record(creator, "shared", uri="ipfs://in-a")
         await b.add_record(creator, "shared", uri="ipfs://in-b")
 
-        key = await a.read(REG.fns.recordKey(keccak(text="shared")))
-        assert bytes(key) == bytes(await b.read(REG.fns.recordKey(keccak(text="shared")))), "the same key..."
-        head_a = await latest(w3, a.address, key)
-        head_b = await latest(w3, b.address, key)
-        assert head_a != b"\x00" * 32 and head_b != b"\x00" * 32
-        assert head_a != head_b, "...each holding its own head, because the caller partitions"
+        root_a, root_b = await root(w3, a.address), await root(w3, b.address)
+        assert root_a != b"\x00" * 32 and root_b != b"\x00" * 32
+        assert root_a != root_b, "each holding its own MMR, because the caller partitions"
+        assert bytes(await a.read(REG.fns.mmrRoot())) == root_a, "and reads its own back"
 
 
 class TestRecords:
@@ -221,10 +219,10 @@ class TestRecords:
         assert err, "a category past the enum must revert"
 
     async def test_update_record_status_is_idempotent_on_chain(self, w3, registry):
-        """The envelope's sequence number keeps repeated status writes clear of the no-op rule.
+        """The envelope's sequence number keeps repeated status writes distinct leaves.
 
-        A moved head would also pass if the second write were dropped, so the test reads ``seq``
-        out of both envelopes.
+        A moved root would also pass if the repeat committed to the same bytes, so the test
+        reads ``seq`` out of both envelopes.
         """
         creator, checksum_hash = registry.creator, keccak(text="abc")
         await registry.add_record(creator, "abc")
@@ -232,11 +230,11 @@ class TestRecords:
         await registry.set_status(creator, "abc", 1, "redacted")
         await registry.set_status(creator, "abc", 1, "redacted")
 
-        key = await registry.read(REG.fns.statusKey(checksum_hash, 1))
-        assert await latest(w3, registry.address, key) != b"\x00" * 32
+        count, _ = await state(w3, registry.address)
+        assert count == 3, "one record and two statuses"
 
-        anchored = [f for _, f in await envelopes(w3, registry, key, "STATUS")]
-        assert len(anchored) == 2, "the identical repeat anchors again rather than reverting"
+        anchored = [f for _, f in await envelopes(w3, registry, "STATUS", checksum_hash)]
+        assert len(anchored) == 2, "the identical repeat is a leaf of its own"
         for fields in anchored:
             assert (fields["checksum_hash"], fields["index"], fields["status"]) == (checksum_hash, 1, "redacted")
         assert anchored[1]["seq"] > anchored[0]["seq"], "seq is what makes the payloads differ"
@@ -389,24 +387,24 @@ class TestRoles:
 
 
 class TestAnchoredLog:
-    async def test_anchors_land_in_the_precompile(self, w3, registry):
-        """A registry's writes are real anchors: a new version moves the head."""
-        creator, checksum_hash = registry.creator, keccak(text="abc")
+    async def test_records_land_as_leaves_of_the_precompile(self, w3, registry):
+        """A registry's writes are real leaves: a new version moves the root and the count."""
+        creator = registry.creator
         await registry.add_record(creator, "abc")
 
-        key = await registry.read(REG.fns.recordKey(checksum_hash))
-        before = await latest(w3, registry.address, key)
+        before = await root(w3, registry.address)
         assert before != b"\x00" * 32
-        assert bytes(await registry.read(REG.fns.latestRecordDigest(checksum_hash))) == before
+        assert (await state(w3, registry.address))[0] == 1
 
-        await registry.add_record(creator, "abc")  # new version moves the head
-        assert await latest(w3, registry.address, key) != before
+        await registry.add_record(creator, "abc")  # a new version is one more leaf
+        assert await root(w3, registry.address) != before
+        assert (await state(w3, registry.address))[0] == 2
 
-    async def test_the_anchored_log_alone_reconstructs_a_record_stream(self, w3, registry):
+    async def test_the_log_alone_reconstructs_a_record_stream(self, w3, registry):
         """Version history is only in the log, since the contract keeps no record data.
 
-        Each envelope leads with its kind, so the key it was anchored under confirms the shape
-        rather than being the only thing that identifies it.
+        Each envelope leads with its kind and its checksum hash, so a record's versions are
+        picked out of the registry's leaves by the payload alone.
         """
         creator, checksum_hash = registry.creator, keccak(text="abc")
         await registry.add_record(creator, "abc", uri="ipfs://v1")
@@ -419,10 +417,8 @@ class TestAnchoredLog:
         )
         await registry.add_record(creator, "def", uri="ipfs://other")
 
-        key = await registry.read(REG.fns.recordKey(checksum_hash))
-
         versions, commitments, classified = {}, {}, {}
-        for commitment, fields in await envelopes(w3, registry, key, "RECORD"):
+        for commitment, fields in await envelopes(w3, registry, "RECORD", checksum_hash):
             index = fields["index"]
             versions[index] = (fields["uri"], fields["checksum"])
             commitments[index] = commitment
@@ -437,8 +433,7 @@ class TestAnchoredLog:
         }
         newest = max(versions)
         assert newest == await registry.versions("abc")
-        digest = await registry.read(REG.fns.latestRecordDigest(checksum_hash))
-        assert bytes(digest) == commitments[newest]
+        assert (await state(w3, registry.address))[0] == 3, "two versions of abc, one of def"
 
     async def test_acl_changes_are_not_anchored(self, w3, registry):
         """Role changes reach the log as events only.
@@ -455,8 +450,8 @@ class TestAnchoredLog:
             await registry.revoke(creator, editor, EDITOR),
         ]
 
-        anchored = await anchored_logs(w3, registry.address, from_block=before + 1)
-        assert anchored == [], f"a role change reached the anchored log: {anchored}"
+        appended = await append_logs(w3, registry.address, from_block=before + 1)
+        assert appended == [], f"a role change reached the MMR: {appended}"
         assert await registry.has_role(editor, EDITOR) is False, "...but the state moved"
         for receipt in receipts:
             assert any(lg["address"].lower() == registry.address.lower() for lg in receipt["logs"]), (
@@ -506,11 +501,10 @@ class TestContractAccounts:
         await send_call(w3, chain_id, creator, safe, write)
 
         assert await registry.versions("abc") == 1
-        key = await registry.read(REG.fns.recordKey(keccak(text="abc")))
-        assert await latest(w3, registry.address, key) != b"\x00" * 32, (
-            "and the anchor is still the registry's, not the contract's that called it"
+        assert await root(w3, registry.address) != b"\x00" * 32, (
+            "and the leaf is still the registry's, not the contract's that called it"
         )
-        assert await latest(w3, safe, key) == b"\x00" * 32
+        assert await root(w3, safe) == b"\x00" * 32
 
     async def test_one_transaction_carries_a_whole_change_or_none_of_it(self, w3, chain_id, registry):
         """A grant, a record and its status in one tx -- and a call that reverts takes the

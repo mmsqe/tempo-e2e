@@ -231,47 +231,55 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
 )
 
 
-# Anchoring precompile (IAnchoring): a caller-partitioned commitment log, enshrined at T10.
+# Anchoring precompile (IAnchoring): one Merkle Mountain Range per caller, enshrined at T10.
 # The caller is the namespace, so there is no authorization surface and nothing to deploy.
-# Supersedes the withdrawn x/anchoring module: the address is inherited from that
-# precompile, but its selectors are gone and now revert UnknownFunctionSelector. Registry and
-# record reads become indexer queries over the Anchored log; roles have no successor at all --
-# there is no grantRole/hasRole here, and permissioning is a wrapper-contract concern.
+# State is the leaf count and one peak per height, so an append needs no witness; payloads are
+# only emitted, with the peaks, so a proof needs the log and nothing else. Supersedes the
+# withdrawn x/anchoring module: the address is inherited from that precompile, but its
+# selectors are gone and now revert UnknownFunctionSelector. Registry and record reads become
+# indexer queries over the log; roles have no successor at all -- there is no grantRole/hasRole
+# here, and permissioning is a wrapper-contract concern.
 ANCHORING_ADDRESS = to_checksum_address("0x0000000000000000000000000000000000000a00")
 ANCHORING = Contract.from_abi(
     [
-        "function anchor(bytes32 key, bytes32 commitment, bytes metadata)",
-        "function anchorAndHash(bytes32 key, bytes metadata)",
-        "function latest(address namespace, bytes32 key) view returns (bytes32 commitment)",
-        "event Anchored(address indexed caller, bytes32 indexed key, bytes32 commitment, bytes metadata)",
+        "function appendLeaf(bytes32 commitment, bytes metadata) returns (bytes32 root)",
+        "function appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes metadata) returns (bytes32 root)",
+        "function root(address namespace) view returns (bytes32)",
+        "function state(address namespace) view returns (uint256 count, bytes32[] peaks)",
+        "event LeafAppended(address indexed namespace, uint256 indexed index, bytes32 commitment, bytes32 root,"
+        " bytes32[] peaks, bytes metadata)",
+        "event LeavesAppended(address indexed namespace, uint256 indexed firstLeaf, uint256 count,"
+        " bytes32[] chunkRoots, uint8[] chunkHeights, bytes32 root, bytes32[] peaks, bytes metadata)",
     ]
 )
 
 # Registry (app contract): one deployment per registry -- checksum records with scoped RBAC,
-# anchored through the precompile rather than stored on-chain. There is no registryId anywhere:
-# the deployment address is the partition, because the precompile is a caller-partitioned log.
-# The contract keeps only role membership and a version count per record; latest(registry, key)
-# in the precompile is the source of truth, and every anchored envelope leads with a bytes32
-# kind (record/status) an indexer classifies on. Roles are registry- or record-scoped (one
-# checksum) over "admin"/"editor" as right-padded bytes32, and are not anchored: membership is
-# this contract's state, its history the contract's own events.
+# every version and status a leaf of the registry's MMR in the precompile rather than stored
+# on-chain. There is no registryId anywhere: the deployment address is the registry's MMR,
+# because the precompile is partitioned by caller. The contract keeps only role membership and
+# a version count per record, and every envelope it commits to leads with a bytes32 kind
+# (record/status) an indexer classifies on. Roles are registry- or record-scoped (one checksum)
+# over "admin"/"editor" as right-padded bytes32, and are not leaves: membership is this
+# contract's state, its history the contract's own events.
 REGISTRY = Contract.from_abi(
     [
         "function addRecord(string uri, string checksum, string checksumAlgo, string metadata,"
         " uint8 category, string dataPointer) returns (bytes32 checksumHash, uint256 index)",
         "function updateRecordStatus(string checksum, uint256 index, string status)",
+        # Leaves: off-chain records committed to the registry's MMR. The precompile's own
+        # signatures, forwarded once the caller's role is checked.
+        "function appendLeaf(bytes32 commitment, bytes metadata) returns (bytes32 root)",
+        "function appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes metadata) returns (bytes32 root)",
+        "function mmrRoot() view returns (bytes32)",
         "function grantRole(string checksum, address account, bytes32 role)",
         "function revokeRole(string checksum, address account, bytes32 role)",
         "function hasRole(string checksum, address account, bytes32 role) view returns (bool)",
         "function versionCount(bytes32 checksumHash) view returns (uint256)",
-        "function latestRecordDigest(bytes32 checksumHash) view returns (bytes32)",
-        # The kind tags leading every anchored envelope; indexers match these literals.
+        # The kind tags leading every envelope; indexers match these literals.
         "function KIND_RECORD() pure returns (bytes32)",
         "function KIND_STATUS() pure returns (bytes32)",
         # keccak256(""), the checksumHash a registry-scoped role is announced under.
         "function REGISTRY_SCOPE() pure returns (bytes32)",
-        "function recordKey(bytes32 checksumHash) pure returns (bytes32)",
-        "function statusKey(bytes32 checksumHash, uint256 index) pure returns (bytes32)",
         "function ROLE_ADMIN() pure returns (bytes32)",
         "function ROLE_EDITOR() pure returns (bytes32)",
         "function owner() view returns (address)",
@@ -302,4 +310,14 @@ REGISTRY_FACTORY = Contract.from_abi(
 # nothing to upgrade, since a replacement registry splits history across two addresses rather
 # than invalidating any -- with the calling EOA as its owner, and so as every registry's
 # break-glass admin. Read the factory from `factory()`.
-REGISTRY_DEPLOYER = Contract.from_abi(["function factory() view returns (address)"])
+REGISTRY_DEPLOYER = Contract.from_abi(
+    ["function factory() view returns (address)", "function verifier() view returns (address)"]
+)
+
+# Inclusion proofs against any registry's MMR root; deployed once, beside the factory.
+MMR_VERIFIER = Contract.from_abi(
+    [
+        "function verify(bytes32 root, bytes32 commitment, uint256 index, bytes32[] siblings,"
+        " bytes32[] peaks, uint256 count) pure returns (bool)",
+    ]
+)
