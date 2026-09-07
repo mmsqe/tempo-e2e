@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -35,7 +36,31 @@ MAX_CALLS = 32
 # carrying the cap is a block to itself; one reserving what it plans shares.
 GAS_CAP = 30_000_000
 BUDGET = 27_000_000  # planned per transaction, headroom under the cap
-GAS = {"deploy": 6_105_000, "first": 526_679, "later": 54_107, "status": 269_688}  # measured on a devnet
+# What a batch reserves over what it plans. At a tenth, two transactions of thirty-two first
+# versions fit a block. Running out of gas reverts the batch and stops the run, so the margin
+# does not go lower.
+GAS_HEADROOM = 1.1
+CALLDATA_GAS = 16  # per byte, which the per-step costs leave out
+# What a step is planned at, above what it was measured at, since a reservation that falls
+# short reverts. Over the corpus a record averaged 283k and a status 21k; a later version only
+# moves a word, where a first version also creates its version-count slot.
+GAS = {"deploy": 5_500_000, "first": 330_000, "later": 60_000, "status": 30_000}
+# A record stores its strings, so its cost follows their length. `GAS["first"]` covers the
+# replay's median record, 612 bytes of calldata; a rooted one carries the legacy envelope at
+# about 900, and thirty-two of those reverted at a 21.3M reservation but passed under the cap.
+# That brackets one between 664k and 937k, and this rate is the top of the bracket.
+RECORD_BYTES_AT, RECORD_BYTE_GAS = 612, 2_100
+# A `leaves` step is mostly state: the precompile creates a slot per chunk, each a peak, and
+# one for the count -- TIP-1000's 250k each -- plus the call itself.
+FRESH_SLOT, LEAVES_CALL = 250_000, 80_000
+# How many registries a batch may span before `GAS`'s averages stop describing it: they average
+# a registry's records, where all but the first call finds the tree warm. In the corpus's tail
+# of small registries, every call is that first one.
+SAME_TREE = 2
+# The pool also refuses a transaction past its input limit, 128 KiB by reth's default. Thirty-two
+# of the corpus's largest records come to 81 KiB, so this only guards the batch that would run
+# past it.
+BYTES_BUDGET, CALL_OVERHEAD = 96 * 1024, 64
 # Multiples of the base fee to bid. `suggested_max_fee` bids two, which a burst outruns: a full
 # block raises the base fee 12.5%, so six of them double it. Overbidding costs only balance held
 # while the transaction is out; the base fee is burned at its actual value.
@@ -55,22 +80,62 @@ REPORT_EVERY = 25
 
 
 def cost(step: dict) -> int:
+    """What a step is planned at, for filling a transaction. The peak slot a leaf may open is
+    not in these figures; `reserve` adds it, since the gas limit is what has to cover it.
+    """
     if step["kind"] == "deploy":
         return GAS["deploy"]
+    if step["kind"] == "leaves":
+        # `appendLeaves((bytes32,uint8)[] chunks, …)`: the chunks' length word sits right after
+        # the two-word head, so the chunk count is read off the calldata rather than guessed.
+        data = bytes.fromhex(step["data"][2:])
+        chunks = int.from_bytes(data[4 + 64 : 4 + 96], "big")
+        return FRESH_SLOT * (chunks + 1) + LEAVES_CALL
     if step["kind"] == "status":
         return GAS["status"]
-    return GAS["first"] if step.get("version", 1) == 1 else GAS["later"]
+    if step.get("version", 1) != 1:
+        return GAS["later"]
+    over = max(0, len(step["data"]) // 2 - 1 - RECORD_BYTES_AT)
+    return GAS["first"] + RECORD_BYTE_GAS * over
+
+
+def size(step: dict) -> int:
+    """The calldata a step puts in a transaction, with the envelope around one call."""
+    return len(step["data"]) // 2 - 1 + CALL_OVERHEAD
+
+
+def reserve(batch: list[dict]) -> int:
+    """The gas limit a batch is sent with: what it plans, its calldata, the peak slots its
+    appends may open, and `GAS_HEADROOM` over the sum -- so two transactions fit a block
+    where the cap lets in one.
+
+    `GAS` averages over one registry's records, where all but the first call finds the tree
+    warm, so a batch over more trees than `SAME_TREE` keeps the cap: chunk 21's boundary
+    batches put thirty-two calls on as many cold registries and wanted 649k each against the
+    330k planned. Within one tree the slots are counted per registry, since the precompile
+    creates one the first time a tree reaches a height.
+    """
+    appends = Counter(s["registry"] for s in batch if s["kind"] in ("record", "status"))
+    if any(s["kind"] == "leaves" for s in batch) or len(appends) > SAME_TREE:
+        return GAS_CAP
+    heights = FRESH_SLOT * sum(n.bit_length() for n in appends.values())
+    planned = sum(cost(s) for s in batch) + CALLDATA_GAS * sum(size(s) for s in batch) + heights
+    return min(GAS_CAP, int(planned * GAS_HEADROOM))
 
 
 def batched(steps: list[dict]):
-    """Steps grouped into transactions, by both limits at once."""
-    batch, planned = [], 0
+    """Steps grouped into transactions, by every limit at once. The call cap is what fills one
+    in practice; the gas budget bounds deploys, which are dear enough to fill one first, and the
+    calldata budget guards a batch of unusually large records."""
+    batch, planned, carried = [], 0, 0
     for step in steps:
-        if batch and (len(batch) == MAX_CALLS or planned + cost(step) > BUDGET):
+        full = len(batch) == MAX_CALLS or planned + cost(step) > BUDGET or carried + size(step) > BYTES_BUDGET
+        if batch and full:
             yield batch
-            batch, planned = [], 0
+            batch, planned, carried = [], 0, 0
         batch.append(step)
         planned += cost(step)
+        carried += size(step)
     if batch:
         yield batch
 
@@ -342,7 +407,7 @@ async def stream(sender: Sender, *, factory: str, steps: list[dict], deployed: d
     spent, mine, deployed = 0, {}, dict(deployed)
     for at, batch in enumerate(batches(steps), 1):
         calls = [{"to": target(s, factory, deployed), "data": bytes.fromhex(s["data"][2:])} for s in batch]
-        receipt = await sender.landed(calls)
+        receipt = await sender.landed(calls, reserve(batch))
         if receipt["status"] != 1:
             raise SystemExit(
                 f"tx {at} reverted at {receipt['gasUsed']:,} gas, steps {batch[0]['step']}-{batch[-1]['step']}: "
