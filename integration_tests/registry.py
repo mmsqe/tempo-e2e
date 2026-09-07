@@ -15,7 +15,7 @@ from web3 import Web3
 
 from .abi import REGISTRY as REG
 from .abi import REGISTRY_DEPLOYER, REGISTRY_FACTORY
-from .utils import call_revert, funded, send_call, send_calls
+from .utils import DEPLOY_GAS, call_revert, funded, send_call, send_calls
 
 #: The roles a registry knows, as the right-padded ``bytes32`` the contract compares. Pinned
 #: against ``ROLE_ADMIN``/``ROLE_EDITOR`` by the registry suite, like every other constant here.
@@ -107,8 +107,10 @@ def deployed_address(receipt, factory: str) -> str:
 class Factory:
     """The deployed factory, and the recipe for getting registries out of it."""
 
-    def __init__(self, w3, chain_id, address, owner):
+    def __init__(self, w3, chain_id, address, owner, verifier=None):
         self.w3, self.chain_id, self.address, self.owner = w3, chain_id, address, owner
+        #: The chain-wide `MMRVerifier` the deployer put beside the factory.
+        self.verifier = verifier
 
     async def deploy(self, signer, name="docs", description="", metadata=""):
         """Deploys a registry and returns it bound, carrying its deployment receipt."""
@@ -118,6 +120,7 @@ class Factory:
             signer,
             self.address,
             REGISTRY_FACTORY.fns.deployRegistry(name, description, metadata).data,
+            gas_limit=DEPLOY_GAS,
         )
         address = deployed_address(receipt, self.address)
         return Deployed(self.w3, self.chain_id, address, receipt, signer)
@@ -139,4 +142,5 @@ async def deploy_factory(w3, chain_id) -> Factory:
     assert receipt["status"] == 1, "deployer create reverted"
     deployer = receipt["contractAddress"]
     address = await REGISTRY_DEPLOYER.fns.factory().call(w3, to=deployer)
-    return Factory(w3, chain_id, Web3.to_checksum_address(address), owner)
+    verifier = await REGISTRY_DEPLOYER.fns.verifier().call(w3, to=deployer)
+    return Factory(w3, chain_id, Web3.to_checksum_address(address), owner, Web3.to_checksum_address(verifier))
