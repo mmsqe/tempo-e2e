@@ -1,4 +1,5 @@
-"""Throwaway: what one call costs, for the tables the PRs quote.
+"""Measured: what one call costs, for the tables the PRs quote and the constants
+`send_plan` reserves by.
 
 Skipped unless ``PERCALL`` is set. The corpus runs measure whole paths; these are the
 individual calls those tables name, taken from receipts on a fresh registry so a first
@@ -11,6 +12,7 @@ import os
 import pytest
 
 from .abi import REGISTRY as REG
+from .send_plan import BUDGET, GAS
 from .utils import funded
 
 pytestmark = pytest.mark.tempo
@@ -51,3 +53,13 @@ async def test_per_call(w3, factory, registry):
     # The claim these tables are quoted for: a height's slot is paid for once, so the append
     # that opens one costs several times the append that lands on a height already there.
     assert out["appendLeaf, opening a height"] > 4 * out["appendLeaf, overwriting a height"]
+
+    # A deploy is the one step `send_plan` prices flat, and the only one gas bounds
+    # rather than the call cap: `BUDGET // GAS["deploy"]` is how many go in a
+    # transaction. Grow past it and every deploy batch reverts, so this is checked
+    # against the chain rather than left to drift. The rest of the reservation is
+    # arithmetic over these figures, and `test_send_plan` covers it without a node.
+    assert out["deployRegistry"] <= GAS["deploy"], (
+        f"a deploy now costs {out['deployRegistry']:,}, over the {GAS['deploy']:,} "
+        f"send_plan reserves — {BUDGET // GAS['deploy']} to a transaction would revert"
+    )

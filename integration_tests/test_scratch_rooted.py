@@ -1,4 +1,4 @@
-"""Throwaway: the whole corpus committed as one root per registry.
+"""Measured: the whole corpus committed as one root per registry.
 
 Skipped unless ``ROOTED`` names the root, ``merkle``, ``sha256`` or ``mmr``; `corpus`
 says where the export and the migrator come from.

@@ -1,8 +1,8 @@
-"""Throwaway: the whole corpus replayed row by row, chunk after chunk.
+"""Measured: the whole corpus replayed row by row, chunk after chunk.
 
-Skipped unless ``REPLAY_DIR`` is set. It holds one directory per chunk under ``chunks/``,
-each with a ``registries.json`` and a ``manifest.json``; `corpus` says where the export and
-the migrator come from.
+Skipped unless ``REPLAY_DIR`` is set: a writable directory with room for two chunk plans at
+once, tens of gigabytes. The chunks are cut from the export on the way in; `corpus` says
+where the export and the migrator come from.
 """
 
 import json
@@ -21,7 +21,6 @@ pytestmark = pytest.mark.tempo
 if not os.environ.get("REPLAY_DIR"):
     pytest.skip("REPLAY_DIR is unset", allow_module_level=True)
 S = Path(os.environ["REPLAY_DIR"])
-CHUNKS = sorted((S / "chunks").iterdir())
 PROGRESS = S / "replay-progress.jsonl"
 SENDERS = 8
 # Statuses the planner leaves out, as the corpus holds one value and it carries nothing.
@@ -32,6 +31,7 @@ FLAGS = ("--threshold=99999999", *([f"--skip-status={SKIP_STATUS}"] if SKIP_STAT
 
 
 async def test_full_replay(w3, chain_id, tempo, factory):
+    chunks = corpus.chunks(S / "chunks")
     keys = await corpus.senders(w3, SENDERS)
     # A bid is held at its cap while the transaction is out: say what each sender holds, so
     # a run that is going to die broke says so in its first seconds.
@@ -50,16 +50,16 @@ async def test_full_replay(w3, chain_id, tempo, factory):
     # noticed one chunk late, when its turn comes.
     plans = [S / "chunk-plan-a.jsonl", S / "chunk-plan-b.jsonl"]
     with ThreadPoolExecutor(max_workers=1) as planner:
-        pending = planner.submit(plan_chunk, CHUNKS[0], plans[0])
-        for i in range(1, len(CHUNKS) + 1):
+        pending = planner.submit(plan_chunk, chunks[0], plans[0])
+        for i in range(1, len(chunks) + 1):
             out = plans[(i - 1) % 2]
             planned, plan_secs = pending.result()
-            if i < len(CHUNKS):
-                pending = planner.submit(plan_chunk, CHUNKS[i], plans[i % 2])
+            if i < len(chunks):
+                pending = planner.submit(plan_chunk, chunks[i], plans[i % 2])
             assert planned.returncode == 0, planned.stderr[-400:]
             steps, plan_bytes = corpus.steps_in(out), out.stat().st_size
             done_bytes += plan_bytes
-            line = {"chunk": i, "of": len(CHUNKS), "steps": steps, "plan_bytes": plan_bytes, "plan_secs": plan_secs}
+            line = {"chunk": i, "of": len(chunks), "steps": steps, "plan_bytes": plan_bytes, "plan_secs": plan_secs}
 
             try:
                 gas, secs = corpus.send(
@@ -80,12 +80,19 @@ async def test_full_replay(w3, chain_id, tempo, factory):
             print(json.dumps(line), flush=True)
 
     total = time.monotonic() - began
-    summary = {
+    # One ``RESULT`` line, the same shape `test_scratch_rooted` reports, so whatever drives
+    # the run reads all four paths the same way.
+    result = {
+        "path": f"1:1 replay, {'--skip-status' if SKIP_STATUS else 'with status'}",
         "steps": done_steps,
         "gas": done_gas,
         "plan_bytes": done_bytes,
         "seconds": round(total, 1),
         "steps_per_sec": round(done_steps / total, 1),
+        "failed_chunks": failed,
+        # Every registry on this chain hangs off it, and `reconcile` takes it as
+        # `FACTORY_ADDRESS`. A fresh one per run, so the summary is the only record.
+        "factory": factory.address,
     }
-    print(json.dumps({**summary, "failed_chunks": failed}, indent=2))
+    print("RESULT " + json.dumps(result), flush=True)
     assert not failed, f"{len(failed)} chunk(s) did not land: {failed}"

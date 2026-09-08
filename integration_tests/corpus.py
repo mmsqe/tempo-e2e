@@ -5,6 +5,7 @@ The export, its ``registries.json`` and ``manifest.json`` beside it, is under
 ``MIGRATE_BIN``, or whatever ``cargo install`` put on the path.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,9 @@ EXPORT = Path(os.environ.get("NVNM_EXPORT_DIR", "/tmp/from-chain"))
 # The migrator reads a chain to reconcile against. These leg it away from one: the plan is
 # built from the export alone, so nothing here should reach a node but the sender.
 OFFLINE = {"CHAIN_ID": "1", "TIDX_URL": "http://127.0.0.1:1"}
+# The largest registry alone holds 1.2M records, so this is a floor for a chunk rather than
+# a ceiling: a plan is per registry, so a registry is never split.
+PER_CHUNK = 570_000
 
 
 def plan(source: Path, out: Path, *flags: str, timeout: float = 3600) -> subprocess.CompletedProcess:
@@ -61,3 +65,38 @@ def send(out: Path, *, rpc: str, chain_id: int, factory: str, keys: list, timeou
 def steps_in(out: Path) -> int:
     with out.open("rb") as fh:
         return sum(1 for _ in fh)
+
+
+def chunks(out: Path, per_chunk: int = PER_CHUNK) -> list[Path]:
+    """The export's two index files split into subsets under ``out``, biggest registry first.
+
+    Chunking is only about planning, which writes a chunk's plan whole before sending it --
+    the corpus at once is 22 GB. The shards are not copied, since every chunk still names the
+    same ``--export``, so where the cuts fall changes nothing that gets measured.
+    """
+    registries = json.loads((EXPORT / "registries.json").read_text())
+    manifest = json.loads((EXPORT / "manifest.json").read_text())
+    rows = {f["registry"]: f for f in manifest["files"]}
+
+    groups, current, held = [], [], 0
+    for registry in sorted(registries, key=lambda r: -rows[r["name"]]["records"]):
+        current.append(registry)
+        held += rows[registry["name"]]["records"]
+        if held >= per_chunk:
+            groups.append((current, held))
+            current, held = [], 0
+    if current:
+        groups.append((current, held))
+
+    made = []
+    for i, (group, records) in enumerate(groups):
+        home = out / f"{i:03d}"
+        home.mkdir(parents=True, exist_ok=True)
+        files = [rows[r["name"]] for r in group]
+        (home / "registries.json").write_text(json.dumps(group, ensure_ascii=False))
+        # The planner checks both totals against what it reads, so they are per chunk.
+        totals = {**manifest["totals"], "registries": len(group), "records": records}
+        chunk = {**manifest, "files": files, "totals": totals}
+        (home / "manifest.json").write_text(json.dumps(chunk, ensure_ascii=False))
+        made.append(home)
+    return made
