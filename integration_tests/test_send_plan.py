@@ -25,6 +25,10 @@ def record(registry, checksum, version=1):
     return {"kind": "record", "registry": registry, "checksum": checksum, "version": version}
 
 
+def status(registry, checksum, version=1):
+    return {"kind": "status", "registry": registry, "checksum": checksum, "version": version}
+
+
 def sized(kind, calldata_bytes, **fields):
     """A step carrying `calldata_bytes` of data, for what the batching weighs."""
     return {"kind": kind, "registry": "r", "data": "0x" + "00" * calldata_bytes} | fields
@@ -58,10 +62,6 @@ def test_deploys_are_bound_by_gas_below_the_cap():
     assert len(lots[0]) == BUDGET // GAS["deploy"] < MAX_CALLS
     assert all(len(lot) * GAS["deploy"] <= BUDGET for lot in lots)
     assert sum(len(lot) for lot in lots) == 60
-
-
-def status(registry, checksum, version=1):
-    return {"kind": "status", "registry": registry, "checksum": checksum, "version": version}
 
 
 def test_a_record_keeps_its_status():

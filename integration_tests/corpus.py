@@ -1,8 +1,8 @@
 """Driving the migrator and the sender over a corpus, for the throwaway measurements.
 
 The export, its ``registries.json`` and ``manifest.json`` beside it, is under
-``REPLAY_EXPORT``. The migrator is ``MIGRATE_BIN``, or whatever ``cargo install`` put on
-the path.
+``NVNM_EXPORT_DIR`` -- the same one the service tests read. The migrator is
+``MIGRATE_BIN``, or whatever ``cargo install`` put on the path.
 """
 
 import os
@@ -14,7 +14,7 @@ from pathlib import Path
 from .utils import fund, new_account
 
 BIN = os.environ.get("MIGRATE_BIN", os.path.expanduser("~/.cargo/bin/nvnmchain-anchoring"))
-EXPORT = os.environ.get("REPLAY_EXPORT", "/tmp/from-chain")
+EXPORT = Path(os.environ.get("NVNM_EXPORT_DIR", "/tmp/from-chain"))
 # The migrator reads a chain to reconcile against. These leg it away from one: the plan is
 # built from the export alone, so nothing here should reach a node but the sender.
 OFFLINE = {"CHAIN_ID": "1", "TIDX_URL": "http://127.0.0.1:1"}
