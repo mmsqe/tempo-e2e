@@ -286,17 +286,20 @@ def _platform_args() -> list[str]:
     return ["--platform", TIDX_PLATFORM] if TIDX_PLATFORM else []
 
 
-DOCKER_WAITS = (1, 2, 4, 8)
-
-
 def _docker(*args: str) -> subprocess.CompletedProcess[str]:
-    """One docker command, asked again on failure over ``DOCKER_WAITS``."""
-    for wait in (*DOCKER_WAITS, None):
-        probe = subprocess.run(["docker", *args], capture_output=True, text=True)
-        if probe.returncode == 0 or wait is None:
-            return probe
-        time.sleep(wait)
-    raise AssertionError("unreachable")
+    return subprocess.run(["docker", *args], capture_output=True, text=True)
+
+
+def _retag(image: str) -> bool:
+    """Put `image` back on the id `docker images` still lists it under.
+
+    Docker Desktop's containerd store loses a local image's *name* while keeping the
+    image, which no amount of asking again recovers. Writing the tag back is the fix
+    by hand. An image nothing lists is genuinely absent and stays a skip.
+    """
+    listed = _docker("images", "--filter", f"reference={image}", "--format", "{{.ID}}")
+    at = listed.stdout.split("\n")[0].strip()
+    return bool(at) and _docker("tag", at, image).returncode == 0
 
 
 def preflight() -> None:
@@ -305,12 +308,20 @@ def preflight() -> None:
         raise TidxUnavailable("the docker CLI is not available")
     if _docker("info").returncode != 0:
         raise TidxUnavailable("the docker daemon is not running")
-    # docker's own words: only one of its failures is worth pulling for.
     found = _docker("image", "inspect", TIDX_IMAGE)
+    if found.returncode != 0 and _retag(TIDX_IMAGE):
+        found = _docker("image", "inspect", TIDX_IMAGE)
     if found.returncode != 0:
+        # A tag with no registry in it cannot be pulled, and the published image is
+        # amd64 only, so an arm64 host builds its own.
+        fix = (
+            f"docker build -t {TIDX_IMAGE} <tidx checkout>"
+            if "/" not in TIDX_IMAGE
+            else " ".join(["docker", "pull", *_platform_args(), TIDX_IMAGE])
+        )
         raise TidxUnavailable(
             f"tidx image {TIDX_IMAGE!r} not usable: {found.stderr.strip()}\n"
-            f"  {' '.join(['docker', 'pull', *_platform_args(), TIDX_IMAGE])}\n"
+            f"  {fix}\n"
             f"(or point $TIDX_IMAGE at an image you have)"
         )
     # Pulling an amd64-only image succeeds on any host; *running* it needs emulation that
