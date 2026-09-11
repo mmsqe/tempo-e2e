@@ -113,22 +113,6 @@ def bytea(value) -> str:
     return "'\\x" + HexBytes(value).hex() + "'"
 
 
-def named_signature(event) -> str:
-    """A contract event in the form tidx's ``signature=`` takes: argument names become
-    result columns, ``indexed`` says which come from the topics.
-
-    Built from the ABI rather than typed out -- a signature tidx cannot match builds its
-    table off a different topic0, which returns no rows rather than an error.
-    """
-    return "{}({})".format(
-        event.name,
-        ", ".join(
-            f"{a['type']}{' indexed' if a.get('indexed') else ''} {a.get('name', '')}"
-            for a in event.abi.get("inputs", [])
-        ),
-    )
-
-
 class Tidx:
     """A tidx + PostgreSQL stack indexing ``rpc_url``, controlled over docker compose."""
 
@@ -212,40 +196,6 @@ class Tidx:
         if not result.get("ok"):
             raise QueryRefused(f"{result.get('error', result)}\n  sql: {query}")
         return [dict(zip(result["columns"], row)) for row in result["rows"]]
-
-    def coverage(self) -> dict:
-        """The chain's ``/status`` entry: ``tip_num``, ``synced_num``, ``backfill_num``, gaps.
-
-        Not ``SELECT ... FROM sync_state`` -- ``/query`` allowlists blocks/txs/logs/receipts
-        and 422s the rest, that table by name. For which field may bound an index-derived
-        answer, see ``indexed_through``.
-        """
-        status = self._get("/status", {})
-        for chain in status.get("chains", []):
-            if int(chain["chain_id"]) == self.chain_id:
-                return chain
-        raise TidxUnavailable(f"chain {self.chain_id} is not in /status: {status}")
-
-    def indexed_through(self) -> int:
-        """The highest block an index-derived answer may be pinned to.
-
-        ``tip_num``, not ``synced_num``: realtime ingest advances the former and leaves the
-        latter to gap-fill, so on an index following the chain ``synced_num`` sits below
-        rows already there and a query bounded by it reads almost nothing while reporting
-        clean.
-        """
-        return int(self.coverage()["tip_num"])
-
-    def bounded(self, receipt) -> int:
-        """``indexed_through`` after waiting for ``receipt``'s block: what a test does
-        between writing and querying. Asserted to cover the block, because a bound below
-        it drops the rows under test and returns what a correct query over an unwritten
-        chain also returns."""
-        wrote = receipt["blockNumber"]
-        self.wait_for_block(wrote)
-        at = self.indexed_through()
-        assert at >= wrote, f"index reached {at}, but the test wrote at {wrote}"
-        return at
 
     def synced_block(self) -> int:
         """Highest block written to PostgreSQL, or -1 before the first one.

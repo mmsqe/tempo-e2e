@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The anchoring precompile is not in upstream tempo
+  # NVM runs a fork of tempo
   TEMPO_REPO: mmsqe/tempo
   TEMPO_REF: main
 

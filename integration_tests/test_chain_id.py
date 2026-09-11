@@ -1,13 +1,13 @@
 """Chain identity: what the node reports, and ids no binary has an entry for."""
 
 import pytest
+from eth_contract.erc20 import ERC20
+from tempo.constants import PATH_USD
 from web3 import AsyncWeb3
 from web3.exceptions import Web3RPCError
 
-from .abi import ANCHORING, ANCHORING_ADDRESS
-from .anchoring import hash_leaf
 from .network import dev_node
-from .utils import fund, new_account, send_call
+from .utils import fund, new_account, send_call, transfer_call
 
 # An id no binary claims -- upstream keys chains off 4217/42431, this fork off 787222.
 UNCLAIMED_CHAIN_ID = 424242
@@ -35,18 +35,16 @@ class TestUnclaimedChainId:
             w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(node.rpc_url))
             assert await w3.eth.chain_id == UNCLAIMED_CHAIN_ID
             assert int(await w3.net.version) == UNCLAIMED_CHAIN_ID
-            assert await w3.eth.get_code(ANCHORING_ADDRESS) == b"\xef", "T10 activated from the genesis config"
 
             signer = new_account()
             await fund(w3, signer.address)
-            commitment = b"\x22" * 32
-            anchor = ANCHORING.fns.appendLeaf(commitment, b"").data
-            await send_call(w3, UNCLAIMED_CHAIN_ID, signer, ANCHORING_ADDRESS, anchor)
-            read = ANCHORING.fns.root(signer.address)
-            assert bytes(await read.call(w3, to=ANCHORING_ADDRESS)) == hash_leaf(commitment), "one leaf is its own root"
+            recipient = new_account().address
+            transfer = transfer_call(recipient, 1)
+            await send_call(w3, UNCLAIMED_CHAIN_ID, signer, transfer["to"], transfer["data"])
+            assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 1
 
             # Signed one id over, the same write has to bounce.
             with pytest.raises(Web3RPCError, match="chain ID"):
-                await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, ANCHORING_ADDRESS, anchor)
+                await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, transfer["to"], transfer["data"])
         finally:
             node.stop()

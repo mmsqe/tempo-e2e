@@ -51,9 +51,6 @@ DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
 DEFAULT_MAX_FEE_PER_GAS = 100_000_000_000
 # A tempo tx that writes new storage (DEX orders, token deploys) needs extra TIP-1060 state gas.
 STATE_WRITE_GAS = 8_000_000
-# A Registry deploys at about 5.3M now that the MMR lives in the precompile -- its own limit
-# rather than a write's, with room for a fork that prices code deposit higher.
-DEPLOY_GAS = 12_000_000
 SET_CODE_GAS = 500_000  # a 7702 delegation, plus whatever the delegated code then does
 
 # Default KeyRestrictions expiry (year ~2096): the on-chain authorizeKey path needs a real
@@ -195,15 +192,6 @@ async def prepare_tx(w3: AsyncWeb3, chain_id: int, sender, calls: Sequence[dict]
         max_fee_per_gas=await suggested_max_fee(w3),
         calls=calls,
     )
-
-
-def error_selector(sig: str) -> str:
-    """A custom error's 4-byte selector as lowercase hex, for ``call_revert`` assertions.
-
-    Tempo precompiles and contracts revert with ABI-encoded custom errors; the RPC error
-    surfaces the raw data, so tests match on the selector of the error's signature.
-    """
-    return keccak(text=sig)[:4].hex()
 
 
 async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None) -> str:
@@ -408,41 +396,6 @@ async def seed_fee_pool(
             {"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.mint(user_token, validator_token, amount, funder).data},
         ],
     )
-
-
-# A contract that forwards the calldata it is given to one address and answers with the
-# success flag, so a call the callee refused is distinguishable from one that returned a zero
-# word. `test_precompiles` has a forwarder returning the callee's output instead, which cannot
-# tell those apart.
-#
-#   calldatacopy(0, 0, calldatasize)     ; the call's data becomes the forwarded args
-#   call(gas, <target>, 0, 0, cds, 0, 0)
-#   mstore(0, success) ; return(0, 32)
-_FORWARDER_RUNTIME = "36 6000 6000 37  6000 6000 36 6000 6000  73{addr} 5a f1  6000 52  6020 6000 f3"
-# The same in a read-only frame; STATICCALL takes no value argument.
-_PROBE_RUNTIME = "36 6000 6000 37  6000 6000 36 6000  73{addr} 5a fa  6000 52  6020 6000 f3"
-
-
-def _forwarder(template: str, target: str) -> bytes:
-    """Init code deploying ``template`` pointed at ``target``: copy the runtime out from past
-    this 12-byte prefix, then return it."""
-    addr = target.removeprefix("0x")
-    assert len(addr) == 40, "the target must be a 20-byte address"
-    runtime = bytes.fromhex(template.format(addr=addr))
-    size = f"60{len(runtime):02x}"
-    return bytes.fromhex(f"{size} 600c 6000 39 {size} 6000 f3") + runtime
-
-
-def call_forwarder(target: str) -> bytes:
-    """Init code for a contract that CALLs ``target``: a caller that is not an EOA, which two
-    suites need -- one for the namespace a frame anchors under, one for a role held by a
-    contract."""
-    return _forwarder(_FORWARDER_RUNTIME, target)
-
-
-def staticcall_probe(target: str) -> bytes:
-    """The same, in a read-only frame."""
-    return _forwarder(_PROBE_RUNTIME, target)
 
 
 async def send_set_code_tx(
