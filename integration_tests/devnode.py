@@ -52,8 +52,7 @@ def main(argv: list[str]) -> int:
     up.add_argument(
         "--datadir",
         type=Path,
-        default=Path("node-data") / "data",
-        help="node datadir; point at a kept single-node datadir to resume it (default: ./node-data/data)",
+        help="a kept single-node datadir to resume (default: a new chain in ./node-data/data)",
     )
     up.add_argument(
         "--http-port", type=int, default=DEFAULT_HTTP_PORT, help=f"HTTP RPC port (default {DEFAULT_HTTP_PORT})"
@@ -69,6 +68,11 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "down":
         return _down()
+    if args.datadir is None:
+        args.datadir = Path("node-data") / "data"
+    elif not args.datadir.exists():
+        # Otherwise a stale path would silently start a new, empty chain there.
+        parser.error(f"no datadir at {args.datadir} to resume")
     return _up(args.datadir, args.datadir.parent / "tempo.log", args.http_port, args.genesis)
 
 

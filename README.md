@@ -181,6 +181,8 @@ variant.
 | `test_precompiles.py` | — | a contract STATICCALLs each enshrined precompile for deterministic output |
 | `test_current_committee.py` | TIP-1070 | current-committee precompile (T8+): read members, system-only writes, epoch boundary |
 | `test_validator_config.py` | TIP-1017 | ValidatorConfig V2 append-only registry: genesis state, owner-gated mutators |
+| `test_anchoring.py` | — | anchoring contract at `0x…0a00`: the precompile's ABI, a seed corpus loaded at block 0, writes on top, EOA gate per sender type |
+| `test_anchoring_service.py` | — | nvnmchain-anchoring's name search over that node: seeded and live registries by prefix, suffix and contains |
 
 ### Consensus & networking (`consensus` marker)
 

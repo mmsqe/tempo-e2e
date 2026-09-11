@@ -229,3 +229,39 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
         "function getVoucherDigest(bytes32 channelId, uint96 cumulativeAmount) view returns (bytes32)",
     ]
 )
+
+# Anchoring (0x…0a00): the precompile's methods and events, as a contract placed in genesis.
+# Bound to the address, so `.call(w3)` needs no `to`.
+_ANCHORING_PAGE = "(bytes key, uint64 offset, uint64 limit, bool countTotal, bool reverse)"
+_ANCHORING_PAGE_OUT = "(bytes nextKey, uint64 total)"
+_ANCHORING_RECORD = (
+    "(string uri, string checksum, string checksumAlgo, string metadata, string timestamp, string status,"
+    " uint64 recordId, uint64 index, bool isLatest, uint64 registryId)"
+)
+_ANCHORING_REGISTRY = "(uint64 id, string name, string description, string creator, string createdAt, string metadata)"
+ANCHORING_ADDRESS = to_checksum_address("0x0000000000000000000000000000000000000a00")
+ANCHORING = Contract.from_abi(
+    [
+        "function addRegistry(string name, string description, string metadata) returns (uint64 registryId)",
+        f"function addRecord({_ANCHORING_RECORD} record) returns (uint64 recordId)",
+        "function updateRecordStatus(uint64 registryId, uint64 recordId, uint64 index, string status)",
+        f"function records(uint64 registryId, string checksum, uint64 recordId, uint64 index, {_ANCHORING_PAGE} pagination)"
+        f" view returns ({_ANCHORING_RECORD}[] recordsOut, {_ANCHORING_PAGE_OUT} paginationOut)",
+        f"function registries(uint64 registryId, {_ANCHORING_PAGE} pagination)"
+        f" view returns ({_ANCHORING_REGISTRY}[] registriesOut, {_ANCHORING_PAGE_OUT} paginationOut)",
+        # matchMode 0/1 (exact) only; prefix, suffix and contains revert.
+        f"function registriesByName(string name, uint8 matchMode, {_ANCHORING_PAGE} pagination)"
+        f" view returns ({_ANCHORING_REGISTRY}[] registriesOut, {_ANCHORING_PAGE_OUT} paginationOut)",
+        "function grantRole(uint64 registryId, string checksum, address account, string role)",
+        "function revokeRole(uint64 registryId, string checksum, address account, string role)",
+        # The contract's own role views; the precompile had none.
+        "function hasRole(bytes32 role, address account) view returns (bool)",
+        "function roleMemberCount(bytes32 role) view returns (uint256)",
+        "event AddRegistry(address indexed caller, uint64 registryId, string name)",
+        "event AddRecord(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string checksum)",
+        "event UpdateRecordStatus(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string status)",
+        "event GrantRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
+        "event RevokeRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
+    ],
+    to=ANCHORING_ADDRESS,
+)

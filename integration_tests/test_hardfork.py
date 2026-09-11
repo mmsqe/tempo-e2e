@@ -19,7 +19,9 @@ from pathlib import Path
 import pytest
 from web3 import Web3
 
-from .network import dev_node, generate_dev_genesis, xtask_forks
+from .abi import ANCHORING, ANCHORING_ADDRESS
+from .anchoring import RUNTIME_CODE, Page, genesis_with_anchoring, seed_fixture
+from .network import TempoNode, dev_node, free_port, generate_dev_genesis, xtask_forks
 
 pytestmark = [pytest.mark.tempo, pytest.mark.slow]
 
@@ -29,6 +31,8 @@ FAR_FUTURE = 4_000_000_000
 # Gap between launching a node and the fork activating: enough for startup and still some
 # pre-fork blocks to observe. Blocks land every 50ms, so a generous value costs only time.
 ACTIVATION_LEAD = 30
+
+MMR_FORK = "t10_time"  # put a precompile, which answers before code, at 0x…0a00 until nvnmchain-tempo#10
 
 
 def _fork_label(name: str) -> str:
@@ -172,3 +176,26 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
         # Post-fork: the executor installed it all on a chain already running without it.
         assert _active_fork(w3) == _fork_label(forks[-1])
         assert fingerprints(w3) == fingerprints(head_w3)
+
+
+def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
+    """Its code, storage and answers come through the boundary unchanged."""
+    activation = int(time.time()) + ACTIVATION_LEAD
+    seed = seed_fixture()
+    genesis = genesis_with_anchoring(tmp_path, storage=seed, fork_times=_schedule(MMR_FORK, activation))
+    node = TempoNode(datadir=tmp_path / "node0", log_path=tmp_path / "t10.log", genesis=genesis, http_port=free_port())
+    listing = ANCHORING.fns.registries(0, Page()).data
+
+    def state(w3: Web3):
+        answer = bytes(w3.eth.call({"to": ANCHORING_ADDRESS, "data": listing}))
+        return _fingerprint(w3, ANCHORING_ADDRESS, map(hex, seed)), answer
+
+    with _running(node) as w3:
+        _assert_pre_fork(w3, activation, _fork_label(MMR_FORK))
+        before = state(w3)
+        assert before[0]["code"] == RUNTIME_CODE.hex()
+
+        _wait_past(w3, activation)
+
+        assert _active_fork(w3) == _fork_label(xtask_forks()[-1])
+        assert state(w3) == before
