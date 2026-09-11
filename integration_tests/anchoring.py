@@ -10,12 +10,18 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
+import pytest
+
 from .abi import ANCHORING, ANCHORING_ADDRESS
 from .network import TempoNode, default_genesis, free_port, generate_dev_genesis, resolve_tempo_bin
 from .utils import send_call
 
 LAYOUT = Path(__file__).parent.parent / "contracts" / "layout"
-RUNTIME_CODE = bytes.fromhex((LAYOUT / "anchoring.bin").read_text().strip().removeprefix("0x"))
+# CI checks out without the private submodule until its token is approved; what needs it skips there.
+needs_contracts = pytest.mark.skipif(not LAYOUT.is_dir(), reason="contracts/ submodule not checked out")
+RUNTIME_CODE = b""
+if LAYOUT.is_dir():
+    RUNTIME_CODE = bytes.fromhex((LAYOUT / "anchoring.bin").read_text().strip().removeprefix("0x"))
 
 # Go's time.Time.String() in UTC, whole seconds: how the contract writes block time.
 GO_TIME = "%Y-%m-%d %H:%M:%S +0000 UTC"

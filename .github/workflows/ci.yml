@@ -40,10 +40,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          # contracts/ is a private submodule, which github.token cannot read.
-          submodules: true
-          token: ${{ secrets.NVNM_CONTRACTS_TOKEN || github.token }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

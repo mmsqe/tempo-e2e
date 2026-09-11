@@ -20,6 +20,7 @@ from .anchoring import (
     anchoring_node,
     bech32,
     emitted,
+    needs_contracts,
     new_registry,
     records,
     registries,
@@ -44,7 +45,7 @@ from .utils import (
     suggested_max_fee,
 )
 
-pytestmark = pytest.mark.tempo
+pytestmark = [pytest.mark.tempo, needs_contracts]
 
 
 @pytest.fixture(scope="module")

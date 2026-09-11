@@ -20,7 +20,7 @@ import pytest
 from web3 import Web3
 
 from .abi import ANCHORING, ANCHORING_ADDRESS
-from .anchoring import RUNTIME_CODE, Page, genesis_with_anchoring, seed_fixture
+from .anchoring import RUNTIME_CODE, Page, genesis_with_anchoring, needs_contracts, seed_fixture
 from .network import TempoNode, dev_node, free_port, generate_dev_genesis, xtask_forks
 
 pytestmark = [pytest.mark.tempo, pytest.mark.slow]
@@ -178,6 +178,7 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
         assert fingerprints(w3) == fingerprints(head_w3)
 
 
+@needs_contracts
 def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
     """Its code, storage and answers come through the boundary unchanged."""
     activation = int(time.time()) + ACTIVATION_LEAD
