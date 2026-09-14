@@ -20,7 +20,6 @@ from .anchoring import (
     anchoring_node,
     bech32,
     emitted,
-    needs_contracts,
     new_registry,
     records,
     registries,
@@ -45,7 +44,7 @@ from .utils import (
     suggested_max_fee,
 )
 
-pytestmark = [pytest.mark.tempo, pytest.mark.anchoring, needs_contracts]
+pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
 
 
 def intrinsic(data: bytes) -> int:
