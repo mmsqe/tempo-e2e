@@ -45,7 +45,36 @@ from .utils import (
     suggested_max_fee,
 )
 
-pytestmark = [pytest.mark.tempo, needs_contracts]
+pytestmark = [pytest.mark.tempo, pytest.mark.anchoring, needs_contracts]
+
+
+def intrinsic(data: bytes) -> int:
+    """What a transaction owes before it runs anything: 21k plus its calldata."""
+    return 21_000 + sum(4 if byte == 0 else 16 for byte in bytes(data))
+
+
+async def send_type_2(w3, chain_id, account, data, *, gas=None):
+    """A plain EIP-1559 transaction, which is what ``eth_estimateGas`` models.
+
+    The limit is the estimate unless given: TIP-1016 charges per new slot, so a large field
+    runs past any round number worth hard-coding.
+    """
+    sender = account.address
+    if gas is None:
+        gas = await w3.eth.estimate_gas({"to": ANCHORING_ADDRESS, "from": sender, "data": data})
+    tx = {
+        "to": ANCHORING_ADDRESS,
+        "data": data,
+        "value": 0,
+        "nonce": await w3.eth.get_transaction_count(sender),
+        "chainId": chain_id,
+        "gas": gas,
+        "maxFeePerGas": await suggested_max_fee(w3),
+        "maxPriorityFeePerGas": DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+        "type": 2,
+    }
+    raw = Account.sign_transaction(tx, account.key).raw_transaction
+    return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw))
 
 
 @pytest.fixture(scope="module")
@@ -219,6 +248,67 @@ class TestWrites:
         assert "cannot revoke the last registry admin" in refused
 
 
+class TestGas:
+    """What the node charges: forge prices its own VM, and an estimate is not a receipt."""
+
+    async def test_an_estimate_covers_the_write(self, w3, chain_id, funded_account):
+        data = ANCHORING.fns.addRegistry("estimate", "covers the receipt", "{}").data
+        tx = {"to": ANCHORING_ADDRESS, "from": funded_account.address, "data": data}
+
+        estimated = await w3.eth.estimate_gas(tx)
+        receipt = await send_type_2(w3, chain_id, funded_account, data, gas=estimated)
+
+        assert receipt["status"] == 1
+        assert estimated >= receipt["gasUsed"]
+
+    async def test_every_write_costs_more_than_its_calldata(self, w3, chain_id, funded_account):
+        """Each method runs: one that did nothing would stop at the intrinsic cost."""
+        editor = new_account().address
+        registry_id = await new_registry(w3, chain_id, funded_account, name="gas-matrix")
+        await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, add_record(registry_id, "sha:gas"))
+        [record] = await records(w3, registry_id, "sha:gas")
+        status = ANCHORING.fns.updateRecordStatus(registry_id, record.record_id, record.index, "Superseded")
+
+        writes = {
+            "addRegistry": ANCHORING.fns.addRegistry("gas-matrix-2", "", "{}").data,
+            "addRecord": add_record(registry_id, "sha:gas-2"),
+            "updateRecordStatus": status.data,
+            "grantRole": ANCHORING.fns.grantRole(registry_id, "", editor, "editor").data,
+            "revokeRole": ANCHORING.fns.revokeRole(registry_id, "", editor, "editor").data,
+        }
+
+        for method, data in writes.items():
+            receipt = await send_type_2(w3, chain_id, funded_account, data)
+            assert receipt["status"] == 1, method
+            assert receipt["gasUsed"] > intrinsic(data), method
+
+    async def test_a_bigger_metadata_costs_more(self, w3, chain_id, funded_account):
+        """Past the calldata it adds: the string lands in storage, a slot at a time."""
+        costs = {}
+        for size in (100, 1000):
+            data = ANCHORING.fns.addRegistry(f"gas-scale-{size}", "", "m" * size).data
+            receipt = await send_type_2(w3, chain_id, funded_account, data)
+            assert receipt["status"] == 1
+            costs[size] = receipt["gasUsed"] - intrinsic(data)
+
+        assert costs[1000] > costs[100]
+
+
+class TestFieldLimits:
+    """The caps in the module's record validation, at the byte either side."""
+
+    async def test_a_checksum_algo_over_its_cap_is_refused(self, w3, chain_id, funded_account):
+        """MAX_CHECKSUM_ALGO is 128 bytes."""
+        registry_id = await new_registry(w3, chain_id, funded_account, name="limits")
+
+        at_cap = add_record(registry_id, "sha:at-cap", algo="a" * 128)
+        assert (await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, at_cap))["status"] == 1
+
+        over = add_record(registry_id, "sha:over-cap", algo="a" * 129)
+        refused = await call_revert(w3, ANCHORING_ADDRESS, over, sender=funded_account.address)
+        assert "checksum algorithm exceeds max length" in refused
+
+
 class TestEoaGate:
     """Each way Tempo sends reaches the contract as the signer; a contract in between is refused."""
 
@@ -240,19 +330,8 @@ class TestEoaGate:
 
     async def test_type_2(self, w3, chain_id, funded_account):
         """What the old chain's integrations send."""
-        tx = {
-            "to": ANCHORING_ADDRESS,
-            "data": ANCHORING.fns.addRegistry("type-2", "", "").data,
-            "value": 0,
-            "nonce": await w3.eth.get_transaction_count(funded_account.address),
-            "chainId": chain_id,
-            "gas": STATE_WRITE_GAS,
-            "maxFeePerGas": await suggested_max_fee(w3),
-            "maxPriorityFeePerGas": DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
-            "type": 2,
-        }
-        raw = Account.sign_transaction(tx, funded_account.key).raw_transaction
-        receipt = await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw))
+        data = ANCHORING.fns.addRegistry("type-2", "", "").data
+        receipt = await send_type_2(w3, chain_id, funded_account, data, gas=STATE_WRITE_GAS)
         assert receipt["type"] == 2
         await self.assert_created_by(w3, receipt, funded_account.address)
 
@@ -328,4 +407,36 @@ class TestEoaGate:
         calls = [{"to": relay, "data": data}]
         receipt = await send_calls(w3, chain_id=chain_id, private_key=key, calls=calls, gas_limit=STATE_WRITE_GAS)
         assert receipt["status"] == 0
+        assert await registries(w3, page=Page(limit=1, reverse=True)) == [last], "nothing was written"
+
+    @staticmethod
+    def constructs_by_calling(data: bytes) -> bytes:
+        """Init code that calls the contract while constructing and deploys nothing: copy the
+        appended calldata to memory, call, keep whether it worked in slot 0, return no runtime."""
+        addr, size = ANCHORING_ADDRESS[2:], f"{len(data):04x}"
+        body = (
+            f"61{size} 61{{at}} 6000 39"  # codecopy(dest=0, at, size)
+            f" 6000 6000 61{size} 6000 6000 73{addr} 5a f1"  # call(gas, addr, 0, 0, size, 0, 0)
+            " 6000 55 6000 6000 f3"  # sstore(0, worked), return nothing
+        )
+        at = len(bytes.fromhex(body.format(at="0000").replace(" ", "")))
+        return bytes.fromhex(body.format(at=f"{at:04x}").replace(" ", "")) + data
+
+    async def test_a_constructor_is_refused(self, w3, chain_id, funded_account):
+        """A caller under construction has no code yet, so an extcodesize check alone would
+        admit it; the gate compares the sender to the origin first."""
+        [last] = await registries(w3, page=Page(limit=1, reverse=True))
+        data = ANCHORING.fns.addRegistry("constructed", "", "").data
+
+        receipt, deployed = await deploy_contract(
+            w3,
+            chain_id=chain_id,
+            private_key=funded_account.key.hex(),
+            bytecode=self.constructs_by_calling(data),
+        )
+
+        assert receipt["status"] == 1, "the deployment itself survives the refusal"
+        # Slot 0 holds the call's own verdict, so an init that never called would fail here too.
+        assert int.from_bytes(await w3.eth.get_storage_at(deployed, 0)) == 0, "the call was refused"
+        assert emitted(receipt, "AddRegistry") == []
         assert await registries(w3, page=Page(limit=1, reverse=True)) == [last], "nothing was written"

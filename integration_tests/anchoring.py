@@ -139,9 +139,9 @@ def bech32(address: str, hrp: str = "nvnm") -> str:
     return hrp + "1" + "".join("qpzry9x8gf2tvdw0s3jn54khce6mua7l"[w] for w in words)
 
 
-def add_record(registry_id: int, checksum: str, uri: str = "") -> bytes:
+def add_record(registry_id: int, checksum: str, uri: str = "", algo: str = "sha256") -> bytes:
     """``addRecord`` calldata. The chain fills in the timestamp, ids and ``isLatest``."""
-    record = (uri or f"https://ex.test/{checksum}", checksum, "sha256", '{"by":"tempo-e2e"}', "", "Active")
+    record = (uri or f"https://ex.test/{checksum}", checksum, algo, '{"by":"tempo-e2e"}', "", "Active")
     return ANCHORING.fns.addRecord((*record, 0, 0, False, registry_id)).data
 
 

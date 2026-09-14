@@ -16,7 +16,7 @@ from .anchoring import GO_TIME, anchoring_node, bech32, emitted, needs_contracts
 from .network import _resolve_bin, free_port, terminate_process_group
 from .utils import new_account, send_call
 
-pytestmark = [pytest.mark.tempo, needs_contracts]
+pytestmark = [pytest.mark.tempo, pytest.mark.anchoring, needs_contracts]
 
 SEARCH_PATH = "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search"
 
