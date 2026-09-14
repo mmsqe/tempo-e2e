@@ -134,7 +134,7 @@ class TestSeededCorpus:
     REGISTRIES = [
         Registry(1, "us-ca1", "First Circuit", bech32(ALICE), AT, '{"tranche":1}'),
         Registry(2, "us-ca9", "Ninth Circuit", bech32(BOB), AT, "{}"),
-        Registry(3, "us-ca1", "", bech32(ALICE), AT, ""),
+        Registry(3, "US-CA1", "", bech32(ALICE), AT, ""),
     ]
     # CITATION twice in registry 1 and once in registry 2; the rest of each record is shared.
     ALIKE = ("cite-canonical-v1", '{"cluster":8857414,"name":"Richmond v. Atwood"}', AT, "Active")
@@ -160,7 +160,9 @@ class TestSeededCorpus:
 
     async def test_names_and_roles(self, w3):
         assert [r.id for r in await registries_by_name(w3, "us-ca9")] == [2]
-        assert [r.id for r in await registries_by_name(w3, "us-ca1", Page(limit=2))] == [1, 3]
+        # Registry 3 is seeded as US-CA1, so the dump's index has to be keyed folded.
+        for spelling in ("us-ca1", "US-CA1", "Us-Ca1"):
+            assert [r.id for r in await registries_by_name(w3, spelling, Page(limit=2))] == [1, 3], spelling
         # Roles are keccak of the strings the keeper formats; a record role hex-encodes both parts.
         admin, editor = keccak(text="registry:1:admin"), keccak(text="registry:1:editor")
         record_admin = keccak(text=f"record:1:{self.CITATION.encode().hex()}:{b'admin'.hex()}")
@@ -168,6 +170,12 @@ class TestSeededCorpus:
         assert await ANCHORING.fns.roleMemberCount(admin).call(w3) == 1
         assert await ANCHORING.fns.hasRole(editor, self.BOB).call(w3)
         assert await ANCHORING.fns.hasRole(record_admin, self.BOB).call(w3)
+
+    async def test_only_ascii_folds(self, w3, chain_id, funded_account):
+        """The fold is A-Z only, so a capital from another script stays as written."""
+        registry_id = await new_registry(w3, chain_id, funded_account, "Ünicode-Fold")
+        assert [r.id for r in await registries_by_name(w3, "ÜNICODE-FOLD")] == [registry_id]
+        assert await registries_by_name(w3, "ünicode-fold") == []
 
     async def test_a_new_registry_takes_the_next_id(self, w3, chain_id, funded_account):
         me = funded_account.address
