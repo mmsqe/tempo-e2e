@@ -25,6 +25,7 @@ from .anchoring import (
     registries,
     registries_by_name,
 )
+from .network import ExternalNode
 from .utils import (
     DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
     RETURN_42_INIT,
@@ -82,8 +83,13 @@ def module_admin():
 
 
 @pytest.fixture(scope="module")
-def tempo(tmp_path_factory, module_admin):
-    """This module's node, in place of the session's."""
+def tempo(request, tmp_path_factory, module_admin):
+    """This module's node, in place of the session's, unless ``--tempo-rpc`` names one to attach
+    to: pointed at a node carrying the real dump, these cases read what was migrated."""
+    rpc_url = request.config.getoption("--tempo-rpc")
+    if rpc_url:
+        yield ExternalNode(rpc_url, request.config.getoption("--tempo-ws")).wait_for_rpc()
+        return
     with anchoring_node(tmp_path_factory.mktemp("anchoring"), module_admin.address) as node:
         yield node
 
@@ -125,6 +131,12 @@ class TestBinding:
 
 class TestSeededCorpus:
     """SeedFixture.t.sol's corpus and writes on top of it; none touch registries 1 and 2."""
+
+    @pytest.fixture(autouse=True)
+    def _needs_the_seeded_corpus(self, request):
+        """Only this module's own node carries this corpus; any other holds its own."""
+        if request.config.getoption("--tempo-rpc"):
+            pytest.skip("attached to another node, which carries a corpus of its own")
 
     ALICE = "0x00000000000000000000000000000000000A11cE"
     BOB = "0x0000000000000000000000000000000000000B0b"
