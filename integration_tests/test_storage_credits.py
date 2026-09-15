@@ -11,6 +11,7 @@ from .abi import DEX
 from .abi import STORAGE_CREDITS as SC
 from .utils import (
     STATE_WRITE_GAS,
+    active_forks,
     approve_call,
     call_revert,
     create_token,
@@ -39,7 +40,11 @@ async def test_fresh_account_reads_zero(w3):
 
 async def test_reserved_mode_reverts(w3):
     reason = await call_revert(w3, SC_ADDR, SC.fns.setMode(3).data)
-    assert "InvalidMode" in reason or "0xa0042b17" in reason
+    if "T11" in await active_forks(w3):
+        # Strict decoding refuses the out-of-range enum before dispatch, so no error selector.
+        assert reason == "execution reverted"
+    else:
+        assert "InvalidMode" in reason or "0xa0042b17" in reason
 
 
 async def test_valid_mode_and_budget_calls_succeed(w3, chain_id):

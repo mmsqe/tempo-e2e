@@ -8,6 +8,7 @@ from tempo.constants import PATH_USD
 
 from .utils import (
     EXPIRING_NONCE_KEY,
+    active_forks,
     build_tempo_tx,
     fund,
     latest_timestamp,
@@ -19,7 +20,13 @@ from .utils import (
 
 pytestmark = pytest.mark.tempo
 
-MAX_EXPIRY_SECS = 30  # EXPIRING_NONCE_MAX_EXPIRY_SECS: valid_before must land in (now, now+30]
+# valid_before must land in (now, now + the window]. TIP-1093 widened it at T11.
+PRE_T11_MAX_EXPIRY_SECS = 30
+T11_MAX_EXPIRY_SECS = 300
+
+
+async def max_expiry_secs(w3) -> int:
+    return T11_MAX_EXPIRY_SECS if "T11" in await active_forks(w3) else PRE_T11_MAX_EXPIRY_SECS
 
 
 def _expiring_tx(chain_id, *, valid_before, max_fee, nonce=0):
@@ -70,13 +77,27 @@ async def test_replayed_expiring_nonce_is_rejected(w3, chain_id):
 
 
 async def test_window_beyond_max_expiry_is_rejected(w3, chain_id):
-    """E3: valid_before further than 30s out is outside (now, now+30] -> InvalidExpiringNonceExpiry."""
+    """E3: valid_before past the window -> InvalidExpiringNonceExpiry."""
     acct = new_account()
     await fund(w3, acct.address)
-    far = await latest_timestamp(w3) + MAX_EXPIRY_SECS + 90
+    far = await latest_timestamp(w3) + await max_expiry_secs(w3) + 90
     tx = _expiring_tx(chain_id, valid_before=far, max_fee=await suggested_max_fee(w3))
     with pytest.raises(Exception):
         await w3.eth.send_raw_transaction(_raw(tx, acct))
+
+
+async def test_t11_widens_the_window(w3, chain_id):
+    """A valid_before the pre-T11 window refused is accepted once T11 is active."""
+    if "T11" not in await active_forks(w3):
+        pytest.skip("the node under test is older than T11")
+    acct = new_account()
+    await fund(w3, acct.address)
+    beyond_old = await latest_timestamp(w3) + PRE_T11_MAX_EXPIRY_SECS + 90
+    assert beyond_old <= await latest_timestamp(w3) + T11_MAX_EXPIRY_SECS
+    tx = _expiring_tx(chain_id, valid_before=beyond_old, max_fee=await suggested_max_fee(w3))
+
+    receipt = await send_tempo_tx(w3, tx, acct.key.hex())
+    assert receipt["status"] == 1
 
 
 async def test_nonzero_nonce_is_rejected(w3, chain_id):

@@ -12,7 +12,8 @@ pytestmark = pytest.mark.consensus
 
 KILL_ROUNDS = 3
 
-STRICT_REJECTION = "strict consensus startup requires a finalized certificate archive"
+# Startup says this when the execution layer has state the certificates cannot account for.
+STRICT_REJECTION = "consensus startup requires a finalized certificate archive"
 
 
 def _require_fault_tolerance(num_validators: int) -> None:
@@ -23,17 +24,6 @@ def _require_fault_tolerance(num_validators: int) -> None:
 
 def _node_dir(net, moniker: str):
     return net.data_dir / moniker
-
-
-def _launch_script(net, moniker: str):
-    """The wrapper script the backend actually execs.
-
-    Docker's compose command is ``docker-run.sh`` (container-relative paths);
-    supervisord runs ``run.sh``.  Both are generated per node, so patching the
-    wrong one silently leaves the node's flags untouched.
-    """
-    name = "docker-run.sh" if isinstance(net, DockerCluster) else "run.sh"
-    return _node_dir(net, moniker) / name
 
 
 def _log_size(net, moniker: str) -> int:
@@ -71,23 +61,42 @@ def _ensure_started(net, moniker: str) -> None:
         pass
 
 
-def _stop_and_wipe_consensus_storage(net, moniker: str) -> int:
-    """Stop the node and delete its consensus storage, leaving only EL state.
+def _stop_and_take_consensus_storage(net, moniker: str):
+    """Stop the node and move its consensus storage aside, leaving only EL state.
 
-    Returns a node.log offset from after the stop: panic assertions must only
-    cover the restart, not the deliberate SIGTERM (a stop that catches an
-    in-flight block dispatch panics in marshal instead of exiting cleanly).
+    Moved, not deleted: the cluster is shared, and a validator that cannot start is one short
+    of quorum for every test after this one. The returned node.log offset starts after the
+    stop, so panic assertions skip the deliberate SIGTERM, which panics in marshal when it
+    catches an in-flight block dispatch.
     """
     net.stop_node(moniker)
     time.sleep(1)  # let the process exit before touching its storage
     consensus_dir = _node_dir(net, moniker) / "consensus"
     assert consensus_dir.is_dir(), f"expected consensus storage at {consensus_dir}"
+    saved = consensus_dir.with_name("consensus.saved")
     try:
-        shutil.rmtree(consensus_dir)
-    except PermissionError:
+        shutil.rmtree(saved, ignore_errors=True)
+        shutil.move(str(consensus_dir), str(saved))
+    except OSError:
         _ensure_started(net, moniker)
         pytest.skip("consensus storage not writable from the host (docker-owned files)")
-    return _log_size(net, moniker)
+    return _log_size(net, moniker), saved
+
+
+def _restore_consensus_storage(net, moniker: str, saved) -> None:
+    """Put the saved consensus storage back, replacing whatever the refused start left."""
+    consensus_dir = _node_dir(net, moniker) / "consensus"
+    shutil.rmtree(consensus_dir, ignore_errors=True)
+    shutil.move(str(saved), str(consensus_dir))
+
+
+def _wait_for_log(net, moniker: str, since: int, needle: str, timeout: float = 60.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if needle in _log_since(net, moniker, since):
+            return True
+        time.sleep(1)
+    return False
 
 
 def test_unclean_kill_recovers(consensus_net, num_validators):
@@ -117,53 +126,32 @@ def test_unclean_kill_recovers(consensus_net, num_validators):
     _assert_no_panic(consensus_net, victim, log_mark)
 
 
-def test_rejoin_after_consensus_storage_loss(consensus_net, num_validators):
-    """A validator with only EL state (no finalization certificates) rejoins
-    under today's non-strict startup."""
+def test_certificate_less_restart_is_refused(consensus_net, num_validators):
+    """A validator that keeps its EL state but loses its finalization certificates must refuse
+    to start, and must rejoin once they are back.
+
+    Startup began requiring the certificates unconditionally with commonware 2026.7.0;
+    ``--consensus.strict-startup``, which used to select this, is now a no-op that only parses.
+    """
     _require_fault_tolerance(num_validators)
     victim = f"node{num_validators - 1}"
     primary = consensus_net.node_rpc_url("node0")
     victim_rpc = consensus_net.node_rpc_url(victim)
 
-    log_mark = _stop_and_wipe_consensus_storage(consensus_net, victim)
-
-    _ensure_started(consensus_net, victim)
-    target = poll_height(primary) + 2
-    assert wait_height(victim_rpc, target, timeout=120) >= target, "validator with EL-only state failed to rejoin"
-    _assert_no_panic(consensus_net, victim, log_mark)
-
-
-def test_strict_startup_requires_certificates(consensus_net, num_validators):
-    """With --consensus.strict-startup, the same certificate-less restore must
-    be rejected — snapshots will have to bundle finalization certificates once
-    strict startup becomes the default. Still opt-in as of tempo v1.10.2
-    (``consensus.strict-startup`` defaults to false)."""
-    _require_fault_tolerance(num_validators)
-    victim = "node2"  # distinct from the other tests' victims
-    primary = consensus_net.node_rpc_url("node0")
-    victim_rpc = consensus_net.node_rpc_url(victim)
-    run_sh = _launch_script(consensus_net, victim)
-    original = run_sh.read_text()
-
-    log_mark = _stop_and_wipe_consensus_storage(consensus_net, victim)
-
-    run_sh.write_text(original.rstrip("\n") + " \\\n  '--consensus.strict-startup'\n")
+    log_mark, saved = _stop_and_take_consensus_storage(consensus_net, victim)
     try:
         _ensure_started(consensus_net, victim)
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            if STRICT_REJECTION in _log_since(consensus_net, victim, log_mark):
-                break
-            time.sleep(1)
-        else:
-            pytest.fail("strict startup accepted an execution layer with no finalization certificates")
+        assert _wait_for_log(consensus_net, victim, log_mark, STRICT_REJECTION), (
+            "startup accepted an execution layer with no finalization certificates"
+        )
     finally:
-        # Drop the flag and rejoin non-strict, leaving the cluster healthy.
         consensus_net.stop_node(victim)
-        run_sh.write_text(original)
+        time.sleep(1)
+        _restore_consensus_storage(consensus_net, victim, saved)
         _ensure_started(consensus_net, victim)
 
+    # The cluster is shared, so this has to hand back every validator it was given.
     target = poll_height(primary) + 2
     assert wait_height(victim_rpc, target, timeout=120) >= target, (
-        "victim did not rejoin after restoring its launch script"
+        "victim did not rejoin once its certificates were back"
     )

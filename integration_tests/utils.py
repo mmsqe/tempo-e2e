@@ -257,6 +257,15 @@ async def latest_timestamp(w3: AsyncWeb3) -> int:
     return (await w3.eth.get_block("latest"))["timestamp"]
 
 
+async def active_forks(w3: AsyncWeb3) -> set[str]:
+    """The hardforks the node reports as active, named as ``tempo_forkSchedule`` names them,
+    so a test can state what each fork brings instead of pinning one binary."""
+    resp = await w3.provider.make_request("tempo_forkSchedule", [])
+    if resp.get("error"):
+        raise RuntimeError(f"tempo_forkSchedule failed: {resp['error']}")
+    return {fork["name"].upper() for fork in resp["result"]["schedule"] if fork["active"]}
+
+
 async def wait_for_block(w3: AsyncWeb3, number: int, *, timeout: float = 300.0, poll: float = 0.5) -> int:
     deadline = asyncio.get_running_loop().time() + timeout
     while (height := await w3.eth.block_number) < number:
