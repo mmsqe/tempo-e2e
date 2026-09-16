@@ -265,3 +265,22 @@ ANCHORING = Contract.from_abi(
     ],
     to=ANCHORING_ADDRESS,
 )
+
+# The module admin at the old chain's `params.Admin` address: a 2-of-3 multisig contract placed in
+# genesis, since no key can sign for an amino multisig's address. It calls the anchoring contract
+# and nothing else. Owners are slots 0..2, as the alloc writes them.
+MODULE_ADMIN_ADDRESS = to_checksum_address("0x0582bfb2e8561d48636e78f0e6b139d5a842be8f")
+MODULE_ADMIN_MULTISIG = Contract.from_abi(
+    [
+        "function propose(bytes data) returns (uint256 id)",
+        "function confirm(uint256 id)",
+        "function confirmed(uint256 id, address owner) view returns (bool)",
+        "function proposal(uint256 id) view returns (bytes data, uint8 confirmations, bool executed)",
+        "function owners() view returns (address[3], uint8)",
+        "function proposalCount() view returns (uint256)",
+        "event Proposed(uint256 indexed id, address indexed owner, bytes data)",
+        "event Confirmed(uint256 indexed id, address indexed owner, uint8 confirmations)",
+        "event Executed(uint256 indexed id, bytes returned)",
+    ],
+    to=MODULE_ADMIN_ADDRESS,
+)

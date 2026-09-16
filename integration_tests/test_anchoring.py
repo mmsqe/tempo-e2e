@@ -19,6 +19,7 @@ from .anchoring import (
     add_record,
     anchoring_node,
     bech32,
+    deploy_relay,
     emitted,
     new_registry,
     records,
@@ -331,12 +332,6 @@ class TestFieldLimits:
 class TestEoaGate:
     """Each way Tempo sends reaches the contract as the signer; a contract in between is refused."""
 
-    # Relays its calldata to the anchoring contract and returns the answer, revert data included:
-    # calldatacopy, call, returndatacopy, then revert or (at 0x33) return.
-    RELAY_RUNTIME = (
-        "36 6000 6000 37  6000 6000 36 6000 6000 73{addr} 5a f1  3d 6000 6000 3e  6033 57  3d 6000 fd  5b 3d 6000 f3"
-    )
-
     @staticmethod
     async def assert_created_by(w3, receipt, account: str) -> None:
         """``receipt`` created a registry with ``account`` as its caller, creator and admin."""
@@ -414,17 +409,15 @@ class TestEoaGate:
         )
 
     async def test_a_contract_is_refused(self, w3, chain_id, funded_account):
-        runtime = bytes.fromhex(self.RELAY_RUNTIME.format(addr=ANCHORING_ADDRESS[2:]))
-        size = f"60{len(runtime):02x}"
-        init = bytes.fromhex(f"{size} 600c 6000 39 {size} 6000 f3") + runtime  # copy the runtime out, return it
-        key = funded_account.key.hex()
-        _, relay = await deploy_contract(w3, chain_id=chain_id, private_key=key, bytecode=init)
+        relay = await deploy_relay(w3, chain_id, funded_account)
         data = ANCHORING.fns.addRegistry("relayed", "", "").data
         assert "sender not an eoa" in await call_revert(w3, relay, data, sender=funded_account.address)
 
         [last] = await registries(w3, page=Page(limit=1, reverse=True))
         calls = [{"to": relay, "data": data}]
-        receipt = await send_calls(w3, chain_id=chain_id, private_key=key, calls=calls, gas_limit=STATE_WRITE_GAS)
+        receipt = await send_calls(
+            w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=calls, gas_limit=STATE_WRITE_GAS
+        )
         assert receipt["status"] == 0
         assert await registries(w3, page=Page(limit=1, reverse=True)) == [last], "nothing was written"
 

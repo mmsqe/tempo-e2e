@@ -10,14 +10,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
-from .abi import ANCHORING, ANCHORING_ADDRESS
+from .abi import ANCHORING, ANCHORING_ADDRESS, MODULE_ADMIN_ADDRESS
 from .network import TempoNode, default_genesis, free_port, generate_dev_genesis, resolve_tempo_bin
-from .utils import send_call
+from .utils import deploy_contract, send_call
 
 LAYOUT = Path(__file__).parent.parent / "contracts" / "layout"
 if not LAYOUT.is_dir():
     raise RuntimeError(f"{LAYOUT} is missing: run `git submodule update --init contracts`")
 RUNTIME_CODE = bytes.fromhex((LAYOUT / "anchoring.bin").read_text().strip().removeprefix("0x"))
+MULTISIG_RUNTIME = bytes.fromhex((LAYOUT / "module-admin-multisig.bin").read_text().strip().removeprefix("0x"))
 
 # Go's time.Time.String() in UTC, whole seconds: how the contract writes block time.
 GO_TIME = "%Y-%m-%d %H:%M:%S +0000 UTC"
@@ -67,18 +68,36 @@ def seed_fixture(module_admin: str | None = None) -> dict[int, int]:
     return slots
 
 
-def genesis_with_anchoring(
-    output_dir: Path, *, storage: dict[int, int] | None = None, fork_times: dict[str, int] | None = None
-) -> Path:
-    """The dev genesis plus the contract's code, and ``storage`` if given, at ``ANCHORING_ADDRESS``."""
-    base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
-    genesis = json.loads(base.read_text())
-    account = {"balance": "0x0", "code": "0x" + RUNTIME_CODE.hex(), "nonce": "0x1"}
+def _account(code: bytes, storage: dict[int, int] | None = None) -> dict:
+    """A genesis alloc entry for placed code: no balance, nonce 1 as a deployment would leave."""
+    account = {"balance": "0x0", "code": "0x" + code.hex(), "nonce": "0x1"}
     if storage:
         account["storage"] = {f"0x{slot:064x}": f"0x{value:064x}" for slot, value in storage.items()}
-    key = ANCHORING_ADDRESS.lower()
-    assert key not in genesis["alloc"], f"xtask's genesis already has {ANCHORING_ADDRESS}"
-    genesis["alloc"][key] = account
+    return account
+
+
+def genesis_with_anchoring(
+    output_dir: Path,
+    *,
+    storage: dict[int, int] | None = None,
+    fork_times: dict[str, int] | None = None,
+    multisig_owners: list[str] | None = None,
+) -> Path:
+    """The dev genesis plus the contract's code, and ``storage`` if given, at ``ANCHORING_ADDRESS``.
+
+    With ``multisig_owners``, the module admin multisig too, at the old chain's admin address with
+    those owners in its slots 0..2, as the launch genesis places it.
+    """
+    base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
+    genesis = json.loads(base.read_text())
+    placed = {ANCHORING_ADDRESS: _account(RUNTIME_CODE, storage)}
+    if multisig_owners:
+        slots = {i: int(owner, 16) for i, owner in enumerate(multisig_owners)}
+        placed[MODULE_ADMIN_ADDRESS] = _account(MULTISIG_RUNTIME, slots)
+    for address, account in placed.items():
+        key = address.lower()
+        assert key not in genesis["alloc"], f"xtask's genesis already has {address}"
+        genesis["alloc"][key] = account
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "genesis.json"
     path.write_text(json.dumps(genesis))
@@ -102,10 +121,10 @@ def load_dump(genesis: Path, datadir: Path, slots: dict[int, int]) -> None:
 
 
 @contextmanager
-def anchoring_node(base: Path, module_admin: str) -> Iterator[TempoNode]:
+def anchoring_node(base: Path, module_admin: str, *, multisig_owners: list[str] | None = None) -> Iterator[TempoNode]:
     """A dev node with the contract in genesis, the seed fixture loaded, and ``module_admin`` in place
     of the fixture's keyless one. The datadir is kept; ``-s`` prints how to resume it."""
-    genesis = genesis_with_anchoring(base)
+    genesis = genesis_with_anchoring(base, multisig_owners=multisig_owners)
     load_dump(genesis, base / "node0", seed_fixture(module_admin))
     node = TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
     try:
@@ -113,6 +132,22 @@ def anchoring_node(base: Path, module_admin: str) -> Iterator[TempoNode]:
     finally:
         node.stop()
         print(f"\n  anchoring node kept: python -m integration_tests.devnode up --datadir {node.datadir}")
+
+
+# Relays its calldata to the anchoring contract and returns the answer, revert data included:
+# calldatacopy, call, returndatacopy, then revert or (at 0x33) return.
+RELAY_RUNTIME = (
+    "36 6000 6000 37  6000 6000 36 6000 6000 73{addr} 5a f1  3d 6000 6000 3e  6033 57  3d 6000 fd  5b 3d 6000 f3"
+)
+
+
+async def deploy_relay(w3, chain_id: int, account) -> str:
+    """A contract that forwards a call to the anchoring contract, which the EOA gate refuses."""
+    runtime = bytes.fromhex(RELAY_RUNTIME.format(addr=ANCHORING_ADDRESS[2:]))
+    size = f"60{len(runtime):02x}"
+    init = bytes.fromhex(f"{size} 600c 6000 39 {size} 6000 f3") + runtime  # copy the runtime out, return it
+    _, relay = await deploy_contract(w3, chain_id=chain_id, private_key=account.key.hex(), bytecode=init)
+    return relay
 
 
 def bech32(address: str, hrp: str = "nvnm") -> str:
