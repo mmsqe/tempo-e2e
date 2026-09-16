@@ -1,0 +1,11 @@
+# Builds Reader.sol against the contracts submodule; tempo_vs_export.py runs this on first use.
+[profile.default]
+solc = "0.8.28"
+src = "src"
+out = "out"
+libs = []
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+remappings = ["anchoring/=../../contracts/src/"]
+allow_paths = ["../../contracts"]

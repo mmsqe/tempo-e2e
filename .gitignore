@@ -23,3 +23,7 @@ node-data/
 # Local env
 .env
 .cache/
+
+# Forge output for the anchoring reader
+integration_tests/reader/out/
+integration_tests/reader/cache/
