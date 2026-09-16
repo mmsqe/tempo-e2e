@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -33,11 +34,14 @@ FAR_FUTURE = 4_000_000_000
 ACTIVATION_LEAD = 30
 
 MMR_FORK = "t10_time"  # put a precompile, which answers before code, at 0x…0a00 until nvnmchain-tempo#10
+ANCHORING_FORK = "nvnm1_time"  # installs the anchoring runtime over the code the alloc placed
 
 
 def _fork_label(name: str) -> str:
-    """The name ``tempo_forkSchedule`` reports: ``t1a_time`` -> ``T1a``."""
-    return f"T{name.removeprefix('t').removesuffix('_time')}"
+    """The name ``tempo_forkSchedule`` reports, which is the enum variant: ``t10_time`` -> ``T10``,
+    ``t1a_time`` -> ``T1A``, ``nvnm1_time`` -> ``Nvnm1``."""
+    fork = name.removesuffix("_time")
+    return fork.upper() if re.fullmatch(r"t\d+[a-z]?", fork) else fork.capitalize()
 
 
 def _read_alloc(genesis: Path) -> dict[str, dict]:
@@ -176,6 +180,44 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
         # Post-fork: the executor installed it all on a chain already running without it.
         assert _active_fork(w3) == _fork_label(forks[-1])
         assert fingerprints(w3) == fingerprints(head_w3)
+
+
+def test_crossing_nvnm1_installs_the_anchoring_runtime(tmp_path):
+    """The upgrade path itself: the boundary replaces the code, and the corpus under it survives.
+
+    Genesis places a stub where a released runtime would sit, so the swap is visible; a launch
+    genesis already holding the current runtime crosses this boundary as a no-op.
+    """
+    if ANCHORING_FORK not in xtask_forks():
+        pytest.skip(f"this tempo-xtask cannot schedule {ANCHORING_FORK}")
+    activation = int(time.time()) + ACTIVATION_LEAD
+    seed = seed_fixture()
+    stub = bytes.fromhex("60006000fd")  # any code at all, so the address is not an empty one
+    genesis = genesis_with_anchoring(
+        tmp_path, storage=seed, fork_times=_schedule(ANCHORING_FORK, activation), code=stub
+    )
+    node = TempoNode(
+        datadir=tmp_path / "node0", log_path=tmp_path / "nvnm1.log", genesis=genesis, http_port=free_port()
+    )
+    listing = ANCHORING.fns.registries(0, Page()).data
+
+    def slots(w3: Web3) -> dict[str, str]:
+        written = _fingerprint(w3, ANCHORING_ADDRESS, map(hex, seed))
+        return {slot: value for slot, value in written.items() if slot not in ("code", "answer")}
+
+    with _running(node) as w3:
+        _assert_pre_fork(w3, activation, _fork_label(ANCHORING_FORK))
+        assert _code(w3, ANCHORING_ADDRESS) == stub, "the alloc did not place the stub"
+        before = slots(w3)
+
+        _wait_past(w3, activation)
+
+        assert _active_fork(w3) == _fork_label(ANCHORING_FORK)
+        assert _code(w3, ANCHORING_ADDRESS) == RUNTIME_CODE, "the boundary did not install the runtime"
+        assert slots(w3) == before, "the swap moved storage, which holds the corpus"
+        # The corpus was there all along; the boundary only brought the code that reads it.
+        answer = bytes(w3.eth.call({"to": ANCHORING_ADDRESS, "data": listing}))
+        assert b"us-ca1" in answer, "the installed runtime does not read the corpus already in storage"
 
 
 def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
