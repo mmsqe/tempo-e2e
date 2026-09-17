@@ -119,6 +119,7 @@ def generate_dev_genesis(
     fork_times: dict[str, int] | None = None,
     chain_id: int | None = None,
     epoch_length: int | None = None,
+    module_admin_owners: list[str] | None = None,
 ) -> Path:
     """The dev genesis: ``$TEMPO_GENESIS`` if set, else generated in ``output_dir`` via ``tempo-xtask``.
 
@@ -133,13 +134,16 @@ def generate_dev_genesis(
     ``chain_id`` overrides xtask's default. ``epoch_length`` raises the epoch boundary a
     single-validator chain cannot cross: past it the chain stops producing blocks for good,
     so a run long enough to reach the default 302,400 has to say so up front.
+
+    ``module_admin_owners`` places the anchoring contract and its module admin, as the launch
+    genesis carries them; without it neither is in the alloc.
     """
     genesis = output_dir / "genesis.json"
     if fork_times:
         unknown = sorted(set(fork_times) - set(xtask_forks()))
         if unknown:
             raise ValueError(f"tempo-xtask cannot schedule {unknown}; it knows {list(xtask_forks())}")
-    if not fork_times and chain_id is None and epoch_length is None:
+    if not fork_times and chain_id is None and epoch_length is None and module_admin_owners is None:
         # Only a default genesis may be supplied or reused: neither a prebuilt nor a leftover
         # file can be trusted to carry a particular schedule, chain id or epoch length.
         env_genesis = os.environ.get("TEMPO_GENESIS")
@@ -165,6 +169,7 @@ def generate_dev_genesis(
             *[a for name, ts in (fork_times or {}).items() for a in (f"--{name.replace('_', '-')}", str(ts))],
             *(("--chain-id", str(chain_id)) if chain_id is not None else ()),
             *(("--epoch-length", str(epoch_length)) if epoch_length is not None else ()),
+            *(("--module-admin-owners", ",".join(module_admin_owners)) if module_admin_owners else ()),
         ],
         capture_output=True,
         text=True,
