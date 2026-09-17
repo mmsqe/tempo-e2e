@@ -11,9 +11,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # NVM runs a fork of tempo
-  TEMPO_REPO: mmsqe/tempo
-  TEMPO_REF: main
+  # The images the tempo repo's Docker Build workflow publishes, rather than a branch of
+  # anyone's fork. Bump the tag to the release being tested.
+  TEMPO_IMAGE: ghcr.io/nvnm-chain/tempo
+  TEMPO_XTASK_IMAGE: ghcr.io/nvnm-chain/tempo-xtask
+  TEMPO_TAG: sha-cb8ce92
 
 jobs:
   lint:
@@ -52,87 +54,24 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
-      - name: Resolve the tempo revision
-        id: tempo
+      # The node is the image the tempo repo publishes, so the suite runs what a validator
+      # runs. Only the two binaries come out of it: the harness launches the node itself,
+      # and needs tempo-xtask on the host because the hardfork tests generate their own
+      # genesis to schedule a fork past block 0.
+      # Not cached: the image is 390 MB to pull and the binaries are 1.3 GB unstripped, so
+      # a cache round trip costs more than fetching them again.
+      - name: Take the binaries out of the published images
         run: |
           set -euo pipefail
-          sha=$(git ls-remote "https://github.com/$TEMPO_REPO" "refs/heads/$TEMPO_REF" | cut -f1)
-          [ -n "$sha" ] || { echo "no such branch: $TEMPO_REPO@$TEMPO_REF" >&2; exit 1; }
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "tempo node: $TEMPO_REPO@$TEMPO_REF ($sha)"
-
-      # Keyed on the node revision, so the build only reruns when that branch moves.
-      - name: Restore the tempo node binary
-        id: tempo-bin
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ runner.temp }}/tempo/tempo
-            ${{ runner.temp }}/tempo/tempo-xtask
-          key: tempo-bins-${{ runner.os }}-${{ steps.tempo.outputs.sha }}
-
-      # Published per commit on main by tempo's ci-bins workflow. A miss is routine -- the
-      # build may still be running, or the asset may have been pruned -- so fall through
-      # to the source build rather than failing.
-      - name: Download the prebuilt tempo node binaries
-        id: tempo-dl
-        if: steps.tempo-bin.outputs.cache-hit != 'true'
-        env:
-          SHA: ${{ steps.tempo.outputs.sha }}
-        run: |
-          set -uo pipefail
-          url="https://github.com/$TEMPO_REPO/releases/download/ci-bins/tempo-bins-$SHA-x86_64-linux.tar.gz"
-          mkdir -p "$RUNNER_TEMP/tempo"
-          # Bare --retry so a 404, the ordinary "not built yet", fails fast instead of
-          # backing off. Extracting inside the condition keeps a truncated tarball from
-          # reaching the suite.
-          if curl -fsSL --retry 3 -o "$RUNNER_TEMP/bins.tar.gz" "$url" \
-            && tar -xzf "$RUNNER_TEMP/bins.tar.gz" -C "$RUNNER_TEMP/tempo"; then
-            echo "downloaded=true" >> "$GITHUB_OUTPUT"
-            echo "using prebuilt binaries for $SHA"
-          else
-            echo "downloaded=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::no prebuilt binaries for $SHA; building from source"
-          fi
-
-      - name: Check out the tempo node
-        if: steps.tempo-bin.outputs.cache-hit != 'true' && steps.tempo-dl.outputs.downloaded != 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.TEMPO_REPO }}
-          ref: ${{ steps.tempo.outputs.sha }}
-          path: tempo-src
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.tempo-bin.outputs.cache-hit != 'true' && steps.tempo-dl.outputs.downloaded != 'true'
-
-      # Linking a reth-derived binary with GNU ld costs minutes; tempo's own CI uses mold.
-      - uses: rui314/setup-mold@v1
-        if: steps.tempo-bin.outputs.cache-hit != 'true' && steps.tempo-dl.outputs.downloaded != 'true'
-
-      - uses: Swatinem/rust-cache@v2
-        if: steps.tempo-bin.outputs.cache-hit != 'true' && steps.tempo-dl.outputs.downloaded != 'true'
-        with:
-          workspaces: tempo-src
-
-      # Default features only: the image's asm-keccak/jemalloc/otlp are perf and
-      # observability knobs the harness does not need. tempo-xtask comes along because
-      # the hardfork tests generate their own genesis to schedule a fork past block 0 --
-      # a prebuilt one cannot express that.
-      - name: Build the tempo node binaries
-        if: steps.tempo-bin.outputs.cache-hit != 'true' && steps.tempo-dl.outputs.downloaded != 'true'
-        working-directory: tempo-src
-        env:
-          # Even with every dependency cached, release's thin LTO plus the link was 10m15s
-          # of an 11m38s build here. The harness needs a correct node, not a fast one.
-          # ci-bins sets the same overrides so both paths agree.
-          CARGO_PROFILE_RELEASE_LTO: "false"
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
-        run: |
-          set -euo pipefail
-          cargo build --release --bin tempo --bin tempo-xtask
-          mkdir -p "$RUNNER_TEMP/tempo"
-          cp target/release/tempo target/release/tempo-xtask "$RUNNER_TEMP/tempo/"
+          dir="$RUNNER_TEMP/tempo"
+          mkdir -p "$dir"
+          for image in "$TEMPO_IMAGE" "$TEMPO_XTASK_IMAGE"; do
+            bin="${image##*/}"
+            docker pull "$image:$TEMPO_TAG"
+            id="$(docker create "$image:$TEMPO_TAG")"
+            docker cp "$id:/usr/local/bin/$bin" "$dir/$bin"
+            docker rm "$id" > /dev/null
+          done
 
       - name: Point the harness at the node + genesis
         run: |

@@ -38,7 +38,7 @@ markers = [
     "slow: long-running tests",
     "tempo: tempo-native feature tests (TIP-20, AA tx, access keys, fees)",
     "consensus: requires a multi-validator consensus network",
-    "anchoring: needs the private nvnmchain-contracts submodule at contracts/",
+    "anchoring: needs the nvnmchain-contracts submodule at contracts/",
 ]
 
 [tool.ruff]
