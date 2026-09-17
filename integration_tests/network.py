@@ -95,16 +95,22 @@ def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None
 def xtask_forks() -> tuple[str, ...]:
     """Hardforks the installed ``tempo-xtask`` can schedule, oldest first (``"t0_time", ...``).
 
-    Read off its ``--tN-time`` flags, so the binary is the authority on which forks exist.
+    Read off its ``--<fork>-time`` flags, so the binary is the authority on which forks exist.
     One built before a fork was declared lacks its flag, letting a test that schedules it
     skip with a clear reason instead of dying in clap.
     """
     result = subprocess.run([resolve_xtask_bin(), "generate-genesis", "--help"], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"tempo-xtask generate-genesis --help failed (exit {result.returncode}):\n{result.stderr}")
-    forks = re.findall(r"--t(\d+)([a-z]?)-time", result.stdout)
-    # Numeric sort, point releases after their base: t1 < t1a < t2 < ... < t9 < t10.
-    return tuple(f"t{num}{point}_time" for num, point in sorted(forks, key=lambda f: (int(f[0]), f[1])))
+    forks = re.findall(r"--([a-z0-9]+)-time", result.stdout)
+
+    def order(fork: str) -> tuple[int, int, str]:
+        # Numeric sort, point releases after their base: t1 < t1a < t2 < ... < t9 < t10. This
+        # chain's own forks are appended after the T series, as they are in the enum.
+        numbered = re.fullmatch(r"t(\d+)([a-z]?)", fork)
+        return (0, int(numbered[1]), numbered[2]) if numbered else (1, 0, fork)
+
+    return tuple(f"{fork}_time" for fork in sorted(forks, key=order))
 
 
 def generate_dev_genesis(
