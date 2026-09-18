@@ -83,19 +83,20 @@ def genesis_with_anchoring(
     fork_times: dict[str, int] | None = None,
     multisig_owners: list[str] | None = None,
     code: bytes = RUNTIME_CODE,
+    multisig_code: bytes = MULTISIG_RUNTIME,
 ) -> Path:
     """The dev genesis plus the contract's code, and ``storage`` if given, at ``ANCHORING_ADDRESS``.
 
     With ``multisig_owners``, the module admin multisig too, at the old chain's admin address with
-    those owners in its slots 0..2, as the launch genesis places it. ``code`` stands in for an
-    older release, for a test that watches a fork boundary replace it.
+    those owners in its slots 0..2, as the launch genesis places it. ``code`` and ``multisig_code``
+    stand in for an older release, for a test that watches a fork boundary replace one.
     """
     base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
     genesis = json.loads(base.read_text())
     placed = {ANCHORING_ADDRESS: _account(code, storage)}
     if multisig_owners:
         slots = {i: int(owner, 16) for i, owner in enumerate(multisig_owners)}
-        placed[MODULE_ADMIN_ADDRESS] = _account(MULTISIG_RUNTIME, slots)
+        placed[MODULE_ADMIN_ADDRESS] = _account(multisig_code, slots)
     for address, account in placed.items():
         key = address.lower()
         assert key not in genesis["alloc"], f"xtask's genesis already has {address}"

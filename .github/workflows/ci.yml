@@ -11,11 +11,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The images the tempo repo's Docker Build workflow publishes, rather than a branch of
-  # anyone's fork. Bump the tag to the release being tested.
+  # Published by tempo's Docker Build, which only a release-line tag triggers. The image tag
+  # drops the git tag's leading `v`.
   TEMPO_IMAGE: ghcr.io/nvnm-chain/tempo
   TEMPO_XTASK_IMAGE: ghcr.io/nvnm-chain/tempo-xtask
-  TEMPO_TAG: sha-cb8ce92
+  TEMPO_TAG: 1.14.0-nvnm.1
 
 jobs:
   lint:

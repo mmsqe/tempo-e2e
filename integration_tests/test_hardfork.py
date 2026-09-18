@@ -20,8 +20,8 @@ from pathlib import Path
 import pytest
 from web3 import Web3
 
-from .abi import ANCHORING, ANCHORING_ADDRESS
-from .anchoring import RUNTIME_CODE, Page, genesis_with_anchoring, seed_fixture
+from .abi import ANCHORING, ANCHORING_ADDRESS, MODULE_ADMIN_ADDRESS, MODULE_ADMIN_MULTISIG
+from .anchoring import MULTISIG_RUNTIME, RUNTIME_CODE, Page, genesis_with_anchoring, seed_fixture
 from .network import TempoNode, dev_node, free_port, generate_dev_genesis, xtask_forks
 
 pytestmark = [pytest.mark.tempo, pytest.mark.slow]
@@ -182,42 +182,58 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
         assert fingerprints(w3) == fingerprints(head_w3)
 
 
-def test_crossing_nvnm1_installs_the_anchoring_runtime(tmp_path):
-    """The upgrade path itself: the boundary replaces the code, and the corpus under it survives.
-
-    Genesis places a stub where a released runtime would sit, so the swap is visible; a launch
-    genesis already holding the current runtime crosses this boundary as a no-op.
+def test_crossing_nvnm1_installs_the_anchoring_contracts(tmp_path):
+    """The upgrade path itself: both runtimes land, and the storage under each survives — the
+    corpus, and the owners no method sets, which is why the multisig's code is all a later release
+    can change. Genesis places stubs so the swap is visible; a launch genesis crosses as a no-op.
     """
     if ANCHORING_FORK not in xtask_forks():
         pytest.skip(f"this tempo-xtask cannot schedule {ANCHORING_FORK}")
     activation = int(time.time()) + ACTIVATION_LEAD
     seed = seed_fixture()
+    owners = [  # slots 0..2, as a launch genesis writes them
+        "0x1becd7f3beed7907e5a94980b074b51f8d2f4bed",
+        "0x4de8c982bcc02663554425b324cb4d5e2b87de93",
+        "0xbf13df9e8fd64aee9c2ea17efe7a142514eceb40",
+    ]
     stub = bytes.fromhex("60006000fd")  # any code at all, so the address is not an empty one
     genesis = genesis_with_anchoring(
-        tmp_path, storage=seed, fork_times=_schedule(ANCHORING_FORK, activation), code=stub
+        tmp_path,
+        storage=seed,
+        fork_times=_schedule(ANCHORING_FORK, activation),
+        code=stub,
+        multisig_owners=owners,
+        multisig_code=stub,
     )
     node = TempoNode(
         datadir=tmp_path / "node0", log_path=tmp_path / "nvnm1.log", genesis=genesis, http_port=free_port()
     )
-    listing = ANCHORING.fns.registries(0, Page()).data
+    placed = {ANCHORING_ADDRESS: (RUNTIME_CODE, seed), MODULE_ADMIN_ADDRESS: (MULTISIG_RUNTIME, range(len(owners)))}
 
-    def slots(w3: Web3) -> dict[str, str]:
-        written = _fingerprint(w3, ANCHORING_ADDRESS, map(hex, seed))
-        return {slot: value for slot, value in written.items() if slot not in ("code", "answer")}
+    def written(w3: Web3) -> dict[str, dict[int, str]]:
+        """Every slot genesis wrote, per address."""
+        return {a: {s: bytes(w3.eth.get_storage_at(a, s)).hex() for s in slots} for a, (_, slots) in placed.items()}
 
     with _running(node) as w3:
         _assert_pre_fork(w3, activation, _fork_label(ANCHORING_FORK))
-        assert _code(w3, ANCHORING_ADDRESS) == stub, "the alloc did not place the stub"
-        before = slots(w3)
+        assert {a: _code(w3, a) for a in placed} == dict.fromkeys(placed, stub), "the alloc did not place the stubs"
+        before = written(w3)
 
         _wait_past(w3, activation)
 
         assert _active_fork(w3) == _fork_label(ANCHORING_FORK)
-        assert _code(w3, ANCHORING_ADDRESS) == RUNTIME_CODE, "the boundary did not install the runtime"
-        assert slots(w3) == before, "the swap moved storage, which holds the corpus"
-        # The corpus was there all along; the boundary only brought the code that reads it.
-        answer = bytes(w3.eth.call({"to": ANCHORING_ADDRESS, "data": listing}))
-        assert b"us-ca1" in answer, "the installed runtime does not read the corpus already in storage"
+        assert {a: _code(w3, a) for a in placed} == {a: runtime for a, (runtime, _) in placed.items()}, (
+            "the boundary did not install both runtimes"
+        )
+        assert written(w3) == before, "the swap moved storage"
+
+        # Both were there all along; the boundary only brought the code that reads them.
+        listing = bytes(w3.eth.call({"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.registries(0, Page()).data}))
+        assert b"us-ca1" in listing, "the installed runtime does not read the corpus already in storage"
+        held, threshold = MODULE_ADMIN_MULTISIG.fns.owners().decode(
+            bytes(w3.eth.call({"to": MODULE_ADMIN_ADDRESS, "data": MODULE_ADMIN_MULTISIG.fns.owners().data}))
+        )
+        assert ([a.lower() for a in held], threshold) == (owners, 2), "the owners did not survive the swap"
 
 
 def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
