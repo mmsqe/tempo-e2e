@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
-from .abi import ANCHORING, ANCHORING_ADDRESS, MODULE_ADMIN_ADDRESS
+from .abi import ANCHORING, ANCHORING_ADDRESS
 from .network import TempoNode, default_genesis, free_port, generate_dev_genesis, resolve_tempo_bin
 from .utils import deploy_contract, send_call
 
@@ -18,7 +18,6 @@ LAYOUT = Path(__file__).parent.parent / "contracts" / "layout"
 if not LAYOUT.is_dir():
     raise RuntimeError(f"{LAYOUT} is missing: run `git submodule update --init contracts`")
 RUNTIME_CODE = bytes.fromhex((LAYOUT / "anchoring.bin").read_text().strip().removeprefix("0x"))
-MULTISIG_RUNTIME = bytes.fromhex((LAYOUT / "module-admin-multisig.bin").read_text().strip().removeprefix("0x"))
 
 # Go's time.Time.String() in UTC, whole seconds: how the contract writes block time.
 GO_TIME = "%Y-%m-%d %H:%M:%S +0000 UTC"
@@ -81,26 +80,27 @@ def genesis_with_anchoring(
     *,
     storage: dict[int, int] | None = None,
     fork_times: dict[str, int] | None = None,
-    multisig_owners: list[str] | None = None,
+    module_admin_owners: list[str] | None = None,
     code: bytes = RUNTIME_CODE,
-    multisig_code: bytes = MULTISIG_RUNTIME,
 ) -> Path:
     """The dev genesis plus the contract's code, and ``storage`` if given, at ``ANCHORING_ADDRESS``.
 
-    With ``multisig_owners``, the module admin multisig too, at the old chain's admin address with
-    those owners in its slots 0..2, as the launch genesis places it. ``code`` and ``multisig_code``
-    stand in for an older release, for a test that watches a fork boundary replace one.
+    With ``module_admin_owners``, the generator places the module admin Safe too, owned by those
+    three, as the launch genesis carries it. ``code`` stands in for an older release, for a test
+    that watches a fork boundary replace one.
     """
-    base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
+    if fork_times or module_admin_owners:
+        base = generate_dev_genesis(
+            output_dir / "xtask", fork_times=fork_times, module_admin_owners=module_admin_owners
+        )
+    else:
+        base = default_genesis()
     genesis = json.loads(base.read_text())
-    placed = {ANCHORING_ADDRESS: _account(code, storage)}
-    if multisig_owners:
-        slots = {i: int(owner, 16) for i, owner in enumerate(multisig_owners)}
-        placed[MODULE_ADMIN_ADDRESS] = _account(multisig_code, slots)
-    for address, account in placed.items():
-        key = address.lower()
-        assert key not in genesis["alloc"], f"xtask's genesis already has {address}"
-        genesis["alloc"][key] = account
+    # Asked for owners, xtask places the contract itself; otherwise finding it there means the
+    # generator changed under us.
+    key = ANCHORING_ADDRESS.lower()
+    assert module_admin_owners or key not in genesis["alloc"], f"xtask's genesis already has {key}"
+    genesis["alloc"][key] = _account(code, storage)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "genesis.json"
     path.write_text(json.dumps(genesis))
@@ -124,10 +124,12 @@ def load_dump(genesis: Path, datadir: Path, slots: dict[int, int]) -> None:
 
 
 @contextmanager
-def anchoring_node(base: Path, module_admin: str, *, multisig_owners: list[str] | None = None) -> Iterator[TempoNode]:
+def anchoring_node(
+    base: Path, module_admin: str, *, module_admin_owners: list[str] | None = None
+) -> Iterator[TempoNode]:
     """A dev node with the contract in genesis, the seed fixture loaded, and ``module_admin`` in place
     of the fixture's keyless one. The datadir is kept; ``-s`` prints how to resume it."""
-    genesis = genesis_with_anchoring(base, multisig_owners=multisig_owners)
+    genesis = genesis_with_anchoring(base, module_admin_owners=module_admin_owners)
     load_dump(genesis, base / "node0", seed_fixture(module_admin))
     node = TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
     try:
