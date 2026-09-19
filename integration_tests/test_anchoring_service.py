@@ -14,7 +14,7 @@ import requests
 from .abi import ANCHORING, ANCHORING_ADDRESS
 from .anchoring import GO_TIME, anchoring_node, bech32, emitted, registries_by_name
 from .network import _resolve_bin, free_port, terminate_process_group
-from .utils import new_account, send_call
+from .utils import send_call
 
 pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
 
@@ -22,15 +22,10 @@ SEARCH_PATH = "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search"
 
 
 @pytest.fixture(scope="module")
-def module_admin():
-    return new_account()
-
-
-@pytest.fixture(scope="module")
-def tempo(tmp_path_factory, module_admin):
+def tempo(tmp_path_factory):
     """This module's node, in place of the session's."""
     # Its own name, so pytest's `anchoringcurrent` link stays test_anchoring.py's node.
-    with anchoring_node(tmp_path_factory.mktemp("anchoring-service"), module_admin.address) as node:
+    with anchoring_node(tmp_path_factory.mktemp("anchoring-service")) as node:
         yield node
 
 

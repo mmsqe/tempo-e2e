@@ -265,27 +265,3 @@ ANCHORING = Contract.from_abi(
     ],
     to=ANCHORING_ADDRESS,
 )
-
-# The module admin at the old chain's `params.Admin` address: a Safe placed in genesis, since no
-# key can sign for an amino multisig's address. Its owners are the member keys' own addresses, two
-# of which sign a call to the anchoring contract off chain; anyone may relay it.
-MODULE_ADMIN_ADDRESS = to_checksum_address("0x0582bfb2e8561d48636e78f0e6b139d5a842be8f")
-_SAFE_TX = (
-    "address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas,"
-    " uint256 gasPrice, address gasToken, address refundReceiver"
-)
-MODULE_ADMIN_SAFE = Contract.from_abi(
-    [
-        "function getOwners() view returns (address[])",
-        "function getThreshold() view returns (uint256)",
-        "function isOwner(address owner) view returns (bool)",
-        "function nonce() view returns (uint256)",
-        f"function getTransactionHash({_SAFE_TX}, uint256 _nonce) view returns (bytes32)",
-        f"function execTransaction({_SAFE_TX}, bytes signatures) returns (bool)",
-        "function swapOwner(address prevOwner, address oldOwner, address newOwner)",
-        # setup() reverts on a Safe genesis already set up, which is what keeps it the chain's.
-        "function setup(address[] owners, uint256 threshold, address to, bytes data,"
-        " address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver)",
-    ],
-    to=MODULE_ADMIN_ADDRESS,
-)

@@ -55,16 +55,10 @@ class Page(NamedTuple):
     reverse: bool = False
 
 
-def seed_fixture(module_admin: str | None = None) -> dict[int, int]:
-    """Slot => value as SeedFixture.t.sol left them, optionally with another module admin.
-
-    The admin is the low 20 bytes of slot 3, beside the registry count.
-    """
+def seed_fixture() -> dict[int, int]:
+    """Slot => value as SeedFixture.t.sol left them."""
     fixture = json.loads((LAYOUT / "seed-fixture.json").read_text())
-    slots = {int(slot, 16): int(value, 16) for slot, value in fixture.items()}
-    if module_admin:
-        slots[3] = slots[3] >> 160 << 160 | int(module_admin, 16)
-    return slots
+    return {int(slot, 16): int(value, 16) for slot, value in fixture.items()}
 
 
 def _account(code: bytes, storage: dict[int, int] | None = None) -> dict:
@@ -80,26 +74,18 @@ def genesis_with_anchoring(
     *,
     storage: dict[int, int] | None = None,
     fork_times: dict[str, int] | None = None,
-    module_admin_owners: list[str] | None = None,
     code: bytes = RUNTIME_CODE,
 ) -> Path:
     """The dev genesis plus the contract's code, and ``storage`` if given, at ``ANCHORING_ADDRESS``.
 
-    With ``module_admin_owners``, the generator places the module admin Safe too, owned by those
-    three, as the launch genesis carries it. ``code`` stands in for an older release, for a test
-    that watches a fork boundary replace one.
+    The code is placed here rather than by the generator, so ``code`` can stand in for an older
+    release in a test that watches a fork boundary replace one. What the generator itself writes
+    is `test_genesis.py`'s subject.
     """
-    if fork_times or module_admin_owners:
-        base = generate_dev_genesis(
-            output_dir / "xtask", fork_times=fork_times, module_admin_owners=module_admin_owners
-        )
-    else:
-        base = default_genesis()
+    base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
     genesis = json.loads(base.read_text())
-    # Asked for owners, xtask places the contract itself; otherwise finding it there means the
-    # generator changed under us.
     key = ANCHORING_ADDRESS.lower()
-    assert module_admin_owners or key not in genesis["alloc"], f"xtask's genesis already has {key}"
+    assert key not in genesis["alloc"], f"xtask's genesis already has {key}"
     genesis["alloc"][key] = _account(code, storage)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "genesis.json"
@@ -124,13 +110,11 @@ def load_dump(genesis: Path, datadir: Path, slots: dict[int, int]) -> None:
 
 
 @contextmanager
-def anchoring_node(
-    base: Path, module_admin: str, *, module_admin_owners: list[str] | None = None
-) -> Iterator[TempoNode]:
-    """A dev node with the contract in genesis, the seed fixture loaded, and ``module_admin`` in place
-    of the fixture's keyless one. The datadir is kept; ``-s`` prints how to resume it."""
-    genesis = genesis_with_anchoring(base, module_admin_owners=module_admin_owners)
-    load_dump(genesis, base / "node0", seed_fixture(module_admin))
+def anchoring_node(base: Path) -> Iterator[TempoNode]:
+    """A dev node with the contract in genesis and the seed fixture loaded. The datadir is kept;
+    ``-s`` prints how to resume it."""
+    genesis = genesis_with_anchoring(base)
+    load_dump(genesis, base / "node0", seed_fixture())
     node = TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
     try:
         yield node.start().wait_for_rpc()

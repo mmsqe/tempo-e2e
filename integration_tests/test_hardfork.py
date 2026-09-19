@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from web3 import Web3
 
-from .abi import ANCHORING, ANCHORING_ADDRESS, MODULE_ADMIN_ADDRESS, MODULE_ADMIN_SAFE
+from .abi import ANCHORING, ANCHORING_ADDRESS
 from .anchoring import RUNTIME_CODE, Page, genesis_with_anchoring, seed_fixture
 from .network import TempoNode, dev_node, free_port, generate_dev_genesis, xtask_forks
 
@@ -184,25 +184,17 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
 
 def test_crossing_nvnm1_installs_the_anchoring_contract(tmp_path):
     """The upgrade path itself: the runtime lands and the corpus under it survives. Genesis places
-    a stub so the swap is visible; a launch genesis crosses as a no-op. The module admin is a Safe
-    and upgrades on Safe's own terms, so the boundary must leave it exactly as it found it.
-    """
+    a stub so the swap is visible; a launch genesis crosses as a no-op."""
     if ANCHORING_FORK not in xtask_forks():
         pytest.skip(f"this tempo-xtask cannot schedule {ANCHORING_FORK}")
     activation = int(time.time()) + ACTIVATION_LEAD
     seed = seed_fixture()
-    owners = [  # the member keys behind the old chain's `params.Admin`
-        "0x1becd7f3beed7907e5a94980b074b51f8d2f4bed",
-        "0x4de8c982bcc02663554425b324cb4d5e2b87de93",
-        "0xbf13df9e8fd64aee9c2ea17efe7a142514eceb40",
-    ]
     stub = bytes.fromhex("60006000fd")  # any code at all, so the address is not an empty one
     genesis = genesis_with_anchoring(
         tmp_path,
         storage=seed,
         fork_times=_schedule(ANCHORING_FORK, activation),
         code=stub,
-        module_admin_owners=owners,
     )
     node = TempoNode(
         datadir=tmp_path / "node0", log_path=tmp_path / "nvnm1.log", genesis=genesis, http_port=free_port()
@@ -212,15 +204,10 @@ def test_crossing_nvnm1_installs_the_anchoring_contract(tmp_path):
         """Every slot genesis wrote under the anchoring contract."""
         return {slot: bytes(w3.eth.get_storage_at(ANCHORING_ADDRESS, slot)).hex() for slot in seed}
 
-    def safe_owners(w3: Web3):
-        call = MODULE_ADMIN_SAFE.fns.getOwners()
-        return [a.lower() for a in call.decode(bytes(w3.eth.call({"to": MODULE_ADMIN_ADDRESS, "data": call.data})))]
-
     with _running(node) as w3:
         _assert_pre_fork(w3, activation, _fork_label(ANCHORING_FORK))
         assert _code(w3, ANCHORING_ADDRESS) == stub, "the alloc did not place the stub"
-        before, admin_before = written(w3), _code(w3, MODULE_ADMIN_ADDRESS)
-        assert safe_owners(w3) == owners, "the alloc did not set the Safe up"
+        before = written(w3)
 
         _wait_past(w3, activation)
 
@@ -231,8 +218,6 @@ def test_crossing_nvnm1_installs_the_anchoring_contract(tmp_path):
         # The corpus was there all along; the boundary only brought the code that reads it.
         listing = bytes(w3.eth.call({"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.registries(0, Page()).data}))
         assert b"us-ca1" in listing, "the installed runtime does not read the corpus already in storage"
-        assert _code(w3, MODULE_ADMIN_ADDRESS) == admin_before, "the boundary touched the module admin"
-        assert safe_owners(w3) == owners, "the owners did not come through the boundary"
 
 
 def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):

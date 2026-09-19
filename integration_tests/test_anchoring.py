@@ -34,7 +34,6 @@ from .utils import (
     build_tempo_tx,
     call_revert,
     deploy_contract,
-    fund,
     funded,
     get_nonce,
     new_account,
@@ -79,19 +78,14 @@ async def send_type_2(w3, chain_id, account, data, *, gas=None):
 
 
 @pytest.fixture(scope="module")
-def module_admin():
-    return new_account()
-
-
-@pytest.fixture(scope="module")
-def tempo(request, tmp_path_factory, module_admin):
+def tempo(request, tmp_path_factory):
     """This module's node, in place of the session's, unless ``--tempo-rpc`` names one to attach
     to: pointed at a node carrying the real dump, these cases read what was migrated."""
     rpc_url = request.config.getoption("--tempo-rpc")
     if rpc_url:
         yield ExternalNode(rpc_url, request.config.getoption("--tempo-ws")).wait_for_rpc()
         return
-    with anchoring_node(tmp_path_factory.mktemp("anchoring"), module_admin.address) as node:
+    with anchoring_node(tmp_path_factory.mktemp("anchoring")) as node:
         yield node
 
 
@@ -213,17 +207,14 @@ class TestSeededCorpus:
         assert across[:2] == [self.SECOND, self.ELSEWHERE]
         assert across[-1].registry_id == registry_id
 
-    async def test_the_module_admin_recovers_registry_3(self, w3, chain_id, module_admin):
-        """Registry 3's only admin has no key; the module admin, and nobody else, can appoint one."""
-        await fund(w3, module_admin.address)
+    async def test_registry_3_cannot_be_recovered(self, w3):
+        """Registry 3's only admin has no key, and this build names no module admin, so nobody can
+        appoint one: the registry stays readable and frozen until a fork installs a build that
+        names an admin."""
         successor = await funded(w3)
         grant = ANCHORING.fns.grantRole(3, "", successor.address, "admin").data
         assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, grant, sender=successor.address)
-
-        await send_call(w3, chain_id, module_admin, ANCHORING_ADDRESS, grant)
-        assert await ANCHORING.fns.roleMemberCount(keccak(text="registry:3:admin")).call(w3) == 2
-        receipt = await send_call(w3, chain_id, successor, ANCHORING_ADDRESS, add_record(3, "sha:r"))
-        assert emitted(receipt, "AddRecord") == [(successor.address, 3, 1, 1, "sha:r")]
+        assert await ANCHORING.fns.roleMemberCount(keccak(text="registry:3:admin")).call(w3) == 1
 
 
 class TestWrites:
