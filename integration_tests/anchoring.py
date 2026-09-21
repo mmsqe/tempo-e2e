@@ -110,12 +110,18 @@ def load_dump(genesis: Path, datadir: Path, slots: dict[int, int]) -> None:
 
 
 @contextmanager
-def anchoring_node(base: Path) -> Iterator[TempoNode]:
+def anchoring_node(base: Path, *, extra_args: list[str] | None = None) -> Iterator[TempoNode]:
     """A dev node with the contract in genesis and the seed fixture loaded. The datadir is kept;
     ``-s`` prints how to resume it."""
     genesis = genesis_with_anchoring(base)
     load_dump(genesis, base / "node0", seed_fixture())
-    node = TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
+    node = TempoNode(
+        datadir=base / "node0",
+        log_path=base / "node.log",
+        genesis=genesis,
+        http_port=free_port(),
+        extra_args=extra_args,
+    )
     try:
         yield node.start().wait_for_rpc()
     finally:

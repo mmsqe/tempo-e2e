@@ -199,6 +199,7 @@ class TempoNode:
         genesis: Path | None = None,
         binary: str | None = None,
         block_time: str | None = None,
+        extra_args: list[str] | None = None,
     ):
         self.datadir = Path(datadir)
         self.log_path = Path(log_path)
@@ -213,6 +214,8 @@ class TempoNode:
         # Loopback by default so a test node is never exposed on the network; --tidx
         # sets 0.0.0.0 because its container reaches the node from outside loopback.
         self.http_addr = os.environ.get("TEMPO_HTTP_ADDR", "127.0.0.1")
+        # Flags only one test's node wants, such as an index it is the subject of.
+        self.extra_args = list(extra_args or [])
         self.proc: subprocess.Popen | None = None
         self.chain_id: int | None = None
 
@@ -263,6 +266,7 @@ class TempoNode:
             FAUCET_TOKEN,
             "--faucet.node-address",
             f"http://127.0.0.1:{self.http_port}",
+            *self.extra_args,
         ]
 
     def start(self) -> "TempoNode":
