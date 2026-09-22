@@ -182,7 +182,7 @@ variant.
 | `test_current_committee.py` | TIP-1070 | current-committee precompile (T8+): read members, system-only writes, epoch boundary |
 | `test_validator_config.py` | TIP-1017 | ValidatorConfig V2 append-only registry: genesis state, owner-gated mutators |
 | `test_anchoring.py` | — | anchoring contract at `0x…0a00`: the precompile's ABI, a seed corpus loaded at block 0, writes on top, EOA gate per sender type |
-| `test_anchoring_service.py` | — | nvnmchain-anchoring's name search over that node: seeded and live registries by prefix, suffix and contains |
+| `test_anchoring_service.py` | — | nvnmchain-anchoring translating the node's search onto the module's REST route: its JSON, its mode names and `/health` |
 | `test_anchoring_name_index.py` | — | the node's own name index (`--anchoring.name-index`): the seeded corpus, which emitted no logs, and a live registry |
 
 ### Consensus & networking (`consensus` marker)

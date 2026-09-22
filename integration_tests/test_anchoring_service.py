@@ -1,20 +1,15 @@
-"""nvnmchain-anchoring's name search over the anchoring node: the seed fixture and a live registry,
-found by prefix, suffix and contains. The service comes from PATH (or ``$ANCHORING_BIN``); without it
-these skip."""
+"""nvnmchain-anchoring translating the node's search onto the module's REST route, which is the
+only part the node does not serve itself."""
 
-import asyncio
 import os
-import secrets
 import subprocess
 import time
 
 import pytest
 import requests
 
-from .abi import ANCHORING, ANCHORING_ADDRESS
-from .anchoring import GO_TIME, anchoring_node, bech32, emitted, registries_by_name
+from .anchoring import anchoring_node, bech32
 from .network import _resolve_bin, free_port, terminate_process_group
-from .utils import send_call
 
 pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
 
@@ -23,36 +18,40 @@ SEARCH_PATH = "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search"
 
 @pytest.fixture(scope="module")
 def tempo(tmp_path_factory):
-    """This module's node, in place of the session's."""
+    """This module's node, in place of the session's, running the index the service translates."""
     # Its own name, so pytest's `anchoringcurrent` link stays test_anchoring.py's node.
-    with anchoring_node(tmp_path_factory.mktemp("anchoring-service")) as node:
+    with anchoring_node(tmp_path_factory.mktemp("anchoring-service"), extra_args=["--anchoring.name-index"]) as node:
         yield node
 
 
 @pytest.fixture(scope="module")
 def name_search(tempo, tmp_path_factory):
-    """The service over the node: caught up before it answers, then polling every 0.2 s."""
+    """The service over that node, which it asks for the index once before it listens."""
     try:
         exe = _resolve_bin("nvnmchain-anchoring", "ANCHORING_BIN")
     except RuntimeError as missing:
         pytest.skip(str(missing))
-    base, port = tmp_path_factory.mktemp("name-search"), free_port()
-    url, log = f"http://127.0.0.1:{port}", base / "service.log"
-    env = {"NVNM_RPC": tempo.rpc_url, "DB_PATH": str(base / "names.db"), "BIND": url[7:], "POLL_SECONDS": "0.2"}
+    base, bind = tmp_path_factory.mktemp("name-search"), f"127.0.0.1:{free_port()}"
+    url, log = f"http://{bind}", base / "service.log"
     with open(log, "w") as out:
         proc = subprocess.Popen(
-            [exe, "serve"], cwd=base, env=os.environ | env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
+            [exe, "serve"],
+            cwd=base,
+            env=os.environ | {"NVNM_RPC": tempo.rpc_url, "BIND": bind},
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
     try:
         deadline = time.monotonic() + 60
         while True:
-            if proc.poll() is not None or time.monotonic() > deadline:
-                pytest.fail(f"nvnmchain-anchoring did not come up (exit {proc.returncode}):\n{log.read_text()[-3000:]}")
             try:
                 if requests.get(f"{url}/health", timeout=2).ok:
                     break
             except requests.ConnectionError:
                 pass
+            if proc.poll() is not None or time.monotonic() > deadline:
+                pytest.fail(f"nvnmchain-anchoring did not come up (exit {proc.returncode}):\n{log.read_text()[-3000:]}")
             time.sleep(0.2)
         yield url
     finally:
@@ -66,10 +65,8 @@ def search(base: str, name: str, mode: str = "EXACT") -> list[dict]:
     return response.json()["registries"]
 
 
-def test_the_seeded_registries(name_search):
-    # SeedFixture.t.sol's: us-ca1 (1 and 3) and us-ca9 (2), by Alice and Bob.
-    assert [r["id"] for r in search(name_search, "US-CA", "PREFIX")][:3] == ["1", "2", "3"]
-    assert [r["id"] for r in search(name_search, "ca9", "SUFFIX")] == ["2"]
+def test_a_string_id_and_snake_case_fields(name_search):
+    # SeedFixture.t.sol's us-ca9, by Bob. The node answers a number and camelCase.
     assert search(name_search, "us-ca9") == [
         {
             "id": "2",
@@ -82,27 +79,13 @@ def test_the_seeded_registries(name_search):
     ]
 
 
-async def test_a_new_registry_is_found_once_polled(w3, chain_id, funded_account, name_search):
-    tag = secrets.token_hex(4)
-    name = f"Live Fund {tag}"
-    data = ANCHORING.fns.addRegistry(name, "", "{}").data
-    receipt = await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, data)
-    [(_, registry_id, _)] = emitted(receipt, "AddRegistry")
+def test_the_enum_spelling_on_the_query_string(name_search):
+    # One registry through every mode: the name reaches the right matcher, nothing more.
+    for name, mode in (("us-ca9", "EXACT"), ("us-ca9", "PREFIX"), ("ca9", "SUFFIX"), ("s-ca9", "CONTAINS")):
+        assert [r["id"] for r in search(name_search, name, mode)] == ["2"], mode
 
-    deadline = time.monotonic() + 30
-    while not (found := search(name_search, tag.upper(), "CONTAINS")):
-        assert time.monotonic() < deadline, "not indexed after 30 s"
-        await asyncio.sleep(0.2)
-    block = await w3.eth.get_block(receipt["blockNumber"])
-    assert found == [
-        {
-            "id": str(registry_id),
-            "name": name,
-            "description": "",
-            "creator": bech32(funded_account.address),
-            "created_at": time.strftime(GO_TIME, time.gmtime(block["timestamp"])),
-            "metadata": "{}",
-        }
-    ]
-    on_chain = [r.id for r in await registries_by_name(w3, name)]
-    assert [int(r["id"]) for r in search(name_search, name)] == on_chain, "exact agrees with the contract"
+
+def test_the_health_route_renames_what_the_node_reports(name_search):
+    # The node answers `lastId` and `registryCount`; whether it is caught up is its own suite's.
+    health = requests.get(f"{name_search}/health", timeout=10).json()
+    assert set(health) == {"last_id", "registry_count", "error"}
