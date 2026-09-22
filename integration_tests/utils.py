@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import time
@@ -33,6 +34,10 @@ from web3 import AsyncWeb3, Web3
 from .abi import FEE, NONCE, TIP20, TIP20_FACTORY, TIP20_ROLES, TIP403
 from .network import FAUCET_PRIVATE_KEY
 
+# Every tempo tx the suite sends, at `--log-cli-level=INFO`: on a shared network the hash is
+# what ties a failure to a block an explorer can show.
+log = logging.getLogger(__name__)
+
 # The four enshrined TIP-20 stablecoins, by symbol.
 STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_USD, "THETA_USD": THETA_USD}
 
@@ -51,6 +56,8 @@ DEFAULT_MAX_PRIORITY_FEE_PER_GAS = 2_000_000_000
 DEFAULT_MAX_FEE_PER_GAS = 100_000_000_000
 # A tempo tx that writes new storage (DEX orders, token deploys) needs extra TIP-1060 state gas.
 STATE_WRITE_GAS = 8_000_000
+# What one account is given on a network funded by transfer: a few hundred writes' worth.
+FUNDED_AMOUNT = 5_000_000
 SET_CODE_GAS = 500_000  # a 7702 delegation, plus whatever the delegated code then does
 
 # Default KeyRestrictions expiry (year ~2096): the on-chain authorizeKey path needs a real
@@ -95,11 +102,31 @@ def gas_cost_in_token(receipt) -> int:
     return (wei + 10**12 - 1) // 10**12
 
 
-async def fund(w3: AsyncWeb3, address: str, timeout: float = 60.0):
-    """Fund ``address`` with the faucet TIP-20 via ``tempo_fundAddress``; await any returned txs."""
+def funder():
+    """The account a network without a faucet is funded from: `$E2E_FUNDER_KEY`, else the first
+    of `$MNEMONIC`. A devnet needs neither, since its faucet mints."""
+    if key := os.environ.get("E2E_FUNDER_KEY"):
+        return Account.from_key(key)
+    if phrase := os.environ.get("MNEMONIC"):
+        Account.enable_unaudited_hdwallet_features()
+        return Account.from_mnemonic(phrase, account_path="m/44'/60'/0'/0/0")
+    return None
+
+
+async def fund(w3: AsyncWeb3, address: str, timeout: float = 60.0, amount: int = FUNDED_AMOUNT):
+    """Fund ``address`` with the faucet TIP-20 via ``tempo_fundAddress``; await any returned txs.
+
+    A network without the faucet — anything but a devnet — is funded by transfer from
+    [`funder`] instead, which is what lets the suite run against one.
+    """
     resp = await w3.provider.make_request("tempo_fundAddress", [AsyncWeb3.to_checksum_address(address)])
-    if resp.get("error"):
-        raise RuntimeError(f"tempo_fundAddress failed: {resp['error']}")
+    if error := resp.get("error"):
+        if error.get("code") != -32601:
+            raise RuntimeError(f"tempo_fundAddress failed: {error}")
+        account = funder()
+        if account is None:
+            raise RuntimeError(f"{w3.provider.endpoint_uri} has no faucet; set $MNEMONIC or $E2E_FUNDER_KEY")
+        return await send_call(w3, await w3.eth.chain_id, account, PATH_USD, ERC20.fns.transfer(address, amount).data)
     result = resp.get("result")
     if isinstance(result, list):
         for tx_hash in result:
@@ -241,7 +268,16 @@ async def send_calls(
         max_fee_per_gas=max_fee_per_gas,
         calls=calls,
     )
-    return await send_tempo_tx(w3, tx, private_key)
+    receipt = await send_tempo_tx(w3, tx, private_key)
+    log.info(
+        "tx %s block %s status %s gas %s from %s",
+        receipt["transactionHash"].hex(),
+        receipt["blockNumber"],
+        receipt["status"],
+        receipt["gasUsed"],
+        sender,
+    )
+    return receipt
 
 
 async def send_call(w3: AsyncWeb3, chain_id: int, signer, to: str, data, *, gas_limit: int = STATE_WRITE_GAS):

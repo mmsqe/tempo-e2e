@@ -10,6 +10,7 @@ from pathlib import Path
 from web3 import AsyncWeb3
 
 from .. import network
+from ..utils import fund
 from .base import CAP_CONSENSUS_NET, CAP_FAUCET, CAP_INDEXER_RPC, CAP_TEMPO_NATIVE
 
 
@@ -36,12 +37,6 @@ class TempoDriver:
         )
 
     async def fund(self, w3: AsyncWeb3, address: str, amount: int) -> object:
-        """Fund via the ``tempo_fundAddress`` faucet RPC; await the returned txs."""
-        resp = await w3.provider.make_request("tempo_fundAddress", [AsyncWeb3.to_checksum_address(address)])
-        if resp.get("error"):
-            raise RuntimeError(f"tempo_fundAddress failed: {resp['error']}")
-        result = resp.get("result")
-        if isinstance(result, list):
-            for tx_hash in result:
-                await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60.0)
-        return result
+        """The faucet RPC, or a transfer on a network that has none. How much is the faucet's to
+        choose, and the suite's own when it transfers, so the caller's amount goes unused."""
+        return await fund(w3, address)
