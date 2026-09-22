@@ -235,10 +235,10 @@ def all_registries(rpc: Rpc) -> list:
     return have
 
 
-def check_registries(rpc: Rpc, ids: dict[str, int], exported: list) -> tuple[int, int, list[str]]:
+def check_registries(rpc: Rpc, ids: dict[str, int], exported: list) -> tuple[int, int, int, list[str]]:
     """Every registry, and every record version that predates the seed. The first 68 are the
     fixture's, with their own creator and time; the seed added the rest. Returns the two counts
-    compared and what did not match."""
+    compared, how many registries postdate the corpus, and what did not match."""
     old_registries, old_records = preseed()
     want = old_registries + [
         (ids[r["name"]], r["name"], r.get("description", ""), ADMIN, SEEDED_AT, r.get("metadata", "")) for r in exported
@@ -246,7 +246,10 @@ def check_registries(rpc: Rpc, ids: dict[str, int], exported: list) -> tuple[int
     have = all_registries(rpc)
 
     bad: list[str] = []
-    if len(have) != len(want):
+    # Ids run 1..count and a page is a slice, so the corpus is the prefix and anything past it was
+    # written after the load — a test suite's, and not the export's to answer for.
+    added = len(have) - len(want)
+    if added < 0:
         bad.append(f"contract has {len(have)} registries, the export and the fixture {len(want)}")
     for got, w in zip(have, want):
         if got != w:
@@ -260,7 +263,7 @@ def check_registries(rpc: Rpc, ids: dict[str, int], exported: list) -> tuple[int
         if got != held:
             bad.append(f"registry {rid} before the seed: contract {got[:1]} fixture {held[:1]}")
         seen += len(held)
-    return len(want), seen, bad
+    return len(want), seen, max(added, 0), bad
 
 
 def check_records(args, override: dict, ids: dict[str, int], files: list) -> int:
@@ -313,10 +316,11 @@ def main() -> None:
     override = {ADDRESS: {"code": reader_code()}}
 
     began = time.monotonic()
-    compared, seen, bad = check_registries(Rpc(args.rpc, override), ids, exported)
+    compared, seen, added, bad = check_registries(Rpc(args.rpc, override), ids, exported)
     print(
         f"registries: {compared} compared in {time.monotonic() - began:.0f}s, "
-        f"with {seen} record versions from before the seed, {len(bad)} problems",
+        f"with {seen} record versions from before the seed, "
+        f"{added} added since the load, {len(bad)} problems",
         flush=True,
     )
     if bad:
