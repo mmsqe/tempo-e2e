@@ -34,6 +34,8 @@ SEEDED_AT = "2026-07-30 15:04:00.973906311 +0000 UTC"
 FIRST_SEEDED_ID = 69  # the 68 that predate the seed keep 1..68
 PAGE_LIMIT = 200
 CHUNK = 500  # records per bulk read; 1,000 runs past the 50M call gas cap, so it halves on out of gas
+RETRIES = 6  # a minute of backoff, which is longer than a node takes to come back from this load
+BATCH = 8  # bulk reads per request; 8 x 885 KB back is the most worth holding in flight
 
 RECORD = "(string,string,string,string,string,string,uint64,uint64,bool,uint64)"
 REGISTRY = "(uint64,string,string,string,string,string)"
@@ -60,34 +62,70 @@ class Rpc:
 
     def __init__(self, url: str, override: dict | None):
         u = urlparse(url)
+        # A URL without a port leaves `http.client` to pick 443 or 80; taking the scheme with it
+        # is what keeps an `https://` endpoint from being asked in plain HTTP, which a proxy
+        # answers with a redirect page rather than JSON.
+        self.connect = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
         self.host, self.port, self.path = u.hostname, u.port, u.path or "/"
         self.override = override
         self.conn = None
 
-    def call(self, data: bytes) -> bytes:
-        params = [{"to": ADDRESS, "data": "0x" + data.hex()}, "latest"]
-        if self.override:
-            params.append(self.override)
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": params})
-        for attempt in range(2):
+    def call(self, *datas: bytes) -> list[bytes]:
+        """One round trip, however many calls. A remote node spends more per request than per call,
+        so batching carries the long tail of small registries; the few big ones are bound by the
+        node executing them and gain little."""
+        tail = ["latest"] + ([self.override] if self.override else [])
+        body = json.dumps(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": i,
+                    "method": "eth_call",
+                    "params": [{"to": ADDRESS, "data": "0x" + d.hex()}, *tail],
+                }
+                for i, d in enumerate(datas)
+            ]
+        )
+        for attempt in range(RETRIES):
+            if attempt:
+                time.sleep(2**attempt)  # this run is the load that knocked it over, so wait it out
             try:
                 if self.conn is None:
-                    self.conn = http.client.HTTPConnection(self.host, self.port)
+                    self.conn = self.connect(self.host, self.port)
                 self.conn.request("POST", self.path, body, {"content-type": "application/json"})
-                out = json.loads(self.conn.getresponse().read())
-                break
-            except (http.client.HTTPException, OSError):
+                answer = self.conn.getresponse()
+                status, last, raw = answer.status, f"{answer.status} {answer.reason}", answer.read()
+            except (http.client.HTTPException, OSError) as e:
+                self.conn, last = None, repr(e)
+                continue
+            if status >= 500:
+                # A gateway's own page, not the node's: it is down or refusing, and it comes back.
                 self.conn = None
-                if attempt:
-                    raise
-        if "error" in out:
-            raise RpcError(out["error"]["message"])
-        return bytes.fromhex(out["result"][2:])
+                continue
+            try:
+                out = json.loads(raw)
+            except ValueError:
+                # Not a node at all: an explorer or a proxy on that port answers with a page, and
+                # `--rpc` pointed at it rather than at JSON-RPC. Only the first phase gets here,
+                # before any worker exists, so leaving by SystemExit cannot strand the pool.
+                raise SystemExit(
+                    f"{self.host}:{self.port}{self.path} answered {last} with {len(raw)} bytes, not JSON: {raw[:120]!r}"
+                ) from None
+            # A batch may answer out of order, so each result goes back to its own id.
+            answers: list[bytes] = [b""] * len(datas)
+            for item in out:
+                if "error" in item:
+                    raise RpcError(item["error"]["message"])
+                answers[item["id"]] = bytes.fromhex(item["result"][2:])
+            return answers
+        # An ordinary exception, which a worker hands back to the pool. A `SystemExit` here kills
+        # the worker outright, and `imap_unordered` then waits forever for a result nobody sends.
+        raise RpcError(f"{self.host}:{self.port}{self.path} still answering {last} after {RETRIES} tries")
 
 
 def versions(rpc: Rpc, rid: int, start: int, count: int) -> list:
     """Every version of records start .. start + count - 1, in the contract's own order."""
-    return list(decode([RECORD + "[]"], rpc.call(VERSIONS + encode(["uint64"] * 3, [rid, start, count])))[0])
+    return list(decode([RECORD + "[]"], rpc.call(VERSIONS + encode(["uint64"] * 3, [rid, start, count]))[0])[0])
 
 
 def preseed() -> tuple[list, dict[int, list]]:
@@ -148,29 +186,34 @@ def check_file(entry: dict) -> tuple[int, list[str]]:
 
     rows, start, chunk = 0, 1, CHUNK
     while start <= len(records):
-        count = min(chunk, len(records) - start + 1)
+        spans = []
+        while len(spans) < BATCH and start <= len(records):
+            count = min(chunk, len(records) - start + 1)
+            spans.append((start, count))
+            start += count
         try:
-            got = versions(RPC, rid, start, count)
+            answers = RPC.call(*(VERSIONS + encode(["uint64"] * 3, [rid, s, c]) for s, c in spans))
         except RpcError as e:
             if "out of gas" in str(e) and chunk > 1:
                 chunk //= 2
+                start = spans[0][0]  # the whole batch goes again, at the smaller chunk
                 continue
             raise
-        want = []
-        for r in range(start, start + count):
-            history = records[r - 1]
-            for i, (uri, checksum, algo, metadata, status) in enumerate(history, 1):
-                want.append((uri, checksum, algo, metadata, SEEDED_AT, status, r, i, i == len(history), rid))
-        if len(got) != len(want):
-            return rows, [
-                f"{where} records {start}..{start + count - 1}: "
-                f"contract has {len(got)} versions, the export {len(want)}"
-            ]
-        for g, w in zip(got, want):
-            if g != w:
-                return rows, [f"{where} record {w[6]} version {w[7]}:\n  contract {g}\n  export   {w}"]
-        rows += len(got)
-        start += count
+        for (at, count), answer in zip(spans, answers):
+            got = list(decode([RECORD + "[]"], answer)[0])
+            want = []
+            for r in range(at, at + count):
+                history = records[r - 1]
+                for i, (uri, checksum, algo, metadata, status) in enumerate(history, 1):
+                    want.append((uri, checksum, algo, metadata, SEEDED_AT, status, r, i, i == len(history), rid))
+            if len(got) != len(want):
+                return rows, [
+                    f"{where} records {at}..{at + count - 1}: contract has {len(got)} versions, the export {len(want)}"
+                ]
+            for g, w in zip(got, want):
+                if g != w:
+                    return rows, [f"{where} record {w[6]} version {w[7]}:\n  contract {g}\n  export   {w}"]
+            rows += len(got)
 
     if versions(RPC, rid, len(records) + 1, 1):
         return rows, [f"{where}: contract has a record {len(records) + 1}, the export {len(records)}"]
@@ -183,7 +226,7 @@ def all_registries(rpc: Rpc) -> list:
     while True:
         page = decode(
             [REGISTRY + "[]", "(bytes,uint64)"],
-            rpc.call(REGISTRIES + encode(["uint64", PAGE], [0, (b"", offset, PAGE_LIMIT, False, False)])),
+            rpc.call(REGISTRIES + encode(["uint64", PAGE], [0, (b"", offset, PAGE_LIMIT, False, False)]))[0],
         )[0]
         have.extend(page)
         if len(page) < PAGE_LIMIT:
@@ -225,7 +268,7 @@ def check_records(args, override: dict, ids: dict[str, int], files: list) -> int
     the largest is never left running alone at the end."""
     expected = sum(f["records"] for f in files)
     total = done = 0
-    began = time.monotonic()
+    began = spoke = time.monotonic()
     with multiprocessing.Pool(args.workers, initializer=init_worker, initargs=(args.rpc, override, ids)) as pool:
         for rows, problems in pool.imap_unordered(check_file, files):
             if problems:
@@ -236,9 +279,11 @@ def check_records(args, override: dict, ids: dict[str, int], files: list) -> int
                 sys.exit(1)
             total += rows
             done += 1
-            if done % 200 == 0 or done == len(files):
-                elapsed = time.monotonic() - began
-                rate = total / max(elapsed, 1)
+            # By the clock, not by the file: the biggest file alone holds a tenth of the corpus,
+            # so counting files says nothing for minutes at a time and a stall reads like work.
+            if time.monotonic() - spoke >= 15 or done == len(files):
+                spoke = time.monotonic()
+                rate = total / max(spoke - began, 1)
                 left = (expected - total) / max(rate, 1) / 60
                 print(
                     f"  {done}/{len(files)} files, {total:,} rows, {rate:,.0f} rows/s, ~{left:.1f} min left",
@@ -254,9 +299,13 @@ def check_records(args, override: dict, ids: dict[str, int], files: list) -> int
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rpc", default="http://127.0.0.1:8546")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 4), help="the node needs cores too")
-    ap.add_argument("--files", type=int, default=0, help="check only the N biggest files")
+    ap.add_argument("--workers", type=int, default=0, help="0: a core each locally, 4 over the network")
+    ap.add_argument("--files", type=int, default=0, help="sample N files spread across the size order")
     args = ap.parse_args()
+    # A node sharing the machine wants cores of its own; a shared one wants far less than that.
+    # The record phase is 12 million bulk reads, and a dozen workers is enough to take a node down.
+    local = urlparse(args.rpc).hostname in ("127.0.0.1", "localhost", "::1")
+    args.workers = args.workers or (max(1, (os.cpu_count() or 4) - 4) if local else 4)
 
     manifest = json.loads((EXPORT / "manifest.json").read_text())
     exported = json.loads((EXPORT / "registries.json").read_text())
@@ -276,7 +325,13 @@ def main() -> None:
         sys.exit(1)
 
     files = sorted(manifest["files"], key=lambda f: -f["records"])
-    check_records(args, override, ids, files[: args.files] if args.files else files)
+    if args.files and args.files < len(files):
+        # A spread across the size order rather than the head of it: one file holds a tenth of the
+        # corpus and the 20 biggest hold half, so `--files 20` off the top is not a sample of the
+        # work, it is most of it. Taking each bucket's middle keeps the order biggest-first.
+        step = len(files) / args.files
+        files = [files[int((i + 0.5) * step)] for i in range(args.files)]
+    check_records(args, override, ids, files)
     print(f"\nevery row the contract holds matches {EXPORT}")
 
 
