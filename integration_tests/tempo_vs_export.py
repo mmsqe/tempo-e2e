@@ -35,6 +35,7 @@ FIRST_SEEDED_ID = 69  # the 68 that predate the seed keep 1..68
 PAGE_LIMIT = 200
 CHUNK = 500  # records per bulk read; 1,000 runs past the 50M call gas cap, so it halves on out of gas
 RETRIES = 6  # a minute of backoff, which is longer than a node takes to come back from this load
+DETERMINISTIC = "out of gas"  # the one RPC error retrying cannot help; the caller halves instead
 BATCH = 8  # bulk reads per request; 8 x 885 KB back is the most worth holding in flight
 
 RECORD = "(string,string,string,string,string,string,uint64,uint64,bool,uint64)"
@@ -113,11 +114,18 @@ class Rpc:
                 ) from None
             # A batch may answer out of order, so each result goes back to its own id.
             answers: list[bytes] = [b""] * len(datas)
+            failed = ""
             for item in out:
                 if "error" in item:
-                    raise RpcError(item["error"]["message"])
+                    failed = item["error"]["message"]
+                    break
                 answers[item["id"]] = bytes.fromhex(item["result"][2:])
-            return answers
+            if not failed:
+                return answers
+            # Anything but `out of gas` is the node's own failure: back off as for a 5xx.
+            if DETERMINISTIC in failed:
+                raise RpcError(failed)
+            last = failed
         # An ordinary exception, which a worker hands back to the pool. A `SystemExit` here kills
         # the worker outright, and `imap_unordered` then waits forever for a result nobody sends.
         raise RpcError(f"{self.host}:{self.port}{self.path} still answering {last} after {RETRIES} tries")
@@ -167,10 +175,11 @@ def init_worker(url: str, override: dict, ids: dict[str, int]) -> None:
     RPC, IDS = Rpc(url, override), ids
 
 
-def check_file(entry: dict) -> tuple[int, list[str]]:
+def check_file(entry: dict) -> tuple[str, int, list[str]]:
     """Every version of every record in one export file, against the contract."""
-    rid = IDS[entry["registry"]]
-    where = f"registry {rid} ({entry['registry']})"
+    name = entry["registry"]
+    rid = IDS[name]
+    where = f"registry {rid} ({name})"
 
     # Record ids follow the first occurrence of each checksum, versions its later ones.
     by_checksum: dict[str, list] = {}
@@ -207,17 +216,16 @@ def check_file(entry: dict) -> tuple[int, list[str]]:
                 for i, (uri, checksum, algo, metadata, status) in enumerate(history, 1):
                     want.append((uri, checksum, algo, metadata, SEEDED_AT, status, r, i, i == len(history), rid))
             if len(got) != len(want):
-                return rows, [
-                    f"{where} records {at}..{at + count - 1}: contract has {len(got)} versions, the export {len(want)}"
-                ]
+                span = f"{where} records {at}..{at + count - 1}"
+                return name, rows, [f"{span}: contract has {len(got)} versions, the export {len(want)}"]
             for g, w in zip(got, want):
                 if g != w:
-                    return rows, [f"{where} record {w[6]} version {w[7]}:\n  contract {g}\n  export   {w}"]
+                    return name, rows, [f"{where} record {w[6]} version {w[7]}:\n  contract {g}\n  export   {w}"]
             rows += len(got)
 
     if versions(RPC, rid, len(records) + 1, 1):
-        return rows, [f"{where}: contract has a record {len(records) + 1}, the export {len(records)}"]
-    return rows, []
+        return name, rows, [f"{where}: contract has a record {len(records) + 1}, the export {len(records)}"]
+    return name, rows, []
 
 
 def all_registries(rpc: Rpc) -> list:
@@ -266,14 +274,30 @@ def check_registries(rpc: Rpc, ids: dict[str, int], exported: list) -> tuple[int
     return len(want), seen, max(added, 0), bad
 
 
+def resumed(path: str) -> dict[str, int]:
+    """What an earlier run got through, as the `registry rows` lines it appended."""
+    if not path or not Path(path).exists():
+        return {}
+    done = {}
+    for line in Path(path).read_text().splitlines():
+        name, _, rows = line.rpartition(" ")
+        done[name] = int(rows)
+    return done
+
+
 def check_records(args, override: dict, ids: dict[str, int], files: list) -> int:
     """Every version of every record in each export file, in worker processes. Biggest first, so
-    the largest is never left running alone at the end."""
-    expected = sum(f["records"] for f in files)
-    total = done = 0
+    the largest is never left running alone at the end; `--resume` skips files a run got through."""
+    expected, count = sum(f["records"] for f in files), len(files)
+    passed = resumed(args.resume)
+    files = [f for f in files if f["registry"] not in passed]
+    before, done = sum(passed.values()), len(passed)
+    total = before
+    if passed:
+        print(f"resuming: {done} files and {before:,} rows already checked", flush=True)
     began = spoke = time.monotonic()
     with multiprocessing.Pool(args.workers, initializer=init_worker, initargs=(args.rpc, override, ids)) as pool:
-        for rows, problems in pool.imap_unordered(check_file, files):
+        for name, rows, problems in pool.imap_unordered(check_file, files):
             if problems:
                 pool.terminate()
                 print(f"\nMISMATCH after {total:,} rows")
@@ -282,14 +306,17 @@ def check_records(args, override: dict, ids: dict[str, int], files: list) -> int
                 sys.exit(1)
             total += rows
             done += 1
+            if args.resume:
+                with open(args.resume, "a") as note:
+                    note.write(f"{name} {rows}\n")
             # By the clock, not by the file: the biggest file alone holds a tenth of the corpus,
             # so counting files says nothing for minutes at a time and a stall reads like work.
-            if time.monotonic() - spoke >= 15 or done == len(files):
+            if time.monotonic() - spoke >= 15 or done == count:
                 spoke = time.monotonic()
-                rate = total / max(spoke - began, 1)
+                rate = (total - before) / max(spoke - began, 1)
                 left = (expected - total) / max(rate, 1) / 60
                 print(
-                    f"  {done}/{len(files)} files, {total:,} rows, {rate:,.0f} rows/s, ~{left:.1f} min left",
+                    f"  {done}/{count} files, {total:,} rows, {rate:,.0f} rows/s, ~{left:.1f} min left",
                     flush=True,
                 )
     print(f"records: {total:,} rows over {done} files in {(time.monotonic() - began) / 60:.1f} min", flush=True)
@@ -304,6 +331,7 @@ def main() -> None:
     ap.add_argument("--rpc", default="http://127.0.0.1:8546")
     ap.add_argument("--workers", type=int, default=0, help="0: a core each locally, 4 over the network")
     ap.add_argument("--files", type=int, default=0, help="sample N files spread across the size order")
+    ap.add_argument("--resume", default="", help="a file to note checked registries in, and skip on a rerun")
     args = ap.parse_args()
     # A node sharing the machine wants cores of its own; a shared one wants far less than that.
     # The record phase is 12 million bulk reads, and a dozen workers is enough to take a node down.
