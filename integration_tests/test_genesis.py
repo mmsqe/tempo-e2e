@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tempo.constants import PATH_USD
 
 from .abi import ANCHORING_ADDRESS
 from .anchoring import RUNTIME_CODE
@@ -36,3 +37,9 @@ def test_the_generator_places_the_contract_this_checkout_built(tmp_path):
 def test_a_genesis_without_the_flag_carries_no_contract(tmp_path):
     """Upstream's own networks generate the same way and must not pick it up."""
     assert ANCHORING_ADDRESS.lower() not in _alloc(generate_dev_genesis(tmp_path))
+
+
+def test_the_reserved_stablecoin_is_named_nusd(tmp_path):
+    storage = _alloc(generate_dev_genesis(tmp_path))[PATH_USD.lower()]["storage"]
+    strings = [bytes.fromhex(v[2:66])[: bytes.fromhex(v[2:66])[31] // 2] for v in storage.values()]
+    assert strings.count(b"nUSD") == 2, "name and symbol"

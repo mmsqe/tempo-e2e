@@ -15,7 +15,7 @@ env:
   # drops the git tag's leading `v`.
   TEMPO_IMAGE: ghcr.io/nvnm-chain/tempo
   TEMPO_XTASK_IMAGE: ghcr.io/nvnm-chain/tempo-xtask
-  TEMPO_TAG: 1.14.0-nvnm.1
+  TEMPO_TAG: 1.14.0-nvnm.2
 
 jobs:
   lint:
