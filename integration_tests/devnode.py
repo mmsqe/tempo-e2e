@@ -69,7 +69,8 @@ def main(argv: list[str]) -> int:
     if args.cmd == "down":
         return _down()
     if args.datadir is None:
-        args.datadir = Path("node-data") / "data"
+        # Absolute: the node runs from the genesis's directory, where a relative path breaks.
+        args.datadir = Path("node-data").resolve() / "data"
     elif not args.datadir.exists():
         # Otherwise a stale path would silently start a new, empty chain there.
         parser.error(f"no datadir at {args.datadir} to resume")
