@@ -1,5 +1,7 @@
-"""Hyperlane between anvil and the node, carried by its own agents."""
+"""Hyperlane between anvil and the node, carried by its own agents: its stock Warp Route, then our
+lockbox and BridgedNVNM behind Hyperlane routers."""
 
+import asyncio
 import shutil
 import subprocess
 
@@ -9,11 +11,11 @@ from eth_account import Account
 from eth_contract.erc20 import ERC20
 
 from . import hyperlane as hl
-from .abi import HL_WARP, MOCK_ERC20
+from .abi import HL_LOCK_ROUTER, HL_MINT_ROUTER, HL_WARP, MOCK_ERC20, NVNM_LOCKBOX
 from .anvil import ALICE_KEY, DEPLOYER_KEY
 from .bridge import eth_send
 from .staking import MOCK_ERC20_BYTECODE, transact
-from .utils import new_account, until
+from .utils import new_account, rejects, until
 
 pytestmark = pytest.mark.requires("tempo-native")
 
@@ -22,12 +24,19 @@ MILLION = 1_000_000 * 10**18
 HUB_DOMAIN, L1_DOMAIN = 900_001, 900_002
 ALICE = Account.from_key(ALICE_KEY)
 TIMEOUT = 300  # agents poll, sign and deliver on their own schedule
+IDLE_SECONDS = 60  # longer than a carried message takes
 
 
 async def give(eth, token: str, spender: str):
     """Alice gets a million of mock `token` on the hub, approved to `spender`."""
     await eth_send(eth, DEPLOYER_KEY, to=token, data=MOCK_ERC20.fns.mint(ALICE.address, MILLION).data)
     await eth_send(eth, ALICE_KEY, to=token, data=ERC20.fns.approve(spender, MILLION).data)
+
+
+async def lock(eth, r: hl.NvnmRoute, validator: str):
+    """Alice gets a million NVNM on the hub and locks it through `r`'s router."""
+    await give(eth, r.nvnm, r.lock_router)
+    await eth_send(eth, ALICE_KEY, to=r.lock_router, data=HL_LOCK_ROUTER.fns.lock(validator, MILLION).data)
 
 
 @pytest.fixture
@@ -105,3 +114,44 @@ class TestWarpRoute:
         held = ERC20.fns.balanceOf(ALICE.address)
         await until("NVNM back on the hub", lambda: held.call(eth, to=nvnm), want=MILLION, timeout=TIMEOUT)
         assert await ERC20.fns.balanceOf(collateral).call(eth, to=nvnm) == 0
+
+
+class TestNvnmRoute:
+    """Our lockbox and token, with Hyperlane routers where the attested adapters were."""
+
+    async def test_positions_and_the_invariant_survive_the_swap(self, w3, eth, chain_id, hyperlane):
+        r = await hl.deploy_nvnm_route(hyperlane)
+        hyperlane.agents.relayer(subsidizing=[r.lock_router, r.mint_router])
+        validator = new_account().address
+        supply, escrow = ERC20.fns.totalSupply(), NVNM_LOCKBOX.fns.totalLocked()
+
+        # Out: the router locks into alice's own position, and Hyperlane mints to her on the L1.
+        await lock(eth, r, validator)
+        position = NVNM_LOCKBOX.fns.lockedOf(ALICE.address, validator)
+        assert await position.call(eth, to=r.lockbox) == MILLION, "the position is alice's, not the router's"
+
+        minted = ERC20.fns.balanceOf(ALICE.address)
+        await until("BridgedNVNM on the L1", lambda: minted.call(w3, to=r.token), want=MILLION, timeout=TIMEOUT)
+        assert await escrow.call(eth, to=r.lockbox) == await supply.call(w3, to=r.token) == MILLION
+
+        # Home: burned on the L1, released from alice's position by the lockbox.
+        await transact(w3, chain_id, ALICE, r.token, ERC20.fns.approve(r.mint_router, MILLION))
+        dust = HL_MINT_ROUTER.fns.withdraw(hl.MIN_WITHDRAWAL - 1, ALICE.address, validator)
+        await rejects(w3, r.mint_router, dust, "BelowMinimum", sender=ALICE.address)
+        withdraw = HL_MINT_ROUTER.fns.withdraw(MILLION, ALICE.address, validator)
+        await transact(w3, chain_id, ALICE, r.mint_router, withdraw)
+        held = ERC20.fns.balanceOf(ALICE.address)
+        await until("NVNM released on the hub", lambda: held.call(eth, to=r.nvnm), want=MILLION, timeout=TIMEOUT)
+        assert await escrow.call(eth, to=r.lockbox) == await supply.call(w3, to=r.token) == 0
+
+    async def test_a_route_the_operator_does_not_subsidize_is_not_carried(self, eth, w3, hyperlane):
+        """What bounds the subsidy: another route on the same Mailbox waits while ours arrives."""
+        ours, theirs = await hl.deploy_nvnm_route(hyperlane), await hl.deploy_nvnm_route(hyperlane)
+        hyperlane.agents.relayer(subsidizing=[ours.lock_router, ours.mint_router])
+        for r in (ours, theirs):
+            await lock(eth, r, new_account().address)
+
+        minted = ERC20.fns.balanceOf(ALICE.address)
+        await until("the subsidized mint", lambda: minted.call(w3, to=ours.token), want=MILLION, timeout=TIMEOUT)
+        await asyncio.sleep(IDLE_SECONDS)
+        assert await minted.call(w3, to=theirs.token) == 0, "the relayer carried a route it does not subsidize"

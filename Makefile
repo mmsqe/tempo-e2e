@@ -42,6 +42,8 @@ contract-artifacts:
 	$(call _artifact,$(BRIDGE_WORK),NVNMLockbox,NVNMLockbox,lockbox.json)
 	$(call _artifact,$(BRIDGE_WORK),NVNMBridgeAdapter,NVNMBridgeAdapter,bridge_adapter.json)
 	$(call _artifact,$(BRIDGE_WORK),NVNMReleaseAdapter,NVNMReleaseAdapter,release_adapter.json)
+	$(call _artifact,$(BRIDGE_WORK),HyperlaneLockRouter,HyperlaneLockRouter,hl_lock_router.json)
+	$(call _artifact,$(BRIDGE_WORK),HyperlaneMintRouter,HyperlaneMintRouter,hl_mint_router.json)
 
 # Hyperlane's contracts, as its npm release publishes them. Needs node and npm.
 HYPERLANE_CORE := 12.1.0

@@ -13,9 +13,19 @@ from typing import NamedTuple
 from eth_abi.abi import encode
 from eth_account import Account
 
-from .abi import HL_COLLATERAL, HL_ISM_FACTORY, HL_MAILBOX, HL_SYNTHETIC, HL_WARP
-from .bridge import eth_create, eth_send
-from .staking import create, transact
+from .abi import (
+    BRIDGED_NVNM,
+    HL_COLLATERAL,
+    HL_ISM_FACTORY,
+    HL_LOCK_ROUTER,
+    HL_MAILBOX,
+    HL_MINT_ROUTER,
+    HL_SYNTHETIC,
+    HL_WARP,
+    NVNM_LOCKBOX,
+)
+from .bridge import BRIDGE_ROLE, LOCKBOX_BYTECODE, eth_create, eth_send
+from .staking import BRIDGED_NVNM_BYTECODE, MOCK_ERC20_BYTECODE, bytecode, create, transact
 
 IMAGE = "gcr.io/abacus-labs-dev/hyperlane-agent:agents-v2.0.0"
 _ARTIFACT = json.loads((Path(__file__).parent / "artifacts" / "hyperlane.json").read_text())
@@ -28,6 +38,7 @@ VALIDATOR_KEYS = {
     "nvnml1": "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
 }
 RELAYER_KEY = "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97"
+MIN_WITHDRAWAL = 100 * 10**18
 
 
 def pad(address: str) -> bytes:
@@ -87,6 +98,38 @@ class Hyperlane(NamedTuple):
     hub_core: Core
     l1_core: Core
     agents: Agents
+
+
+class NvnmRoute(NamedTuple):
+    nvnm: str  # a mock NVNM on the hub
+    lockbox: str
+    token: str  # BridgedNVNM on the L1
+    lock_router: str
+    mint_router: str
+
+
+async def deploy_nvnm_route(h: Hyperlane) -> NvnmRoute:
+    """Our lockbox and BridgedNVNM, with Hyperlane routers holding the two roles the attested
+    adapters would."""
+    hub, l1, hub_core, l1_core = h.hub, h.l1, h.hub_core, h.l1_core
+    nvnm = await hub.create(MOCK_ERC20_BYTECODE, encode(["string", "string"], ["NVNM", "NVNM"]))
+    lockbox = await hub.create(LOCKBOX_BYTECODE, encode(["address", "address"], [nvnm, hub.account.address]))
+    token = await l1.create(BRIDGED_NVNM_BYTECODE, encode(["address"], [l1.account.address]))
+    lock_router = await hub.create(
+        bytecode("hl_lock_router"),
+        encode(["address", "uint32", "address"], [hub_core.mailbox, l1.domain, lockbox]),
+    )
+    mint_router = await l1.create(
+        bytecode("hl_mint_router"),
+        encode(["address", "uint32", "address", "uint256"], [l1_core.mailbox, hub.domain, token, MIN_WITHDRAWAL]),
+    )
+    await hub.send(lock_router, HL_LOCK_ROUTER.fns.enroll(pad(mint_router)))
+    await l1.send(mint_router, HL_MINT_ROUTER.fns.enroll(pad(lock_router)))
+
+    releaser = await NVNM_LOCKBOX.fns.RELEASER_ROLE().call(hub.w3, to=lockbox)
+    await hub.send(lockbox, NVNM_LOCKBOX.fns.grantRole(releaser, lock_router))
+    await l1.send(token, BRIDGED_NVNM.fns.setRole(mint_router, BRIDGE_ROLE, True))
+    return NvnmRoute(nvnm, lockbox, token, lock_router, mint_router)
 
 
 async def deploy_warp_route(h: Hyperlane, token: str) -> tuple[str, str]:

@@ -6,7 +6,6 @@ import asyncio
 import pytest
 from eth_abi.abi import encode
 from eth_contract.erc20 import ERC20
-from eth_utils import keccak
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 
 from .abi import (
@@ -34,7 +33,7 @@ from .staking import (
     router_setup,
     transact,
 )
-from .utils import call_revert, fund, gas_cost_in_token, new_account
+from .utils import call_revert, fund, gas_cost_in_token, new_account, rejects
 
 pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
 
@@ -46,14 +45,6 @@ async def staking(w3, chain_id, funded_account):
 
 ZERO = "0x" + "00" * 20
 DAY = 86_400
-
-
-async def rejects(w3, to, fn, error: str, *, sender: str):
-    """``fn`` from ``sender`` reverts with ``error`` itself, not merely some revert: a guard that
-    fires first would otherwise pass for the one under test."""
-    out = await call_revert(w3, to, fn.data, sender=sender)
-    selector = keccak(text=f"{error}()")[:4].hex()
-    assert selector in out.lower(), f"expected {error} (0x{selector}), got {out}"
 
 
 class TestStaking:

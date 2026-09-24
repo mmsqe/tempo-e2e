@@ -438,3 +438,13 @@ HL_COLLATERAL = Contract.from_abi(["function initialize(address hook, address is
 HL_SYNTHETIC = Contract.from_abi(
     ["function initialize(uint256 totalSupply, string name, string symbol, address hook, address ism, address owner)"]
 )
+# Our own routers over Hyperlane, holding the lockbox's RELEASER and BridgedNVNM's BRIDGE roles.
+HL_LOCK_ROUTER = Contract.from_abi(
+    ["function enroll(bytes32 router)", "function lock(address validator, uint256 amount) returns (bytes32)"]
+)
+HL_MINT_ROUTER = Contract.from_abi(
+    [
+        "function enroll(bytes32 router)",
+        "function withdraw(uint256 amount, address holder, address validator) returns (bytes32)",
+    ]
+)
