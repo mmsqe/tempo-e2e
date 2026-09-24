@@ -205,21 +205,14 @@ class TestDeploymentGasTokenOnValidators:
         if not request.config.getoption("--consensus"):
             pytest.skip("consensus localnet not requested (pass --consensus)")
         base = tmp_path_factory.mktemp("gas-token-net")
-        # tempo-devnet cannot pass xtask this flag, so a wrapper adds it.
-        xtask, issuer = resolve_xtask_bin(), _dev_account(0).address
-        wrapper = base / "tempo-xtask"
-        wrapper.write_text(
-            f'#!/bin/sh\n[ "$1" = generate-localnet ] && exec "{xtask}" "$@" '
-            f'--deployment-gas-token --deployment-gas-token-admin {issuer}\nexec "{xtask}" "$@"\n'
-        )
-        wrapper.chmod(0o755)
         ports = find_free_base_ports(self.VALIDATORS)
         config = {
             "chain_id": 1337,
             "accounts": 20,
             "seed": 0,
+            "patch_genesis_flags": ["--deployment-gas-token", "--deployment-gas-token-admin", _dev_account(0).address],
             "tempo_bin": resolve_tempo_bin(),
-            "tempo_xtask_bin": str(wrapper),
+            "tempo_xtask_bin": resolve_xtask_bin(),
             "validators": [{"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(ports)],
         }
         yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
