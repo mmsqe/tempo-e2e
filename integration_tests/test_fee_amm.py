@@ -1,16 +1,21 @@
 """Fee AMM: paying gas in a non-validator stablecoin swaps through the FeeManager pool."""
 
+import asyncio
+
 import pytest
 from eth_account import Account
 from eth_contract.erc20 import ERC20
 from hexbytes import HexBytes
 from tempo import Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD, THETA_USD
+from tempo.devnet.ports import find_free_base_ports
 from web3 import AsyncWeb3, Web3
 from web3.exceptions import Web3RPCError
+from web3.middleware import ExtraDataToPOAMiddleware
 
 from .abi import FEE
-from .network import FAUCET_PRIVATE_KEY, dev_node
+from .conftest import _consensus_net_supervisord, _run_devnet_init
+from .network import FAUCET_PRIVATE_KEY, dev_node, resolve_tempo_bin, resolve_xtask_bin
 from .utils import (
     build_tempo_tx,
     create_token,
@@ -23,6 +28,7 @@ from .utils import (
     send_type_2,
     suggested_max_fee,
     transfer_call,
+    wait_for_block,
 )
 
 pytestmark = pytest.mark.tempo
@@ -177,3 +183,85 @@ class TestDeploymentGasToken:
         await send_type_2(w3, payer, PATH_USD, ERC20.fns.transfer(new_account().address, 1).data)
         assert await balance.call(w3, to=token) == gas, "no temporary token spent"
         assert (await pool.call(w3, to=FEE_MANAGER_ADDRESS))[0] > reserve, "the nUSD fee went through the pool"
+
+
+def _dev_account(index: int):
+    """An account of the dev mnemonic, which funds the localnet's genesis and names its validators."""
+    Account.enable_unaudited_hdwallet_features()
+    return Account.from_mnemonic(
+        "test test test test test test test test test test test junk", account_path=f"m/44'/60'/0'/0/{index}"
+    )
+
+
+@pytest.mark.consensus
+@pytest.mark.slow
+class TestDeploymentGasTokenOnValidators:
+    """On a localnet each block's fee recipient is its proposer, which xtask leaves on nUSD."""
+
+    VALIDATORS = 4  # the localnet names the dev mnemonic's accounts 1..4
+
+    @pytest.fixture(scope="class")
+    def gas_token_net(self, request, tmp_path_factory):
+        if not request.config.getoption("--consensus"):
+            pytest.skip("consensus localnet not requested (pass --consensus)")
+        base = tmp_path_factory.mktemp("gas-token-net")
+        # tempo-devnet cannot pass xtask this flag, so a wrapper adds it.
+        xtask, issuer = resolve_xtask_bin(), _dev_account(0).address
+        wrapper = base / "tempo-xtask"
+        wrapper.write_text(
+            f'#!/bin/sh\n[ "$1" = generate-localnet ] && exec "{xtask}" "$@" '
+            f'--deployment-gas-token --deployment-gas-token-admin {issuer}\nexec "{xtask}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        ports = find_free_base_ports(self.VALIDATORS)
+        config = {
+            "chain_id": 1337,
+            "accounts": 20,
+            "seed": 0,
+            "tempo_bin": resolve_tempo_bin(),
+            "tempo_xtask_bin": str(wrapper),
+            "validators": [{"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(ports)],
+        }
+        yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
+
+    async def test_a_payer_is_refused_until_the_validators_take_it(self, gas_token_net):
+        w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(gas_token_net.node_rpc_url("node0")))
+        # Genesis and epoch-boundary blocks carry the DKG outcome in extraData, past web3's 32 bytes.
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        cs = Web3.to_checksum_address
+        payer = _dev_account(10)
+        transfer = ERC20.fns.transfer(new_account().address, 1).data
+        token = cs(await FEE.fns.userTokens(payer.address).call(w3, to=FEE_MANAGER_ADDRESS))
+        proposer = (await w3.eth.get_block("latest"))["miner"]
+        assert cs(await FEE.fns.validatorTokens(proposer).call(w3, to=FEE_MANAGER_ADDRESS)) == cs(PATH_USD)
+
+        # The pool admits a fee token one of the last 10 block producers takes (AmmLiquidityCache).
+        # The genesis block's is the coinbase, which does take it, so only past that window is the
+        # refusal certain.
+        await wait_for_block(w3, 12)
+        with pytest.raises(Web3RPCError, match="insufficient liquidity"):
+            await send_type_2(w3, payer, PATH_USD, transfer)
+
+        # Each validator sets the token itself. Another proposer has to mine that (in its own block it
+        # reverts), so it pays in what most of the others take, or the last one deadlocks. While the
+        # set is split the node may also refuse the fee; both retry.
+        chain_id = await w3.eth.chain_id
+        calls = [{"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.setValidatorToken(token).data}]
+        for switched in range(self.VALIDATORS):
+            validator = _dev_account(switched + 1)
+            fee_token = token if 2 * switched >= self.VALIDATORS - 1 else PATH_USD
+            for _ in range(30):
+                try:
+                    receipt = await send_calls(
+                        w3, chain_id=chain_id, private_key=validator.key.hex(), calls=calls, fee_token=fee_token
+                    )
+                except Web3RPCError as refused:
+                    assert "insufficient liquidity" in str(refused), refused
+                    await asyncio.sleep(1)
+                    continue
+                if receipt["status"] == 1:
+                    break
+            assert cs(await FEE.fns.validatorTokens(validator.address).call(w3, to=FEE_MANAGER_ADDRESS)) == token
+
+        await send_type_2(w3, payer, PATH_USD, transfer)
+        await w3.provider.disconnect()

@@ -36,6 +36,7 @@ DEX = Contract.from_abi(
 FEE = Contract.from_abi(
     [
         "function setUserToken(address token)",
+        "function setValidatorToken(address token)",
         "function userTokens(address user) view returns (address)",
         "function validatorTokens(address validator) view returns (address)",
         "function getPool(address userToken, address validatorToken) view returns ((uint128 reserveUserToken, uint128 reserveValidatorToken))",
