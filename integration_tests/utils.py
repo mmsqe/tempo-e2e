@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import shutil
@@ -234,6 +235,14 @@ async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None
     err = resp.get("error")
     assert err is not None, f"expected revert, got result={resp.get('result')!r}"
     return f"{err.get('message', '')} {err.get('data', '') or ''}".strip()
+
+
+async def rejects(w3, to, fn, error: str, *, sender: str):
+    """``fn`` from ``sender`` reverts with ``error`` itself, not merely some revert: a guard that
+    fires first would otherwise pass for the one under test."""
+    out = await call_revert(w3, to, fn.data, sender=sender)
+    selector = keccak(text=f"{error}()")[:4].hex()
+    assert selector in out.lower(), f"expected {error} (0x{selector}), got {out}"
 
 
 async def send_calls(
@@ -572,3 +581,18 @@ def cluster_fixture(name: str, validators: int, *, env: dict[str, str] | None = 
                 shutil.rmtree(base, ignore_errors=True)
 
     return _cluster
+
+
+async def until(what: str, probe, *, want=None, timeout: float = 180.0):
+    """Poll ``probe`` until it equals ``want``, or is truthy without one: the services act on their
+    own schedule, so watch the chain."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = probe()
+        if inspect.isawaitable(last):
+            last = await last
+        if last == want if want is not None else last:
+            return last
+        await asyncio.sleep(1)
+    raise AssertionError(f"timed out after {timeout}s waiting for {what} (last saw {last!r})")

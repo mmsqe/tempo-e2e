@@ -13,6 +13,18 @@ make test-consensus-docker # same, but validators run in Docker containers
 make lint                  # ruff
 ```
 
+## The bridge suite
+
+`test_bridge.py` needs a second chain, so it runs an anvil beside the node and
+the bridge's own services between them (`--bridge-bin-dir`, default
+`bridge/services/target/debug`). It skips when either is missing.
+
+`--eth-fork-url <rpc>` forks that RPC instead of starting a bare anvil, so the
+lockbox holds the real NVNM — pause, proxy and all — and a fork can impersonate
+a holder to fund it. A forked chain still has no finality to wait for. Every
+state read goes upstream, so give it an endpoint you own: a public one gets
+rate-limited, and the run skips if it never comes up.
+
 ## Consensus localnet
 
 `make test-consensus` (or `pytest -m consensus --consensus`) launches four

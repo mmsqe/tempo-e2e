@@ -58,6 +58,18 @@ def pytest_addoption(parser):
         "since tempo only registers stub handlers)",
     )
     group.addoption(
+        "--eth-fork-url",
+        default=os.environ.get("ETH_FORK_URL"),
+        help="Fork this Ethereum RPC for the bridge suite's lockbox chain (also $ETH_FORK_URL), "
+        "so it locks the real NVNM instead of a mock. Unset runs a bare anvil.",
+    )
+    group.addoption(
+        "--bridge-bin-dir",
+        default=os.environ.get("BRIDGE_BIN_DIR", "bridge/services/target/debug"),
+        help="Where the built bridge-attestor / bridge-relayer binaries are (also $BRIDGE_BIN_DIR); "
+        "the bridge suite skips when they are missing",
+    )
+    group.addoption(
         "--tidx",
         action="store_true",
         default=False,
