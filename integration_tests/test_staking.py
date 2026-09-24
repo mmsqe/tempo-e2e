@@ -6,12 +6,14 @@ import asyncio
 import pytest
 from eth_abi.abi import encode
 from eth_contract.erc20 import ERC20
+from eth_utils import keccak
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 
 from .abi import (
     BRIDGED_NVNM,
     FEE,
     FEE_ROUTER,
+    FEE_ROUTER_FACTORY,
     GUARDED_SWAPPER,
     MOCK_ERC20,
     STAKING,
@@ -20,6 +22,7 @@ from .staking import (
     BRIDGED_NVNM_BYTECODE,
     ERR_AMOUNT_TOO_LARGE,
     ETHER,
+    FACTORY_BYTECODE,
     GLOBAL_POOL,
     GUARDED_SWAPPER_BYTECODE,
     POOL_BYTECODE,
@@ -39,6 +42,18 @@ pytestmark = pytest.mark.tempo  # tempo 0x76 create/tx, gas in PATH_USD
 @pytest.fixture
 async def staking(w3, chain_id, funded_account):
     return await deploy(w3, chain_id, funded_account)
+
+
+ZERO = "0x" + "00" * 20
+DAY = 86_400
+
+
+async def rejects(w3, to, fn, error: str, *, sender: str):
+    """``fn`` from ``sender`` reverts with ``error`` itself, not merely some revert: a guard that
+    fires first would otherwise pass for the one under test."""
+    out = await call_revert(w3, to, fn.data, sender=sender)
+    selector = keccak(text=f"{error}()")[:4].hex()
+    assert selector in out.lower(), f"expected {error} (0x{selector}), got {out}"
 
 
 class TestStaking:
@@ -88,6 +103,22 @@ class TestStaking:
         # 1 wei tolerance: the virtual-offset share rate rounds in the pool's favor.
         assert abs(await staking.staked_of(val, me) - 150 * ETHER) <= 1
         assert await staking.earned(val, me) == 0  # stablecoin accumulator untouched
+
+    async def test_unstaking_more_than_staked_reverts(self, staking, funded_account):
+        v = new_account().address
+        await staking.stake(funded_account, v, 10 * ETHER)
+        unstake = STAKING.fns.unstake(v, 11 * ETHER)
+        await rejects(staking.w3, staking.address, unstake, "InsufficientStake", sender=funded_account.address)
+
+    async def test_a_reward_with_no_stakers_reverts(self, staking, funded_account):
+        """A direct deposit into an empty pool has nowhere to go; the router pays the operator."""
+        deposit = STAKING.fns.depositReward(new_account().address, ETHER)
+        await rejects(staking.w3, staking.address, deposit, "NoStakers", sender=funded_account.address)
+
+    async def test_zero_amounts_revert(self, staking, funded_account):
+        v = new_account().address
+        for fn in (STAKING.fns.stake(v, 0), STAKING.fns.unstake(v, 0), STAKING.fns.depositReward(v, 0)):
+            await rejects(staking.w3, staking.address, fn, "ZeroAmount", sender=funded_account.address)
 
 
 class TestCommitteeElection:
@@ -154,6 +185,39 @@ class TestCommitteeElection:
         )
         assert gas < 30_000_000, f"election read too expensive for the node cap: {gas}"
 
+    async def test_below_min_seats_elects_nobody(self, staking, funded_account):
+        """Fewer qualifying candidates than `minSeats` elects nobody; the node falls back."""
+        v1, v2 = new_account().address, new_account().address
+        await staking.setup_election(funded_account, [v1, v2])
+        for v in (v1, v2):
+            await staking.stake(funded_account, v, 100 * ETHER)
+
+        await staking.send(funded_account, STAKING.fns.setMinSeats(3))
+        assert await staking.elected() == []
+        await staking.send(funded_account, STAKING.fns.setMinSeats(2))
+        assert sorted(await staking.elected()) == sorted([v1, v2])
+
+    async def test_stake_past_the_delegation_cap_reverts(self, staking, funded_account):
+        v = new_account().address
+        await staking.send(funded_account, STAKING.fns.setCommitteeConfig(21, 1, 50 * ETHER))
+        stake = STAKING.fns.stake(v, 51 * ETHER)
+        await rejects(staking.w3, staking.address, stake, "DelegationCap", sender=funded_account.address)
+
+    async def test_candidacy_is_closed_without_a_bond(self, staking):
+        stranger = new_account().address
+        register = STAKING.fns.registerCandidate()
+        await rejects(staking.w3, staking.address, register, "CandidacyClosed", sender=stranger)
+
+    async def test_only_the_owner_configures_the_election(self, staking):
+        stranger, v = new_account().address, new_account().address
+        for fn in (
+            STAKING.fns.setCandidate(v, True),
+            STAKING.fns.setCommitteeConfig(21, 1, 0),
+            STAKING.fns.setMinSeats(1),
+            STAKING.fns.setCandidacyBond(ETHER),
+        ):
+            await rejects(staking.w3, staking.address, fn, "Unauthorized", sender=stranger)
+
 
 class TestUnbondingAndSlash:
     """The unbonding delay, and bond-only slashing that never reaches delegators."""
@@ -204,6 +268,25 @@ class TestUnbondingAndSlash:
         before = await staking.balance(staking.nvnm, me)
         await staking.send(funded_account, STAKING.fns.withdraw(val))
         assert await staking.balance(staking.nvnm, me) - before == 100 * ETHER
+
+    async def test_withdrawing_early_or_with_nothing_pending_reverts(self, staking, funded_account):
+        v, me = new_account().address, funded_account.address
+        await staking.send(funded_account, STAKING.fns.setUnbondingPeriod(DAY))
+        await staking.stake(funded_account, v, 10 * ETHER)
+        await staking.send(funded_account, STAKING.fns.unstake(v, 10 * ETHER))
+
+        withdraw = STAKING.fns.withdraw(v)
+        await rejects(staking.w3, staking.address, withdraw, "StillUnbonding", sender=me)
+        await rejects(staking.w3, staking.address, withdraw, "NothingToWithdraw", sender=new_account().address)
+
+    async def test_only_the_owner_slashes(self, staking, funded_account):
+        """address(0) included: the node calls from it only to read the committee."""
+        v, treasury = new_account().address, new_account().address
+        slash = STAKING.fns.slash(v, 1_000, treasury)
+        for caller in (new_account().address, ZERO):
+            await rejects(staking.w3, staking.address, slash, "Unauthorized", sender=caller)
+        too_much = STAKING.fns.slash(v, 10_001, treasury)
+        await rejects(staking.w3, staking.address, too_much, "InvalidBps", sender=funded_account.address)
 
 
 class TestFeeRouting:
@@ -307,6 +390,19 @@ class TestFeeRouting:
         assert await staking.earned(GLOBAL_POOL, owner.address) == 2 * (fees - fees // 10)
         for payout in payouts:
             assert await staking.balance(PATH_USD, payout) == fees // 10
+
+    async def test_the_factory_bounds_commission_and_owns_the_split(self, w3, chain_id, funded_account):
+        staking = await deploy(w3, chain_id, funded_account, reward_token=PATH_USD)
+        arg = encode(["address", "address", "uint256"], [staking.address, funded_account.address, 5_000]).hex()
+        factory = await create(w3, chain_id, funded_account, FACTORY_BYTECODE + arg)
+        v, op, me = new_account().address, new_account().address, funded_account.address
+
+        greedy = FEE_ROUTER_FACTORY.fns.create(v, op, 5_001)
+        await rejects(w3, factory, greedy, "CommissionTooHigh", sender=me)
+        split = FEE_ROUTER_FACTORY.fns.setProtocolSplit(v, op, 2_500, 2_500)
+        await rejects(w3, factory, split, "Unauthorized", sender=new_account().address)
+        over = FEE_ROUTER_FACTORY.fns.setProtocolSplit(v, op, 6_000, 5_000)
+        await rejects(w3, factory, over, "InvalidBps", sender=me)
 
 
 class TestBridgeAndSwapper:
