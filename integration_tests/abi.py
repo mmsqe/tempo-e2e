@@ -388,3 +388,37 @@ BRIDGED_NVNM = Contract.from_abi(
     ]
 )
 
+# -- the bridge: the Ethereum escrow, and the adapter at each end ------------------------------
+NVNM_LOCKBOX = Contract.from_abi(
+    [
+        "function lock(address validator, uint256 amount)",
+        "function lockFor(address holder, address validator, uint256 amount)",
+        "function release(address holder, address validator, uint256 amount)",
+        "function lockedOf(address holder, address validator) view returns (uint256)",
+        "function totalLocked() view returns (uint256)",
+        "function strayBalance() view returns (uint256)",
+        "function grantRole(bytes32 role, address account)",
+        "function RELEASER_ROLE() view returns (bytes32)",
+    ]
+)
+
+NVNM_BRIDGE_ADAPTER = Contract.from_abi(
+    [
+        "function withdraw(uint256 amount, address holder, address validator) returns (uint256)",
+        "function minted(bytes32 transferId) view returns (bool)",
+        "function withdrawalCount() view returns (uint256)",
+        "function threshold() view returns (uint256)",
+        "function grantRole(bytes32 role, address account)",
+        "function revokeRole(bytes32 role, address account)",
+        "function ATTESTOR_ROLE() view returns (bytes32)",
+    ]
+)
+
+NVNM_RELEASE_ADAPTER = Contract.from_abi(
+    [
+        "function released(uint256 withdrawalId) view returns (bool)",
+        "function threshold() view returns (uint256)",
+        "function grantRole(bytes32 role, address account)",
+        "function ATTESTOR_ROLE() view returns (bytes32)",
+    ]
+)
