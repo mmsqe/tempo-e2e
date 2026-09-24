@@ -422,3 +422,19 @@ NVNM_RELEASE_ADAPTER = Contract.from_abi(
         "function ATTESTOR_ROLE() view returns (bytes32)",
     ]
 )
+
+# -- Hyperlane: core and a Warp Route, run beside our bridge as the transport it could switch to --
+HL_MAILBOX = Contract.from_abi(
+    ["function initialize(address owner, address defaultIsm, address defaultHook, address requiredHook)"]
+)
+HL_ISM_FACTORY = Contract.from_abi(["function deploy(address[] values, uint8 threshold) returns (address)"])
+HL_WARP = Contract.from_abi(
+    [
+        "function enrollRemoteRouter(uint32 domain, bytes32 router)",
+        "function transferRemote(uint32 destination, bytes32 recipient, uint256 amount) payable returns (bytes32)",
+    ]
+)
+HL_COLLATERAL = Contract.from_abi(["function initialize(address hook, address ism, address owner)"])
+HL_SYNTHETIC = Contract.from_abi(
+    ["function initialize(uint256 totalSupply, string name, string symbol, address hook, address ism, address owner)"]
+)

@@ -2,8 +2,6 @@
 what the shipped services do when one of them is missing, doubled, or lied to."""
 
 import asyncio
-import inspect
-import time
 from typing import NamedTuple
 
 import pytest
@@ -17,7 +15,7 @@ from .abi import BRIDGED_NVNM, NVNM_BRIDGE_ADAPTER, NVNM_LOCKBOX, STAKING
 from .anvil import ALICE_KEY, ATTESTOR_KEYS, DEPLOYER_KEY, RELAYER_KEY, SECOND_RELAYER_KEY
 from .staking import deploy as deploy_staking
 from .staking import transact
-from .utils import new_account
+from .utils import new_account, until
 
 pytestmark = pytest.mark.requires("tempo-native")
 
@@ -28,21 +26,6 @@ L1_GAS_FUNDING = 10**16
 IDLE_SECONDS = 5
 DEPLOYER, ALICE = Account.from_key(DEPLOYER_KEY), Account.from_key(ALICE_KEY)
 cs = Web3.to_checksum_address
-
-
-async def until(what: str, probe, *, want=None, timeout: float = 180.0):
-    """Poll ``probe`` until it equals ``want``, or is truthy without one: the services act on their
-    own schedule, so watch the chain."""
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
-        last = probe()
-        if inspect.isawaitable(last):
-            last = await last
-        if last == want if want is not None else last:
-            return last
-        await asyncio.sleep(1)
-    raise AssertionError(f"timed out after {timeout}s waiting for {what} (last saw {last!r})")
 
 
 class Stack(NamedTuple):

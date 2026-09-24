@@ -1,4 +1,4 @@
-.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down contract-artifacts
+.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down contract-artifacts hyperlane-artifacts
 
 BIN := .venv/bin
 
@@ -42,6 +42,14 @@ contract-artifacts:
 	$(call _artifact,$(BRIDGE_WORK),NVNMLockbox,NVNMLockbox,lockbox.json)
 	$(call _artifact,$(BRIDGE_WORK),NVNMBridgeAdapter,NVNMBridgeAdapter,bridge_adapter.json)
 	$(call _artifact,$(BRIDGE_WORK),NVNMReleaseAdapter,NVNMReleaseAdapter,release_adapter.json)
+
+# Hyperlane's contracts, as its npm release publishes them. Needs node and npm.
+HYPERLANE_CORE := 12.1.0
+hyperlane-artifacts:
+	@tmp=$$(mktemp -d) && cd $$tmp && npm pack -q @hyperlane-xyz/core@$(HYPERLANE_CORE) >/dev/null && \
+	  tar xzf *.tgz && node $(CURDIR)/scripts/hyperlane-artifacts.js $$tmp/package $(HYPERLANE_CORE) \
+	  > $(CURDIR)/integration_tests/artifacts/hyperlane.json && rm -rf $$tmp
+	@echo "wrote integration_tests/artifacts/hyperlane.json (@hyperlane-xyz/core $(HYPERLANE_CORE))"
 
 # Full suite (launches a local dev node).
 test:

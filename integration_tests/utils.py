@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import shutil
@@ -572,3 +573,18 @@ def cluster_fixture(name: str, validators: int, *, env: dict[str, str] | None = 
                 shutil.rmtree(base, ignore_errors=True)
 
     return _cluster
+
+
+async def until(what: str, probe, *, want=None, timeout: float = 180.0):
+    """Poll ``probe`` until it equals ``want``, or is truthy without one: the services act on their
+    own schedule, so watch the chain."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = probe()
+        if inspect.isawaitable(last):
+            last = await last
+        if last == want if want is not None else last:
+            return last
+        await asyncio.sleep(1)
+    raise AssertionError(f"timed out after {timeout}s waiting for {what} (last saw {last!r})")
