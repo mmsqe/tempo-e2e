@@ -1,9 +1,47 @@
-.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down
+.PHONY: install test test-tempo test-consensus test-consensus-docker lint fmt node-up node-down contract-artifacts
 
 BIN := .venv/bin
 
+# The app contracts the staking suites deploy (NVNMStaking, FeeRouter, …) are built from the
+# `contracts` submodule, and their initcode is vendored under integration_tests/artifacts so the
+# tests themselves need no toolchain. The submodule is already the checkout main reads
+# `contracts/layout/` from, so regenerating pins to whatever commit it points at.
+CONTRACTS_WORK := contracts
+# The bridge contracts the round-trip suite deploys on both chains, from their own repo.
+BRIDGE_WORK := bridge
+
+# _artifact,<submodule>,<source .sol>,<contract>,<output json> — vendor one contract's initcode
+# and where it came from. The repo is read off the submodule, so a second source needs no second
+# macro and cannot be labelled with the wrong origin.
+define _artifact
+	jq -n \
+	  --arg bc "$$(jq -r '.bytecode.object' $(1)/out/$(2).sol/$(3).json)" \
+	  --arg repo "$$(git -C $(1) remote get-url origin)" \
+	  --arg commit "$$(git -C $(1) rev-parse HEAD)" \
+	  '{source:$$repo, commit:$$commit, note:"Regenerate with: make contract-artifacts", deployer_bytecode:$$bc}' \
+	  > integration_tests/artifacts/$(4)
+	@echo "wrote integration_tests/artifacts/$(4) ($(1) $$(git -C $(1) rev-parse --short HEAD))"
+endef
+
 install:
 	uv sync
+
+# Rebuild the vendored artifacts from the submodule. Needs forge and jq. Update the submodule
+# first if you want a newer contracts commit than the one it is pinned to.
+contract-artifacts:
+	git submodule update --init --recursive $(CONTRACTS_WORK) $(BRIDGE_WORK)
+	cd $(CONTRACTS_WORK) && forge build
+	cd $(BRIDGE_WORK) && forge build
+	$(call _artifact,$(CONTRACTS_WORK),StakingDeployer,StakingDeployer,staking.json)
+	$(call _artifact,$(CONTRACTS_WORK),FeeRouter,FeeRouterFactory,feerouter_factory.json)
+	$(call _artifact,$(CONTRACTS_WORK),FeeRouter,FeeRouter,feerouter.json)
+	$(call _artifact,$(CONTRACTS_WORK),MockSwapPool,MockSwapPool,swap_pool.json)
+	$(call _artifact,$(CONTRACTS_WORK),MockERC20,MockERC20,mock_erc20.json)
+	$(call _artifact,$(CONTRACTS_WORK),BridgedNVNM,BridgedNVNM,bridged_nvnm.json)
+	$(call _artifact,$(CONTRACTS_WORK),GuardedSwapper,GuardedSwapper,guarded_swapper.json)
+	$(call _artifact,$(BRIDGE_WORK),NVNMLockbox,NVNMLockbox,lockbox.json)
+	$(call _artifact,$(BRIDGE_WORK),NVNMBridgeAdapter,NVNMBridgeAdapter,bridge_adapter.json)
+	$(call _artifact,$(BRIDGE_WORK),NVNMReleaseAdapter,NVNMReleaseAdapter,release_adapter.json)
 
 # Full suite (launches a local dev node).
 test:
