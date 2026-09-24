@@ -10,17 +10,22 @@ import json
 from pathlib import Path
 
 import pytest
-from tempo.constants import PATH_USD
+from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 
 from .abi import ANCHORING_ADDRESS
 from .anchoring import RUNTIME_CODE
-from .network import generate_dev_genesis
+from .network import DEV_GENESIS_ACCOUNTS, generate_dev_genesis
 
 pytestmark = [pytest.mark.tempo]
 
 
 def _alloc(genesis: Path) -> dict[str, dict]:
     return {address.lower(): account for address, account in json.loads(genesis.read_text())["alloc"].items()}
+
+
+def _strings(storage: dict[str, str]) -> list[bytes]:
+    """The short strings a TIP-20 stores in a slot: its name, symbol and currency."""
+    return [bytes.fromhex(v[2:66])[: bytes.fromhex(v[2:66])[31] // 2] for v in storage.values()]
 
 
 def test_the_generator_places_the_contract_this_checkout_built(tmp_path):
@@ -41,5 +46,13 @@ def test_a_genesis_without_the_flag_carries_no_contract(tmp_path):
 
 def test_the_reserved_stablecoin_is_named_nusd(tmp_path):
     storage = _alloc(generate_dev_genesis(tmp_path))[PATH_USD.lower()]["storage"]
-    strings = [bytes.fromhex(v[2:66])[: bytes.fromhex(v[2:66])[31] // 2] for v in storage.values()]
-    assert strings.count(b"nUSD") == 2, "name and symbol"
+    assert _strings(storage).count(b"nUSD") == 2, "name and symbol"
+
+
+def test_the_deployment_gas_token_is_what_the_genesis_pays_fees_in(tmp_path):
+    """A temporary token for fees before any stablecoin is bridged: every genesis account pays in
+    it, and the coinbase, the only fee recipient xtask sets, takes it."""
+    alloc = _alloc(generate_dev_genesis(tmp_path, gas_token_admin="0x" + "11" * 20))
+    [token] = [a for a in alloc if a.startswith("0x20c0") and b"DONOTUSE" in _strings(alloc[a].get("storage", {}))]
+    fee_tokens = [v[-40:] for v in alloc[FEE_MANAGER_ADDRESS.lower()]["storage"].values()]
+    assert fee_tokens.count(token[2:]) == DEV_GENESIS_ACCOUNTS + 1, "every account, and the coinbase"

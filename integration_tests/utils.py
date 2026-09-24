@@ -289,6 +289,29 @@ async def send_call(w3: AsyncWeb3, chain_id: int, signer, to: str, data, *, gas_
     return receipt
 
 
+async def send_type_2(w3: AsyncWeb3, account, to: str, data, *, gas: int | None = None):
+    """A plain EIP-1559 transaction from ``account``, asserting success. It is what
+    ``eth_estimateGas`` models, and unlike a tempo tx it names no fee token, so the payer's own
+    setting decides. The limit is the estimate unless given: TIP-1016 charges per new slot."""
+    if gas is None:
+        gas = await w3.eth.estimate_gas({"to": to, "from": account.address, "data": data})
+    tx = {
+        "to": to,
+        "data": data,
+        "value": 0,
+        "nonce": await w3.eth.get_transaction_count(account.address),
+        "chainId": await w3.eth.chain_id,
+        "gas": gas,
+        "maxFeePerGas": await suggested_max_fee(w3),
+        "maxPriorityFeePerGas": DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+        "type": 2,
+    }
+    raw = Account.sign_transaction(tx, account.key).raw_transaction
+    receipt = await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw))
+    assert receipt["status"] == 1, receipt
+    return receipt
+
+
 async def latest_timestamp(w3: AsyncWeb3) -> int:
     return (await w3.eth.get_block("latest"))["timestamp"]
 

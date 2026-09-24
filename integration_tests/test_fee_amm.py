@@ -1,12 +1,16 @@
 """Fee AMM: paying gas in a non-validator stablecoin swaps through the FeeManager pool."""
 
 import pytest
+from eth_account import Account
 from eth_contract.erc20 import ERC20
 from hexbytes import HexBytes
 from tempo import Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD, THETA_USD
+from web3 import AsyncWeb3, Web3
+from web3.exceptions import Web3RPCError
 
 from .abi import FEE
+from .network import FAUCET_PRIVATE_KEY, dev_node
 from .utils import (
     build_tempo_tx,
     create_token,
@@ -16,6 +20,7 @@ from .utils import (
     seed_fee_pool,
     send_calls,
     send_tempo_tx,
+    send_type_2,
     suggested_max_fee,
     transfer_call,
 )
@@ -121,3 +126,54 @@ async def test_insufficient_liquidity_names_the_fee_token(w3, chain_id, funded_a
     assert "insufficient liquidity in FeeAMM pool to swap fee tokens" in msg, resp
     assert "(required:" in msg, resp  # required amount
     assert token.lower() in msg.lower(), msg  # identifies the offending fee token
+
+
+@pytest.mark.slow
+class TestDeploymentGasToken:
+    """Fees on xtask's temporary gas token, before any stablecoin is bridged. On a dev node every
+    block's fee recipient is address zero, which has no key, so only the payer's side is tested."""
+
+    ISSUER = Account.from_key(FAUCET_PRIVATE_KEY)
+    PAYER = Account.from_key("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")  # a genesis account
+
+    @pytest.fixture
+    async def gas_token_w3(self, tmp_path):
+        node = dev_node(tmp_path, log_name="deployment-gas-token.log", gas_token_admin=self.ISSUER.address)
+        try:
+            node.start().wait_for_rpc()
+            w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(node.rpc_url))
+            yield w3
+            await w3.provider.disconnect()
+        finally:
+            node.stop()
+
+    async def test_a_payer_leaves_it_only_through_a_pool(self, gas_token_w3):
+        w3 = gas_token_w3
+        cs, payer = Web3.to_checksum_address, self.PAYER
+        token = cs(await FEE.fns.userTokens(payer.address).call(w3, to=FEE_MANAGER_ADDRESS))
+        recipient = (await w3.eth.get_block("latest"))["miner"]
+        assert cs(await FEE.fns.validatorTokens(recipient).call(w3, to=FEE_MANAGER_ADDRESS)) == token
+
+        # Gas comes out of the temporary token; nUSD moves only by the transfer.
+        balance = ERC20.fns.balanceOf(payer.address)
+        gas, usd = await balance.call(w3, to=token), await balance.call(w3, to=PATH_USD)
+        await send_type_2(w3, payer, PATH_USD, ERC20.fns.transfer(new_account().address, 1).data)
+        assert await balance.call(w3, to=token) < gas
+        assert await balance.call(w3, to=PATH_USD) == usd - 1
+
+        # Paying in nUSD needs a pool into the token the recipient takes; the issuer seeds one.
+        switch = FEE.fns.setUserToken(PATH_USD).data
+        with pytest.raises(Web3RPCError, match="insufficient liquidity"):
+            await send_type_2(w3, payer, FEE_MANAGER_ADDRESS, switch)
+        liquidity = 10**10
+        await send_type_2(w3, self.ISSUER, token, ERC20.fns.approve(FEE_MANAGER_ADDRESS, liquidity).data)
+        await send_type_2(
+            w3, self.ISSUER, FEE_MANAGER_ADDRESS, FEE.fns.mint(PATH_USD, token, liquidity, self.ISSUER.address).data
+        )
+        await send_type_2(w3, payer, FEE_MANAGER_ADDRESS, switch)
+
+        pool = FEE.fns.getPool(PATH_USD, token)
+        gas, reserve = await balance.call(w3, to=token), (await pool.call(w3, to=FEE_MANAGER_ADDRESS))[0]
+        await send_type_2(w3, payer, PATH_USD, ERC20.fns.transfer(new_account().address, 1).data)
+        assert await balance.call(w3, to=token) == gas, "no temporary token spent"
+        assert (await pool.call(w3, to=FEE_MANAGER_ADDRESS))[0] > reserve, "the nUSD fee went through the pool"

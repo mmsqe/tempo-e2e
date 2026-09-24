@@ -4,7 +4,6 @@ the seed fixture loaded at block 0."""
 import time
 
 import pytest
-from eth_account import Account
 from eth_utils import filter_abi_by_type, function_abi_to_4byte_selector, keccak
 from tempo import Signer, add_fee_payer_signature, serialize, sign_transaction
 from tempo.keychain import sign_tx_access_key
@@ -28,7 +27,6 @@ from .anchoring import (
 )
 from .network import ExternalNode
 from .utils import (
-    DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
     RETURN_42_INIT,
     STATE_WRITE_GAS,
     build_tempo_tx,
@@ -42,6 +40,7 @@ from .utils import (
     send_calls,
     send_set_code_tx,
     send_signed,
+    send_type_2,
     suggested_max_fee,
 )
 
@@ -51,30 +50,6 @@ pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
 def intrinsic(data: bytes) -> int:
     """What a transaction owes before it runs anything: 21k plus its calldata."""
     return 21_000 + sum(4 if byte == 0 else 16 for byte in bytes(data))
-
-
-async def send_type_2(w3, chain_id, account, data, *, gas=None):
-    """A plain EIP-1559 transaction, which is what ``eth_estimateGas`` models.
-
-    The limit is the estimate unless given: TIP-1016 charges per new slot, so a large field
-    runs past any round number worth hard-coding.
-    """
-    sender = account.address
-    if gas is None:
-        gas = await w3.eth.estimate_gas({"to": ANCHORING_ADDRESS, "from": sender, "data": data})
-    tx = {
-        "to": ANCHORING_ADDRESS,
-        "data": data,
-        "value": 0,
-        "nonce": await w3.eth.get_transaction_count(sender),
-        "chainId": chain_id,
-        "gas": gas,
-        "maxFeePerGas": await suggested_max_fee(w3),
-        "maxPriorityFeePerGas": DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
-        "type": 2,
-    }
-    raw = Account.sign_transaction(tx, account.key).raw_transaction
-    return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw))
 
 
 @pytest.fixture(scope="module")
@@ -267,9 +242,7 @@ class TestGas:
         tx = {"to": ANCHORING_ADDRESS, "from": funded_account.address, "data": data}
 
         estimated = await w3.eth.estimate_gas(tx)
-        receipt = await send_type_2(w3, chain_id, funded_account, data, gas=estimated)
-
-        assert receipt["status"] == 1
+        receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data, gas=estimated)
         assert estimated >= receipt["gasUsed"]
 
     async def test_every_write_costs_more_than_its_calldata(self, w3, chain_id, funded_account):
@@ -289,8 +262,7 @@ class TestGas:
         }
 
         for method, data in writes.items():
-            receipt = await send_type_2(w3, chain_id, funded_account, data)
-            assert receipt["status"] == 1, method
+            receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data)
             assert receipt["gasUsed"] > intrinsic(data), method
 
     async def test_a_bigger_metadata_costs_more(self, w3, chain_id, funded_account):
@@ -298,8 +270,7 @@ class TestGas:
         costs = {}
         for size in (100, 1000):
             data = ANCHORING.fns.addRegistry(f"gas-scale-{size}", "", "m" * size).data
-            receipt = await send_type_2(w3, chain_id, funded_account, data)
-            assert receipt["status"] == 1
+            receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data)
             costs[size] = receipt["gasUsed"] - intrinsic(data)
 
         assert costs[1000] > costs[100]
@@ -336,7 +307,7 @@ class TestEoaGate:
     async def test_type_2(self, w3, chain_id, funded_account):
         """What the old chain's integrations send."""
         data = ANCHORING.fns.addRegistry("type-2", "", "").data
-        receipt = await send_type_2(w3, chain_id, funded_account, data, gas=STATE_WRITE_GAS)
+        receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data, gas=STATE_WRITE_GAS)
         assert receipt["type"] == 2
         await self.assert_created_by(w3, receipt, funded_account.address)
 
