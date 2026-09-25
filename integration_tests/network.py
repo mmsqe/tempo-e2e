@@ -278,6 +278,8 @@ class TempoNode:
         self.datadir.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "w")
+        log.write(" ".join(self.command()) + "\n")
+        log.flush()
         self.proc = subprocess.Popen(
             self.command(),
             stdout=log,
@@ -308,6 +310,44 @@ class TempoNode:
     @property
     def ws_url(self) -> str:
         return f"ws://127.0.0.1:{self.ws_port}"
+
+
+class FollowerNode(TempoNode):
+    """A ``--follow`` node: it makes no blocks, taking them from ``upstream`` over websocket and,
+    with ``--consensus.devp2p.finalizations``, from ``trusted_peers`` over devp2p."""
+
+    def __init__(self, *, upstream: str, trusted_peers: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self.upstream = upstream
+        self.trusted_peers = trusted_peers
+
+    def command(self) -> list[str]:
+        return [
+            self.binary,
+            "node",
+            "--follow",
+            self.upstream,
+            "--chain",
+            str(self.genesis),
+            "--datadir",
+            str(self.datadir),
+            "--http",
+            "--http.addr",
+            "127.0.0.1",
+            "--http.port",
+            str(self.http_port),
+            "--http.api",
+            "eth,net,web3",
+            "--port",
+            str(self.p2p_port),
+            "--trusted-peers",
+            ",".join(self.trusted_peers),
+            "--disable-discovery",
+            "--authrpc.port",
+            str(self.auth_port),
+            "--ipcdisable",
+            *self.extra_args,
+        ]
 
 
 def dev_node(
