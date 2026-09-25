@@ -76,6 +76,9 @@ TIP20 = Contract.from_abi(
         "function transferPolicyId() view returns (uint64)",
         "function logoURI() view returns (string)",
         "function setLogoURI(string newLogoURI)",
+        "function pause()",
+        "function paused() view returns (bool)",
+        "function PAUSE_ROLE() view returns (bytes32)",
     ]
 )
 

@@ -13,7 +13,7 @@ from web3 import AsyncWeb3, Web3
 from web3.exceptions import Web3RPCError
 from web3.middleware import ExtraDataToPOAMiddleware
 
-from .abi import FEE
+from .abi import FEE, TIP20, TIP20_ROLES
 from .conftest import _consensus_net_supervisord, _run_devnet_init
 from .network import FAUCET_PRIVATE_KEY, dev_node, resolve_tempo_bin, resolve_xtask_bin
 from .utils import (
@@ -28,7 +28,6 @@ from .utils import (
     send_type_2,
     suggested_max_fee,
     transfer_call,
-    wait_for_block,
 )
 
 pytestmark = pytest.mark.tempo
@@ -196,7 +195,8 @@ def _dev_account(index: int):
 @pytest.mark.consensus
 @pytest.mark.slow
 class TestDeploymentGasTokenOnValidators:
-    """On a localnet each block's fee recipient is its proposer, which xtask leaves on nUSD."""
+    """The move off xtask's temporary gas token once nUSD is bridged, with each block's fee going to
+    its proposer. Genesis puts the accounts and validators on the token; anyone else is on nUSD."""
 
     VALIDATORS = 4  # the localnet names the dev mnemonic's accounts 1..4
 
@@ -217,44 +217,67 @@ class TestDeploymentGasTokenOnValidators:
         }
         yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
 
-    async def test_a_payer_is_refused_until_the_validators_take_it(self, gas_token_net):
+    async def test_the_switch_to_nusd_needs_no_fork(self, gas_token_net):
         w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(gas_token_net.node_rpc_url("node0")))
         # Genesis and epoch-boundary blocks carry the DKG outcome in extraData, past web3's 32 bytes.
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         cs = Web3.to_checksum_address
-        payer = _dev_account(10)
-        transfer = ERC20.fns.transfer(new_account().address, 1).data
-        token = cs(await FEE.fns.userTokens(payer.address).call(w3, to=FEE_MANAGER_ADDRESS))
-        proposer = (await w3.eth.get_block("latest"))["miner"]
-        assert cs(await FEE.fns.validatorTokens(proposer).call(w3, to=FEE_MANAGER_ADDRESS)) == cs(PATH_USD)
-
-        # The pool admits a fee token one of the last 10 block producers takes (AmmLiquidityCache).
-        # The genesis block's is the coinbase, which does take it, so only past that window is the
-        # refusal certain.
-        await wait_for_block(w3, 12)
-        with pytest.raises(Web3RPCError, match="insufficient liquidity"):
-            await send_type_2(w3, payer, PATH_USD, transfer)
-
-        # Each validator sets the token itself. Another proposer has to mine that (in its own block it
-        # reverts), so it pays in what most of the others take, or the last one deadlocks. While the
-        # set is split the node may also refuse the fee; both retry.
         chain_id = await w3.eth.chain_id
-        calls = [{"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.setValidatorToken(token).data}]
-        for switched in range(self.VALIDATORS):
-            validator = _dev_account(switched + 1)
-            fee_token = token if 2 * switched >= self.VALIDATORS - 1 else PATH_USD
-            for _ in range(30):
-                try:
-                    receipt = await send_calls(
-                        w3, chain_id=chain_id, private_key=validator.key.hex(), calls=calls, fee_token=fee_token
-                    )
-                except Web3RPCError as refused:
-                    assert "insufficient liquidity" in str(refused), refused
-                    await asyncio.sleep(1)
-                    continue
-                if receipt["status"] == 1:
-                    break
-            assert cs(await FEE.fns.validatorTokens(validator.address).call(w3, to=FEE_MANAGER_ADDRESS)) == token
+        admin, payer = _dev_account(0), _dev_account(10)
+        validators = [_dev_account(i) for i in range(1, self.VALIDATORS + 1)]
+        transfer = ERC20.fns.transfer(new_account().address, 1).data
 
+        token = cs(await FEE.fns.userTokens(payer.address).call(w3, to=FEE_MANAGER_ADDRESS))
+        for validator in validators:
+            assert cs(await FEE.fns.validatorTokens(validator.address).call(w3, to=FEE_MANAGER_ADDRESS)) == token
+        newcomer = new_account()
+        await send_type_2(w3, payer, PATH_USD, ERC20.fns.transfer(newcomer.address, 10**9).data)
+        with pytest.raises(Web3RPCError, match="insufficient liquidity"):
+            await send_type_2(w3, newcomer, PATH_USD, transfer)
+
+        # 1. The admin seeds the nUSD -> token pool with the token alone.
+        liquidity = 10**10
+        await send_type_2(w3, admin, token, ERC20.fns.approve(FEE_MANAGER_ADDRESS, liquidity).data)
+        await send_type_2(w3, admin, FEE_MANAGER_ADDRESS, FEE.fns.mint(PATH_USD, token, liquidity, admin.address).data)
+        await send_type_2(w3, newcomer, PATH_USD, transfer)
+
+        # 2. Every account on the token moves to nUSD, validators and admin included.
+        switch = FEE.fns.setUserToken(PATH_USD).data
+        for account in (admin, payer, *validators):
+            await send_type_2(w3, account, FEE_MANAGER_ADDRESS, switch)
+
+        # 3. Each validator takes nUSD, all at once. The call reverts in a block its sender proposes,
+        # at most one per block, so only those resend.
+        calls = [{"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.setValidatorToken(PATH_USD).data}]
+        pending = validators
+        for _ in range(5):
+            receipts = await asyncio.gather(
+                *(send_calls(w3, chain_id=chain_id, private_key=v.key.hex(), calls=calls) for v in pending)
+            )
+            reverted = [(v, r) for v, r in zip(pending, receipts, strict=True) if r["status"] == 0]
+            for validator, receipt in reverted:
+                miner = (await w3.eth.get_block(receipt["blockNumber"]))["miner"]
+                assert miner == validator.address, f"{validator.address} reverted in a block it did not propose"
+            pending = [v for v, _ in reverted]
+            if not pending:
+                break
+        assert not pending, f"still proposing their own blocks after 5 rounds: {[v.address for v in pending]}"
+        for validator in validators:
+            assert cs(await FEE.fns.validatorTokens(validator.address).call(w3, to=FEE_MANAGER_ADDRESS)) == PATH_USD
+
+        pool = FEE.fns.getPool(PATH_USD, token)
+        reserves = await pool.call(w3, to=FEE_MANAGER_ADDRESS)
+        assert reserves[0] > 0, "nUSD fees collected while the set was split"
         await send_type_2(w3, payer, PATH_USD, transfer)
+        assert await pool.call(w3, to=FEE_MANAGER_ADDRESS) == reserves, "no fee goes through the pool"
+
+        # 4. The admin takes the collected nUSD out, then pauses the token.
+        pool_id = await FEE.fns.getPoolId(PATH_USD, token).call(w3, to=FEE_MANAGER_ADDRESS)
+        shares = await FEE.fns.liquidityBalances(pool_id, admin.address).call(w3, to=FEE_MANAGER_ADDRESS)
+        await send_type_2(w3, admin, FEE_MANAGER_ADDRESS, FEE.fns.burn(PATH_USD, token, shares, admin.address).data)
+        assert (await pool.call(w3, to=FEE_MANAGER_ADDRESS))[0] < reserves[0]
+        pause_role = await TIP20.fns.PAUSE_ROLE().call(w3, to=token)
+        await send_type_2(w3, admin, token, TIP20_ROLES.fns.grantRole(pause_role, admin.address).data)
+        await send_type_2(w3, admin, token, TIP20.fns.pause().data)
+        assert await TIP20.fns.paused().call(w3, to=token)
         await w3.provider.disconnect()

@@ -121,6 +121,7 @@ def generate_dev_genesis(
     epoch_length: int | None = None,
     anchoring: bool = False,
     gas_token_admin: str | None = None,
+    validator_address: str | None = None,
 ) -> Path:
     """The dev genesis: ``$TEMPO_GENESIS`` if set, else generated in ``output_dir`` via ``tempo-xtask``.
 
@@ -139,15 +140,26 @@ def generate_dev_genesis(
     ``anchoring`` places the anchoring contract, as the launch genesis carries it; without it the
     alloc has none.
 
-    ``gas_token_admin`` issues xtask's temporary deployment gas token, which the genesis accounts
-    and the coinbase then take fees in.
+    ``gas_token_admin`` issues xtask's temporary deployment gas token: the genesis accounts and the
+    validator pay fees in it, the coinbase and validator take it.
+
+    ``validator_address`` is the validator's onchain address; unset, the mnemonic's second account.
     """
     genesis = output_dir / "genesis.json"
     if fork_times:
         unknown = sorted(set(fork_times) - set(xtask_forks()))
         if unknown:
             raise ValueError(f"tempo-xtask cannot schedule {unknown}; it knows {list(xtask_forks())}")
-    if not fork_times and chain_id is None and epoch_length is None and not anchoring and not gas_token_admin:
+    options = [
+        # t10_time -> --t10-time <ts>
+        *[a for name, ts in (fork_times or {}).items() for a in (f"--{name.replace('_', '-')}", str(ts))],
+        *(("--chain-id", str(chain_id)) if chain_id is not None else ()),
+        *(("--epoch-length", str(epoch_length)) if epoch_length is not None else ()),
+        *(("--anchoring",) if anchoring else ()),
+        *(("--deployment-gas-token", "--deployment-gas-token-admin", gas_token_admin) if gas_token_admin else ()),
+        *(("--validator-addresses", validator_address) if validator_address else ()),
+    ]
+    if not options:
         # Only a default genesis may be supplied or reused: neither a prebuilt nor a leftover
         # file can be trusted to carry a particular schedule, chain id or epoch length.
         env_genesis = os.environ.get("TEMPO_GENESIS")
@@ -169,12 +181,7 @@ def generate_dev_genesis(
             "--validators",
             "127.0.0.1:30303",
             "--no-dkg-in-genesis",
-            # t10_time -> --t10-time <ts>
-            *[a for name, ts in (fork_times or {}).items() for a in (f"--{name.replace('_', '-')}", str(ts))],
-            *(("--chain-id", str(chain_id)) if chain_id is not None else ()),
-            *(("--epoch-length", str(epoch_length)) if epoch_length is not None else ()),
-            *(("--anchoring",) if anchoring else ()),
-            *(("--deployment-gas-token", "--deployment-gas-token-admin", gas_token_admin) if gas_token_admin else ()),
+            *options,
         ],
         capture_output=True,
         text=True,

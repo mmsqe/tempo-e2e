@@ -50,9 +50,14 @@ def test_the_reserved_stablecoin_is_named_nusd(tmp_path):
 
 
 def test_the_deployment_gas_token_is_what_the_genesis_pays_fees_in(tmp_path):
-    """A temporary token for fees before any stablecoin is bridged: every genesis account pays in
-    it, and the coinbase, the only fee recipient xtask sets, takes it."""
-    alloc = _alloc(generate_dev_genesis(tmp_path, gas_token_admin="0x" + "11" * 20))
+    """A temporary token for fees before any stablecoin is bridged: the genesis accounts and the
+    validator hold it and pay in it, the coinbase and the validator take it. The validator is named
+    by address, as a real network's are, so the genesis has to fund it too."""
+    alloc = _alloc(generate_dev_genesis(tmp_path, gas_token_admin="0x" + "11" * 20, validator_address="0x" + "22" * 20))
     [token] = [a for a in alloc if a.startswith("0x20c0") and b"DONOTUSE" in _strings(alloc[a].get("storage", {}))]
     fee_tokens = [v[-40:] for v in alloc[FEE_MANAGER_ADDRESS.lower()]["storage"].values()]
-    assert fee_tokens.count(token[2:]) == DEV_GENESIS_ACCOUNTS + 1, "every account, and the coinbase"
+    assert fee_tokens.count(token[2:]) == DEV_GENESIS_ACCOUNTS + 3, (
+        "every account and the validator; the coinbase and the validator"
+    )
+    minted = [v for v in alloc[token]["storage"].values() if int(v, 16) == 2**64 - 1]
+    assert len(minted) == DEV_GENESIS_ACCOUNTS + 2, "every account, the issuer and the validator"
