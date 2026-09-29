@@ -22,6 +22,9 @@ skips when what it needs is missing. `--eth-fork-url <rpc>` forks that RPC
 instead, so the lockbox holds the live NVNM; use an endpoint you own, as a
 public one gets rate-limited.
 
+`python -m integration_tests.stack [--hyperlane]` stands the same stack up on
+a running dev node and anvil, to walk the flow by hand.
+
 ## Consensus localnet
 
 `make test-consensus` (or `pytest -m consensus --consensus`) launches four
