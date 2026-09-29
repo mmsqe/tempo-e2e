@@ -13,12 +13,13 @@ make test-consensus-docker # same, but validators run in Docker containers
 make lint                  # ruff
 ```
 
-## The bridge suite
+## The bridge suites
 
-`test_bridge.py` runs an anvil beside the node as Ethereum, and the bridge's
-services from `--bridge-bin-dir` (default `bridge/services/target/debug`)
-between them; it skips when either is missing. `--eth-fork-url <rpc>` forks that
-RPC instead, so the lockbox holds the live NVNM; use an endpoint you own, as a
+`test_bridge.py` and `test_hyperlane.py` run an anvil beside the node as Ethereum.
+The bridge's services come from `--bridge-bin-dir` (default
+`bridge/services/target/debug`); Hyperlane's agents run in Docker. Each suite
+skips when what it needs is missing. `--eth-fork-url <rpc>` forks that RPC
+instead, so the lockbox holds the live NVNM; use an endpoint you own, as a
 public one gets rate-limited.
 
 ## Consensus localnet
