@@ -13,6 +13,14 @@ make test-consensus-docker # same, but validators run in Docker containers
 make lint                  # ruff
 ```
 
+## The bridge suite
+
+`test_bridge.py` runs an anvil beside the node as Ethereum, and the bridge's
+services from `--bridge-bin-dir` (default `bridge/services/target/debug`)
+between them; it skips when either is missing. `--eth-fork-url <rpc>` forks that
+RPC instead, so the lockbox holds the live NVNM; use an endpoint you own, as a
+public one gets rate-limited.
+
 ## Consensus localnet
 
 `make test-consensus` (or `pytest -m consensus --consensus`) launches four

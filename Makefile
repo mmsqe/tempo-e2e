@@ -20,14 +20,22 @@ install:
 # Vendor the initcode the suites deploy, from the submodules at their pins, so the tests need no
 # toolchain. Needs forge and jq.
 contract-artifacts:
-	git submodule update --init --recursive contracts
+	git submodule update --init --recursive contracts bridge erc20
 	cd contracts && forge build
+	cd bridge && forge build
+	cd erc20 && forge build
 	$(call _artifact,contracts,StakingDeployer,StakingDeployer,staking.json)
 	$(call _artifact,contracts,FeeRouter,FeeRouterFactory,feerouter_factory.json)
 	$(call _artifact,contracts,FeeRouter,FeeRouter,feerouter.json)
 	$(call _artifact,contracts,MockSwapPool,MockSwapPool,swap_pool.json)
 	$(call _artifact,contracts,BridgedNVNM,BridgedNVNM,bridged_nvnm.json)
 	$(call _artifact,contracts,GuardedSwapper,GuardedSwapper,guarded_swapper.json)
+	$(call _artifact,bridge,NVNMLockbox,NVNMLockbox,lockbox.json)
+	$(call _artifact,bridge,NVNMBridgeAdapter,NVNMBridgeAdapter,bridge_adapter.json)
+	$(call _artifact,bridge,NVNMReleaseAdapter,NVNMReleaseAdapter,release_adapter.json)
+	$(call _artifact,bridge,BridgedTIP20,BridgedTIP20,bridged_tip20.json)
+	$(call _artifact,erc20,NVNMToken,NVNMToken,nvnm_token.json)
+	$(call _artifact,erc20,ERC1967Proxy,ERC1967Proxy,erc1967_proxy.json)
 
 # Full suite (launches a local dev node).
 test:

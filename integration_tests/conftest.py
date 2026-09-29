@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -17,6 +18,7 @@ from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
 
+from . import anvil as anvil_mod
 from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
 from .drivers import get_driver
@@ -143,6 +145,43 @@ def tidx(request, driver, tempo, tmp_path_factory):
         stack.down()
         if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def ethereum(request, tmp_path_factory):
+    """An anvil standing in for Ethereum beside the node, skipped where there is no anvil."""
+    base = tmp_path_factory.mktemp("anvil")
+    fork_url = request.config.getoption("--eth-fork-url")
+    try:
+        node = anvil_mod.AnvilNode(log_path=base / "anvil.log", fork_url=fork_url)
+    except RuntimeError as e:
+        pytest.skip(str(e))
+    try:
+        try:
+            node.start().wait_for_rpc()
+        except (RuntimeError, TimeoutError) as e:
+            # A fork's endpoint is someone else's, and its rate limit not this suite's failure.
+            if not fork_url:
+                raise
+            pytest.skip(f"fork endpoint {fork_url} did not come up: {e}")
+        yield node
+    finally:
+        node.stop()
+        if request.config.getoption("--clean-data"):
+            shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture
+async def eth(ethereum):
+    """A client for the Ethereum side, as ``w3`` is for the tempo node."""
+    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(ethereum.rpc_url))
+    yield client
+    await client.provider.disconnect()
+
+
+@pytest.fixture(scope="session")
+def bridge_bin_dir(request) -> Path:
+    return Path(request.config.getoption("--bridge-bin-dir")).expanduser().resolve()
 
 
 @pytest.fixture
