@@ -44,6 +44,8 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
+        "function distributeFees(address validator, address token)",  # permissionless payout to the fee recipient
+        "function collectedFees(address validator, address token) view returns (uint256)",
     ]
 )
 
@@ -53,6 +55,7 @@ TIP20_FACTORY = Contract.from_abi(
         "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt) returns (address)",
         "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt, string logoURI) returns (address)",
         "function isTIP20(address token) view returns (bool)",
+        "function getTokenAddress(address sender, bytes32 salt) pure returns (address)",
     ]
 )
 TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
@@ -160,6 +163,8 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         "function deactivateValidator(uint64 idx)",
         f"function validatorByAddress(address validatorAddress) view returns ({_VALIDATOR_TUPLE})",
         f"function validatorByPublicKey(bytes32 publicKey) view returns ({_VALIDATOR_TUPLE})",
+        # The block beneficiary, so a validator's fees accrue in FeeManager under it.
+        "function setFeeRecipient(uint64 idx, address feeRecipient)",
         "function transferOwnership(address newOwner)",
     ]
 )
@@ -271,4 +276,166 @@ ANCHORING = Contract.from_abi(
         "event RevokeRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
     ],
     to=ANCHORING_ADDRESS,
+)
+
+# NVNMStaking: NVNM staked toward validators, sharing their fees pro-rata.
+STAKING = Contract.from_abi(
+    [
+        "function stake(address validator, uint256 amount)",
+        "function unstake(address validator, uint256 amount)",
+        "function depositReward(address validator, uint256 amount)",
+        "function compoundReward(address validator, uint256 amount)",
+        "function claim(address validator) returns (uint256 amount)",
+        "function earned(address validator, address user) view returns (uint256)",
+        # a deposit vests over `rewardDuration`; `rewardStream` is its rate and end
+        "function setRewardDuration(uint256 duration)",
+        "function rewardStream(address validator) view returns (uint256 rate, uint256 finish)",
+        "function stakedOf(address validator, address user) view returns (uint256)",
+        "function totalStaked(address validator) view returns (uint256)",
+        "function totalShares(address validator) view returns (uint256)",
+        "function stakeToken() view returns (address)",
+        "function rewardToken() view returns (address)",
+        # election: top `maxSeats` by acquired*acquiredWeight + delegated; under `minSeats` elects nobody.
+        "function setCandidate(address validator, bool active)",
+        "function setCommitteeConfig(uint256 maxSeats, uint256 acquiredWeight, uint256 maxDelegated)",
+        "function candidates() view returns (address[])",
+        # `eligible` is the node's registry: nobody else is elected.
+        "function computeCommittee(address[] eligible) view returns (address[] vals)",
+        "function setMinSeats(uint256 minSeats)",
+        "function minSeats() view returns (uint256)",
+        # candidacy: self-register against an NVNM bond; `minAcquired` is the 1M floor.
+        "function setCandidacyBond(uint256 bond)",
+        "function registerCandidate()",
+        "function resignCandidate()",
+        "function bondOf(address validator) view returns (uint256)",
+        "function setMinAcquired(uint256 minAcquired)",
+        "function minAcquired() view returns (uint256)",
+        # slashing: the owner seizes the candidacy bond, even one unbonding; never delegated stake.
+        "function slash(address validator, uint256 bps, address recipient) returns (uint256 seized)",
+        # unbonding: exiting stake and a resigned bond each wait out the period, then withdraw.
+        # Never 0 once the election is configured or a bond is posted.
+        "function setUnbondingPeriod(uint256 period)",
+        "function withdraw(address validator) returns (uint256 amount)",
+        "function pendingUnstakeOf(address validator, address user) view returns (uint256 amount, uint256 releaseAt)",
+        "function withdrawBond() returns (uint256 amount)",
+        "function pendingBondOf(address validator) view returns (uint256 amount, uint256 releaseAt)",
+    ]
+)
+
+# Its one-shot deployer (nvnmchain-contracts StakingDeployer.sol): the staking proxy over given tokens.
+STAKING_DEPLOYER = Contract.from_abi(["function staking() view returns (address)"])
+
+# FeeRouter: protocol cuts (devshare/buybacks) then validator remainder → commission + delegators.
+FEE_ROUTER = Contract.from_abi(
+    [
+        # `flush()` routes the token FeeManager pays in; `flush(token)` anything else sent here.
+        "function flush() returns (uint256 deposited)",
+        "function flush(address token) returns (uint256 deposited)",
+        "function validator() view returns (address)",
+        "function commissionBps() view returns (uint256)",
+        # Read live off the staking proxy, so it follows a reward-token migration.
+        "function rewardToken() view returns (address)",
+        # The delegators' share of a token the pool cannot account in, never flushed twice.
+        "function heldForDelegators(address token) view returns (uint256)",
+    ]
+)
+FEE_ROUTER_FACTORY = Contract.from_abi(
+    [
+        "function create(address validator, address operator, uint256 commissionBps) returns (address router)",
+        "function setSwapper(address swapper, uint256 swapGas)",
+        "function setProtocolSplit(address devshare, address buyback, uint256 devshareBps, uint256 buybackBps)",
+        # GuardedSwapper reads this to decide who may move its reference price.
+        "function isRouter(address account) view returns (bool)",
+        "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps)",
+    ]
+)
+
+# GuardedSwapper: the buyback-market wrapper the factory's `swapper` points at.
+GUARDED_SWAPPER = Contract.from_abi(
+    [
+        "function setGuards(address inner, uint256 maxAmountIn, uint256 maxDeviationBps, uint256 emaAlphaBps)",
+        # A second floor, `maxDriftBps` under the seeded `refPrice`, so the EMA cannot be walked down.
+        "function setDriftBand(uint256 maxDriftBps)",
+        # Owner and this factory's routers only, whose output goes to the buyback wallet.
+        "function setRouterFactory(address routerFactory)",
+        "function seedPrice(uint256 price)",
+        "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) returns (uint256 out)",
+        "function emaPrice() view returns (uint256)",
+        "function refPrice() view returns (uint256)",
+    ]
+)
+
+# BridgedNVNM: BRIDGE=1 role holders mint/burn; owner curates the role (setRole from EnumerableRoles).
+BRIDGED_NVNM = Contract.from_abi(
+    [
+        "function setRole(address holder, uint256 role, bool active)",
+        "function bridgeMint(address to, uint256 amount)",
+        "function bridgeBurn(address from, uint256 amount)",
+    ]
+)
+
+# nvnm-erc20's NVNMToken, initialized through its ERC1967Proxy: the whole supply goes to `recipient`.
+NVNM_TOKEN = Contract.from_abi(
+    ["function initialize((address recipient, address defaultAdmin, address pauser, address upgrader) params)"]
+)
+
+# -- the bridge: the Ethereum escrow, and the adapter at each end ------------------------------
+NVNM_LOCKBOX = Contract.from_abi(
+    [
+        "function lock(address validator, uint256 amount)",
+        "function lockFor(address holder, address validator, uint256 amount)",
+        "function release(address holder, address validator, uint256 amount)",
+        "function lockedOf(address holder, address validator) view returns (uint256)",
+        "function totalLocked() view returns (uint256)",
+        "function strayBalance() view returns (uint256)",
+        "function grantRole(bytes32 role, address account)",
+        "function RELEASER_ROLE() view returns (bytes32)",
+    ]
+)
+
+NVNM_BRIDGE_ADAPTER = Contract.from_abi(
+    [
+        "function withdraw(uint256 amount, address holder, address validator) returns (uint256)",
+        "function minted(bytes32 transferId) view returns (bool)",
+        "function withdrawalCount() view returns (uint256)",
+        "function threshold() view returns (uint256)",
+        "function grantRole(bytes32 role, address account)",
+        "function revokeRole(bytes32 role, address account)",
+        "function ATTESTOR_ROLE() view returns (bytes32)",
+    ]
+)
+
+NVNM_RELEASE_ADAPTER = Contract.from_abi(
+    [
+        "function released(uint256 withdrawalId) view returns (bool)",
+        "function threshold() view returns (uint256)",
+        "function grantRole(bytes32 role, address account)",
+        "function ATTESTOR_ROLE() view returns (bytes32)",
+    ]
+)
+
+# -- Hyperlane: core and a Warp Route, run beside our bridge as the transport it could switch to --
+HL_MAILBOX = Contract.from_abi(
+    ["function initialize(address owner, address defaultIsm, address defaultHook, address requiredHook)"]
+)
+HL_ISM_FACTORY = Contract.from_abi(["function deploy(address[] values, uint8 threshold) returns (address)"])
+HL_WARP = Contract.from_abi(
+    [
+        "function enrollRemoteRouter(uint32 domain, bytes32 router)",
+        "function transferRemote(uint32 destination, bytes32 recipient, uint256 amount) payable returns (bytes32)",
+    ]
+)
+HL_COLLATERAL = Contract.from_abi(["function initialize(address hook, address ism, address owner)"])
+HL_SYNTHETIC = Contract.from_abi(
+    ["function initialize(uint256 totalSupply, string name, string symbol, address hook, address ism, address owner)"]
+)
+# Our own routers over Hyperlane, holding the lockbox's RELEASER and BridgedNVNM's BRIDGE roles.
+HL_LOCK_ROUTER = Contract.from_abi(
+    ["function enroll(bytes32 router)", "function lock(address validator, uint256 amount) returns (bytes32)"]
+)
+HL_MINT_ROUTER = Contract.from_abi(
+    [
+        "function enroll(bytes32 router)",
+        "function withdraw(uint256 amount, address holder, address validator) returns (bytes32)",
+    ]
 )

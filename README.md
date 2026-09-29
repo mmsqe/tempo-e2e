@@ -13,6 +13,18 @@ make test-consensus-docker # same, but validators run in Docker containers
 make lint                  # ruff
 ```
 
+## The bridge suites
+
+`test_bridge.py` and `test_hyperlane.py` run an anvil beside the node as Ethereum.
+The bridge's services come from `--bridge-bin-dir` (default
+`bridge/services/target/debug`); Hyperlane's agents run in Docker. Each suite
+skips when what it needs is missing. `--eth-fork-url <rpc>` forks that RPC
+instead, so the lockbox holds the live NVNM; use an endpoint you own, as a
+public one gets rate-limited.
+
+`python -m integration_tests.stack [--hyperlane]` stands the same stack up on
+a running dev node and anvil, to walk the flow by hand.
+
 ## Consensus localnet
 
 `make test-consensus` (or `pytest -m consensus --consensus`) launches four
