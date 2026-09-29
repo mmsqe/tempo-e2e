@@ -236,6 +236,14 @@ async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None
     return f"{err.get('message', '')} {err.get('data', '') or ''}".strip()
 
 
+async def rejects(w3, to, fn, error: str, *, sender: str):
+    """``fn`` from ``sender`` reverts with ``error`` itself, not merely some revert: a guard that
+    fires first would otherwise pass for the one under test."""
+    out = await call_revert(w3, to, fn.data, sender=sender)
+    selector = keccak(text=f"{error}()")[:4].hex()
+    assert selector in out.lower(), f"expected {error} (0x{selector}), got {out}"
+
+
 async def send_calls(
     w3: AsyncWeb3,
     *,
@@ -361,6 +369,7 @@ async def create_token(
     admin,
     quote: str = PATH_USD,
     name: str = "TUSD",
+    currency: str = "USD",
     mint=None,
     salt: bytes = bytes(32),
 ):
@@ -379,7 +388,7 @@ async def create_token(
         calls=[
             {
                 "to": TIP20_FACTORY_ADDRESS,
-                "data": TIP20_FACTORY.fns.createToken(name, name, "USD", quote, admin.address, salt).data,
+                "data": TIP20_FACTORY.fns.createToken(name, name, currency, quote, admin.address, salt).data,
             }
         ],
     )
