@@ -44,7 +44,8 @@ async def refuses(w3, data: bytes) -> bool:
 async def test_trailing_bytes_are_accepted_from_t12(w3):
     """A suffix past the last argument decodes again at T12; T11 alone refuses it.
 
-    The relaxation landed after v1.14.0, so a node from that line schedules T12 and refuses.
+    The relaxation landed after v1.14.0. From nvnm.4 that line leaves T12 off and refuses as T11
+    does; before it, it schedules a T12 without the relaxation and the test skips.
     """
     forks = await active_forks(w3)
     if "T11" in forks and "T12" not in forks:

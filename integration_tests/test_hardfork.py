@@ -1,6 +1,6 @@
 """Hardfork boundaries crossed on a running chain, rather than baked into genesis.
 
-Every other test launches with all forks active, so xtask writes their state into the
+Every other test launches with its forks active, so xtask writes their state into the
 alloc and the executor's boundary installers never fire. Scheduling a fork past genesis
 makes the node install that state itself — the shape of every real upgrade. Which forks
 own such state is discovered by diffing generated allocs: T3 (SignatureVerifier),
@@ -72,7 +72,7 @@ def boundary_forks() -> tuple[str, ...]:
     """
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            head = set(_generate_alloc(Path(tmp) / "head"))
+            head = set(_generate_alloc(Path(tmp) / "head", dict.fromkeys(xtask_forks(), 0)))
             return tuple(f for f in xtask_forks() if head - set(_generate_alloc(Path(tmp) / f, {f: FAR_FUTURE})))
     except (OSError, RuntimeError):
         return ()
@@ -141,8 +141,11 @@ def _wait_past(w3: Web3, activation: int, timeout: float = 120.0) -> None:
 
 @pytest.fixture(scope="module")
 def head_chain(tmp_path_factory):
-    """A chain launched with every fork active at genesis — the state a boundary must reproduce."""
-    node = dev_node(tmp_path_factory.mktemp("head"), log_name="head.log")
+    """A chain launched with every fork active at genesis — the state a boundary must reproduce.
+
+    Scheduled outright: xtask leaves T12 off unless asked.
+    """
+    node = dev_node(tmp_path_factory.mktemp("head"), log_name="head.log", fork_times=dict.fromkeys(xtask_forks(), 0))
     alloc = _read_alloc(node.genesis)
     with _running(node) as w3:
         yield w3, alloc
