@@ -13,6 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import requests
 from web3 import Web3
 
 # Accounts prefunded in the generated dev genesis. --dev ignores baked-in validator,
@@ -355,6 +356,59 @@ class FollowerNode(TempoNode):
             "--ipcdisable",
             *self.extra_args,
         ]
+
+
+class ValidatorNode(TempoNode):
+    """A validator joining a running network: a signing key, and no share until the next DKG."""
+
+    def __init__(self, *, signing_key: Path, ingress: str, trusted_peers: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self.signing_key = Path(signing_key)
+        self.ingress = ingress
+        self.trusted_peers = trusted_peers
+        self.metrics_port = free_port()
+
+    def command(self) -> list[str]:
+        return [
+            self.binary,
+            "node",
+            "--chain",
+            str(self.genesis),
+            "--datadir",
+            str(self.datadir),
+            "--consensus.signing-key",
+            str(self.signing_key),
+            "--consensus.listen-address",
+            self.ingress,
+            "--consensus.metrics-address",
+            f"127.0.0.1:{self.metrics_port}",
+            "--consensus.use-local-defaults",  # or it never dials loopback, a private address
+            "--http",
+            "--http.addr",
+            "127.0.0.1",
+            "--http.port",
+            str(self.http_port),
+            "--http.api",
+            "all",
+            "--port",
+            str(self.p2p_port),
+            "--trusted-peers",
+            ",".join(self.trusted_peers),
+            "--disable-discovery",
+            "--authrpc.port",
+            str(self.auth_port),
+            "--ipcdisable",
+            *self.extra_args,
+        ]
+
+    def is_signer(self) -> bool:
+        """Whether it has started an epoch holding a share, by its consensus metrics."""
+        try:
+            text = requests.get(f"http://127.0.0.1:{self.metrics_port}/metrics", timeout=5).text
+        except requests.RequestException:
+            return False
+        counts = re.findall(r"^\S*epoch_manager_how_often_signer_total(?:\{[^}]*\})? (\S+)$", text, re.MULTILINE)
+        return any(float(count) > 0 for count in counts)
 
 
 def dev_node(

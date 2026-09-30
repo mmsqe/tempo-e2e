@@ -280,10 +280,24 @@ async def send_calls(
     return receipt
 
 
-async def send_call(w3: AsyncWeb3, chain_id: int, signer, to: str, data, *, gas_limit: int = STATE_WRITE_GAS):
+async def send_call(
+    w3: AsyncWeb3,
+    chain_id: int,
+    signer,
+    to: str,
+    data,
+    *,
+    gas_limit: int = STATE_WRITE_GAS,
+    fee_token: str = PATH_USD,
+):
     """Send a single-call tempo tx from ``signer`` (a local account), asserting success."""
     receipt = await send_calls(
-        w3, chain_id=chain_id, private_key=signer.key.hex(), gas_limit=gas_limit, calls=[{"to": to, "data": data}]
+        w3,
+        chain_id=chain_id,
+        private_key=signer.key.hex(),
+        gas_limit=gas_limit,
+        fee_token=fee_token,
+        calls=[{"to": to, "data": data}],
     )
     assert receipt["status"] == 1
     return receipt
