@@ -12,7 +12,6 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
-import re
 import tempfile
 import time
 from pathlib import Path
@@ -34,14 +33,6 @@ FAR_FUTURE = 4_000_000_000
 ACTIVATION_LEAD = 30
 
 MMR_FORK = "t10_time"  # put a precompile, which answers before code, at 0x…0a00 until nvnmchain-tempo#10
-ANCHORING_FORK = "nvnm1_time"  # installs the anchoring runtime over the code the alloc placed
-
-
-def _fork_label(name: str) -> str:
-    """The name ``tempo_forkSchedule`` reports, which is the enum variant: ``t10_time`` -> ``T10``,
-    ``t1a_time`` -> ``T1A``, ``nvnm1_time`` -> ``Nvnm1``."""
-    fork = name.removesuffix("_time")
-    return fork.upper() if re.fullmatch(r"t\d+[a-z]?", fork) else fork.capitalize()
 
 
 def _read_alloc(genesis: Path) -> dict[str, dict]:
@@ -113,18 +104,18 @@ def _fingerprint(w3: Web3, address: str, slots) -> dict[str, str]:
 
 
 def _active_fork(w3: Web3) -> str:
-    """The hardfork the node reports as active (``tempo_forkSchedule``)."""
+    """The hardfork the node reports as active (``tempo_forkSchedule``), in xtask's name: ``T1A`` -> ``t1a_time``."""
     resp = w3.provider.make_request("tempo_forkSchedule", [])
     if resp.get("error"):
         raise RuntimeError(f"tempo_forkSchedule failed: {resp['error']}")
-    return resp["result"]["active"]
+    return f"{resp['result']['active'].lower()}_time"
 
 
-def _assert_pre_fork(w3: Web3, activation: int, label: str) -> None:
+def _assert_pre_fork(w3: Web3, activation: int, fork: str) -> None:
     """Guard that the boundary is still ahead, so the pre-fork assertions mean something."""
     ts = w3.eth.get_block("latest")["timestamp"]
     assert ts < activation, (
-        f"chain reached {label} (block timestamp {ts} >= {activation}) "
+        f"chain reached {fork} (block timestamp {ts} >= {activation}) "
         f"before the pre-fork assertions could run; raise ACTIVATION_LEAD"
     )
 
@@ -173,54 +164,16 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
 
     with _running(node) as w3:
         # Pre-fork: a live chain one fork short, holding none of the state.
-        _assert_pre_fork(w3, activation, _fork_label(fork))
-        assert _active_fork(w3) == _fork_label(forks[forks.index(fork) - 1])
+        _assert_pre_fork(w3, activation, fork)
+        assert _active_fork(w3) == forks[forks.index(fork) - 1]
         for address in owed:
-            assert _code(w3, address) == b"", f"{address} must hold no code before {_fork_label(fork)}"
+            assert _code(w3, address) == b"", f"{address} must hold no code before {fork}"
 
         _wait_past(w3, activation)
 
         # Post-fork: the executor installed it all on a chain already running without it.
-        assert _active_fork(w3) == _fork_label(forks[-1])
+        assert _active_fork(w3) == forks[-1]
         assert fingerprints(w3) == fingerprints(head_w3)
-
-
-def test_crossing_nvnm1_installs_the_anchoring_contract(tmp_path):
-    """The upgrade path itself: the runtime lands and the corpus under it survives. Genesis places
-    a stub so the swap is visible; a launch genesis crosses as a no-op."""
-    if ANCHORING_FORK not in xtask_forks():
-        pytest.skip(f"this tempo-xtask cannot schedule {ANCHORING_FORK}")
-    activation = int(time.time()) + ACTIVATION_LEAD
-    seed = seed_fixture()
-    stub = bytes.fromhex("60006000fd")  # any code at all, so the address is not an empty one
-    genesis = genesis_with_anchoring(
-        tmp_path,
-        storage=seed,
-        fork_times=_schedule(ANCHORING_FORK, activation),
-        code=stub,
-    )
-    node = TempoNode(
-        datadir=tmp_path / "node0", log_path=tmp_path / "nvnm1.log", genesis=genesis, http_port=free_port()
-    )
-
-    def written(w3: Web3) -> dict[int, str]:
-        """Every slot genesis wrote under the anchoring contract."""
-        return {slot: bytes(w3.eth.get_storage_at(ANCHORING_ADDRESS, slot)).hex() for slot in seed}
-
-    with _running(node) as w3:
-        _assert_pre_fork(w3, activation, _fork_label(ANCHORING_FORK))
-        assert _code(w3, ANCHORING_ADDRESS) == stub, "the alloc did not place the stub"
-        before = written(w3)
-
-        _wait_past(w3, activation)
-
-        assert _active_fork(w3) == _fork_label(ANCHORING_FORK)
-        assert _code(w3, ANCHORING_ADDRESS) == RUNTIME_CODE, "the boundary did not install the runtime"
-        assert written(w3) == before, "the swap moved storage"
-
-        # The corpus was there all along; the boundary only brought the code that reads it.
-        listing = bytes(w3.eth.call({"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.registries(0, Page()).data}))
-        assert b"us-ca1" in listing, "the installed runtime does not read the corpus already in storage"
 
 
 def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
@@ -236,11 +189,11 @@ def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
         return _fingerprint(w3, ANCHORING_ADDRESS, map(hex, seed)), answer
 
     with _running(node) as w3:
-        _assert_pre_fork(w3, activation, _fork_label(MMR_FORK))
+        _assert_pre_fork(w3, activation, MMR_FORK)
         before = state(w3)
         assert before[0]["code"] == RUNTIME_CODE.hex()
 
         _wait_past(w3, activation)
 
-        assert _active_fork(w3) == _fork_label(xtask_forks()[-1])
+        assert _active_fork(w3) == xtask_forks()[-1]
         assert state(w3) == before

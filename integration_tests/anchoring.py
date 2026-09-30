@@ -74,19 +74,16 @@ def genesis_with_anchoring(
     *,
     storage: dict[int, int] | None = None,
     fork_times: dict[str, int] | None = None,
-    code: bytes = RUNTIME_CODE,
 ) -> Path:
     """The dev genesis plus the contract's code, and ``storage`` if given, at ``ANCHORING_ADDRESS``.
 
-    The code is placed here rather than by the generator, so ``code`` can stand in for an older
-    release in a test that watches a fork boundary replace one. What the generator itself writes
-    is `test_genesis.py`'s subject.
+    What the generator itself writes is `test_genesis.py`'s subject.
     """
     base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
     genesis = json.loads(base.read_text())
     key = ANCHORING_ADDRESS.lower()
     assert key not in genesis["alloc"], f"xtask's genesis already has {key}"
-    genesis["alloc"][key] = _account(code, storage)
+    genesis["alloc"][key] = _account(RUNTIME_CODE, storage)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "genesis.json"
     path.write_text(json.dumps(genesis))
