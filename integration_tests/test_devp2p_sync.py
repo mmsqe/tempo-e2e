@@ -10,13 +10,12 @@ from tempo.devnet.ports import find_free_base_ports
 from web3 import Web3
 
 from .conftest import _consensus_net_supervisord, _run_devnet_init
-from .network import FollowerNode, free_port, resolve_tempo_bin, resolve_xtask_bin
+from .network import DEAD_UPSTREAM, FollowerNode, free_port, resolve_tempo_bin, resolve_xtask_bin
 from .utils import poll_height, wait_height
 
 pytestmark = [pytest.mark.tempo, pytest.mark.consensus, pytest.mark.slow]
 
 GOSSIP = "--consensus.devp2p.finalizations"
-DEAD_UPSTREAM = "ws://127.0.0.1:9"  # the discard port refuses, so only devp2p can bring blocks
 VALIDATORS = 4
 
 
