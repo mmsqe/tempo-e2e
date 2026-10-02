@@ -14,9 +14,9 @@ from web3.exceptions import Web3RPCError
 from .network import DEAD_UPSTREAM, FollowerNode, dev_node, free_port, generate_dev_genesis, node_log
 from .utils import fund, new_account, send_call, transfer_call
 
-# An id no binary claims -- upstream keys chains off 4217/42431, this fork off 787222.
+# An id no binary claims -- upstream keys chains off 4217/42431.
 UNCLAIMED_CHAIN_ID = 424242
-FORK_CHAIN_ID = 787222
+DEVNET_CHAIN_ID = 787222
 
 BOOT_PING = re.compile(r"pinging boot node record=NodeRecord \{ address: ([^,]+)")
 
@@ -104,7 +104,7 @@ class TestBootnodes:
         yield run
         proxy.close()
 
-    @pytest.mark.parametrize("chain_id", [FORK_CHAIN_ID, UNCLAIMED_CHAIN_ID])
+    @pytest.mark.parametrize("chain_id", [DEVNET_CHAIN_ID, UNCLAIMED_CHAIN_ID])
     def test_looks_up_no_peers_by_default(self, lookups, chain_id):
         assert lookups(chain_id) == {"pinged": [], "fetched": []}
 
