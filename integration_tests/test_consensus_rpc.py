@@ -1,9 +1,11 @@
 """Consensus RPC namespace (consensus_*) against the multi-validator localnet (--consensus)."""
 
 import asyncio
+import json
 import time
 
 import pytest
+import websockets
 from hexbytes import HexBytes
 
 from .utils import poll_height, wait_for_block, wait_height
@@ -29,6 +31,29 @@ async def test_get_finalization_latest_certifies_a_block(consensus_w3):
             return
         await asyncio.sleep(1)
     pytest.fail(f"no finalization certificate from consensus_getFinalization: {resp}")
+
+
+async def test_subscribe_streams_finalized_blocks(consensus_net, consensus_w3):
+    """consensus_subscribe, the stream a follower takes its blocks from."""
+    if not hasattr(consensus_net, "node_ws_url"):
+        pytest.skip("needs the supervisord localnet (--consensus)")
+    # A bare socket: web3.py only routes `eth_subscription` notifications.
+    async with websockets.connect(consensus_net.node_ws_url("node0")) as ws:
+        await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "consensus_subscribe", "params": []}))
+        subscription = json.loads(await ws.recv())["result"]
+        async with asyncio.timeout(30):
+            frames = [json.loads(await ws.recv()) for _ in range(3)]
+
+    assert all(f["method"] == "consensus_event" and f["params"]["subscription"] == subscription for f in frames)
+    events = [f["params"]["result"] for f in frames]
+    assert all(e["type"] == "finalized" for e in events)
+    # Only a block with its own certificate is announced, so heights rise but may skip.
+    heights = [int(e["block"]["header"]["number"], 16) for e in events]
+    assert heights == sorted(set(heights))
+    await wait_for_block(consensus_w3, heights[-1])
+    for height, event in zip(heights, events):
+        block = await consensus_w3.provider.make_request("eth_getBlockByNumber", [hex(height), False])
+        assert block["result"]["hash"] == event["digest"]
 
 
 async def test_blocks_are_produced(consensus_w3):
