@@ -16,6 +16,7 @@ from tempo.devnet.cluster import ClusterCLI
 from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
@@ -96,6 +97,8 @@ def tempo(request, driver, tmp_path_factory):
 @pytest.fixture
 async def w3(tempo):
     client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(tempo.rpc_url))
+    # A consensus node's headers carry DKG payloads in extraData, past web3.py's 32-byte cap.
+    client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     yield client
     await client.provider.disconnect()
 
