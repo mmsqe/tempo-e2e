@@ -17,6 +17,9 @@ from .utils import fund, new_account, send_call, transfer_call
 # An id no binary claims -- upstream keys chains off 4217/42431.
 UNCLAIMED_CHAIN_ID = 424242
 DEVNET_CHAIN_ID = 787222
+TESTNET_CHAIN_ID = 787223
+# The testnet's bootnodes, as the node compiles them in.
+TESTNET_BOOTNODES = ["34.150.20.80", "34.92.172.118"]
 
 BOOT_PING = re.compile(r"pinging boot node record=NodeRecord \{ address: ([^,]+)")
 
@@ -73,7 +76,7 @@ class TestUnclaimedChainId:
 
 @pytest.mark.slow
 class TestBootnodes:
-    """No id falls back to upstream's or Ethereum's peers."""
+    """No id falls back to upstream's or Ethereum's peers; the testnet's has its own."""
 
     @pytest.fixture
     def lookups(self, tmp_path, monkeypatch):
@@ -107,6 +110,9 @@ class TestBootnodes:
     @pytest.mark.parametrize("chain_id", [DEVNET_CHAIN_ID, UNCLAIMED_CHAIN_ID])
     def test_looks_up_no_peers_by_default(self, lookups, chain_id):
         assert lookups(chain_id) == {"pinged": [], "fetched": []}
+
+    def test_the_testnet_looks_up_its_own_bootnodes(self, lookups):
+        assert lookups(TESTNET_CHAIN_ID) == {"pinged": TESTNET_BOOTNODES, "fetched": []}
 
     def test_looks_up_the_peers_it_is_given(self, lookups):
         enode = f"enode://{'ab' * 64}@127.0.0.1:{free_port()}"
