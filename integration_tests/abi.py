@@ -72,6 +72,8 @@ TIP20 = Contract.from_abi(
     [
         "function transferWithMemo(address to, uint256 amount, bytes32 memo)",
         "function burn(uint256 amount)",
+        "function burnAt(address from, uint256 amount)",
+        "function BURN_AT_ROLE() view returns (bytes32)",
         "function changeTransferPolicyId(uint64 newPolicyId)",
         "function transferPolicyId() view returns (uint64)",
         "function logoURI() view returns (string)",
