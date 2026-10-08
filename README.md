@@ -142,7 +142,7 @@ variant.
 | File | TIP(s) | Covers |
 |---|---|---|
 | `test_tip20.py` | TIP-20 | transfer, approve/transferFrom, batches, transferWithMemo |
-| `test_tip20_factory.py` | TIP-20 | factory: createToken, ISSUER_ROLE, mint, burn |
+| `test_tip20_factory.py` | TIP-20, TIP-1006 | factory: createToken, ISSUER_ROLE, mint, burn, `burnAt` (T12) |
 | `test_virtual_address.py` | TIP-1022, TIP-1035 | virtual addresses (T3+): deposit/mint/transferFrom forward to master |
 | `test_channel_reserve.py` | TIP-1034, TIP-1035 | payment-channel reserve (T5): lock, voucher settle, close/refund |
 
