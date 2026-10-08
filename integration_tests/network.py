@@ -27,6 +27,9 @@ FAUCET_AMOUNT = 1_000_000_000_000_000
 
 DEFAULT_HTTP_PORT = 8545
 
+# A follower's upstream that refuses: the discard port, so no block comes over websocket.
+DEAD_UPSTREAM = "ws://127.0.0.1:9"
+
 
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -117,6 +120,7 @@ def generate_dev_genesis(
     anchoring: bool = False,
     gas_token_admin: str | None = None,
     validator_address: str | None = None,
+    dkg: bool = False,
 ) -> Path:
     """The dev genesis: ``$TEMPO_GENESIS`` if set, else generated in ``output_dir`` via ``tempo-xtask``.
 
@@ -139,6 +143,8 @@ def generate_dev_genesis(
     validator pay fees in it, the coinbase and validator take it.
 
     ``validator_address`` is the validator's onchain address; unset, the mnemonic's second account.
+
+    ``dkg`` keeps the DKG outcome in the header, which a follower needs.
     """
     genesis = output_dir / "genesis.json"
     if fork_times:
@@ -154,7 +160,7 @@ def generate_dev_genesis(
         *(("--deployment-gas-token", "--deployment-gas-token-admin", gas_token_admin) if gas_token_admin else ()),
         *(("--validator-addresses", validator_address) if validator_address else ()),
     ]
-    if not options:
+    if not options and not dkg:
         # Only a default genesis may be supplied or reused: neither a prebuilt nor a leftover
         # file can be trusted to carry a particular schedule, chain id or epoch length.
         env_genesis = os.environ.get("TEMPO_GENESIS")
@@ -175,7 +181,7 @@ def generate_dev_genesis(
             "0",
             "--validators",
             "127.0.0.1:30303",
-            "--no-dkg-in-genesis",
+            *(() if dkg else ("--no-dkg-in-genesis",)),
             *options,
         ],
         capture_output=True,
@@ -318,10 +324,11 @@ class FollowerNode(TempoNode):
     """A ``--follow`` node: it makes no blocks, taking them from ``upstream`` over websocket and,
     with ``--consensus.devp2p.finalizations``, from ``trusted_peers`` over devp2p."""
 
-    def __init__(self, *, upstream: str, trusted_peers: list[str], **kwargs):
+    def __init__(self, *, upstream: str, trusted_peers: list[str] = (), discovery: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.upstream = upstream
-        self.trusted_peers = trusted_peers
+        self.trusted_peers = list(trusted_peers)
+        self.discovery = discovery
 
     def command(self) -> list[str]:
         return [
@@ -342,9 +349,8 @@ class FollowerNode(TempoNode):
             "eth,net,web3",
             "--port",
             str(self.p2p_port),
-            "--trusted-peers",
-            ",".join(self.trusted_peers),
-            "--disable-discovery",
+            *(("--trusted-peers", ",".join(self.trusted_peers)) if self.trusted_peers else ()),
+            *(("--discovery.port", str(self.p2p_port)) if self.discovery else ("--disable-discovery",)),
             "--authrpc.port",
             str(self.auth_port),
             "--ipcdisable",
