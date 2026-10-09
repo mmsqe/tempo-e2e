@@ -58,6 +58,12 @@ def pytest_addoption(parser):
         "since tempo only registers stub handlers)",
     )
     group.addoption(
+        "--eth-fork-url",
+        default=os.environ.get("ETH_FORK_URL"),
+        help="Fork this Ethereum RPC for the bridge suite's lockbox chain (also $ETH_FORK_URL), "
+        "so it locks the live NVNM. Unset deploys nvnm-erc20's token on a bare anvil.",
+    )
+    group.addoption(
         "--tidx",
         action="store_true",
         default=False,

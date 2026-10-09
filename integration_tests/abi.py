@@ -390,3 +390,63 @@ BRIDGED_NVNM = Contract.from_abi(
         "function bridgeBurn(address from, uint256 amount)",
     ]
 )
+
+# nvnm-erc20's NVNMToken, initialized through its ERC1967Proxy: the whole supply goes to `recipient`.
+NVNM_TOKEN = Contract.from_abi(
+    ["function initialize((address recipient, address defaultAdmin, address pauser, address upgrader) params)"]
+)
+
+# -- the bridge: the Ethereum escrow, and LayerZero's endpoint and our gateway at each end -----
+NVNM_LOCKBOX = Contract.from_abi(
+    [
+        "function lockedOf(address holder, address validator) view returns (uint256)",
+        "function totalLocked() view returns (uint256)",
+        "function bondOf(address validator) view returns (uint256)",
+        "function grantRole(bytes32 role, address account)",
+        "function RELEASER_ROLE() view returns (bytes32)",
+        "function GATEWAY_ROLE() view returns (bytes32)",
+    ]
+)
+
+_ULN = "(uint64 confirmations, uint8 requiredDVNCount, uint8 optionalDVNCount, uint8 optionalDVNThreshold, address[] requiredDVNs, address[] optionalDVNs)"
+_ORIGIN = "(uint32 srcEid, bytes32 sender, uint64 nonce)"
+_FEE = "(uint256 nativeFee, uint256 lzTokenFee)"
+LZ_ENDPOINT = Contract.from_abi(
+    [
+        "function registerLibrary(address lib)",
+        "function setDefaultSendLibrary(uint32 eid, address lib)",
+        "function setDefaultReceiveLibrary(uint32 eid, address lib, uint256 gracePeriod)",
+        f"function lzReceive({_ORIGIN} origin, address receiver, bytes32 guid, bytes message, bytes extraData) payable",
+    ]
+)
+LZ_SEND_ULN = Contract.from_abi(
+    [
+        f"function setDefaultUlnConfigs((uint32 eid, {_ULN} config)[] params)",
+        "function setDefaultExecutorConfigs((uint32 eid, (uint32 maxMessageSize, address executor) config)[] params)",
+    ]
+)
+LZ_RECEIVE_ULN = Contract.from_abi(
+    [
+        f"function setDefaultUlnConfigs((uint32 eid, {_ULN} config)[] params)",
+        "function verify(bytes packetHeader, bytes32 payloadHash, uint64 confirmations)",
+        "function commitVerification(bytes packetHeader, bytes32 payloadHash)",
+    ]
+)
+# The owner's enforced options are the ones every message goes with; callers pass none.
+_ENFORCED = "function setEnforcedOptions((uint32 eid, uint16 msgType, bytes options)[] params)"
+LZ_LOCK_GATEWAY = Contract.from_abi(
+    [
+        "function setPeer(uint32 eid, bytes32 peer)",
+        _ENFORCED,
+        "function lock(address validator, uint256 amount) payable",
+        "function bond(uint256 amount) payable",
+        f"function quote() view returns ({_FEE})",
+    ]
+)
+LZ_MINT_GATEWAY = Contract.from_abi(
+    [
+        "function setPeer(uint32 eid, bytes32 peer)",
+        _ENFORCED,
+        "function withdraw(uint256 amount, address holder, address validator)",
+    ]
+)
