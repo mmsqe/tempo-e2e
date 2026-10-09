@@ -191,6 +191,7 @@ variant.
 |---|---|---|
 | `test_staking.py` | — | staking, election, unbonding, slashing, fee routers, their lockbox and the buyback swapper |
 | `test_epoch_feed.py` | — | the node seats the committee the staking contract elects; block fees reach the routers (`consensus`) |
+| `test_weighted_proposers.py` | — | from T12 proposers are drawn by stake (`consensus`) |
 
 ### Consensus & networking (`consensus` marker)
 

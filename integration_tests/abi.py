@@ -300,6 +300,8 @@ STAKING = Contract.from_abi(
         "function candidates() view returns (address[])",
         # `eligible` is the node's registry: nobody else is elected.
         "function computeCommittee(address[] eligible) view returns (address[] vals)",
+        # From T12 the node draws each epoch's proposers by this score, elected or not.
+        "function electionWeight(address[] who) view returns (uint256[] weights)",
         "function setMinSeats(uint256 minSeats)",
         # candidacy: a bond bridged in from Ethereum stands its validator once it reaches the bar.
         "function setCandidacyBond(uint256 bond)",
