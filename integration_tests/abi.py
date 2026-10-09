@@ -44,6 +44,8 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
+        "function distributeFees(address validator, address token)",  # permissionless payout to the fee recipient
+        "function collectedFees(address validator, address token) view returns (uint256)",
     ]
 )
 
@@ -53,6 +55,7 @@ TIP20_FACTORY = Contract.from_abi(
         "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt) returns (address)",
         "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt, string logoURI) returns (address)",
         "function isTIP20(address token) view returns (bool)",
+        "function getTokenAddress(address sender, bytes32 salt) pure returns (address)",
     ]
 )
 TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
@@ -161,6 +164,8 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         "function rotateValidator(uint64 idx, bytes32 publicKey, string ingress, string egress, bytes signature)",
         f"function validatorByAddress(address validatorAddress) view returns ({_VALIDATOR_TUPLE})",
         f"function validatorByPublicKey(bytes32 publicKey) view returns ({_VALIDATOR_TUPLE})",
+        # The block beneficiary, so a validator's fees accrue in FeeManager under it.
+        "function setFeeRecipient(uint64 idx, address feeRecipient)",
         "function transferOwnership(address newOwner)",
     ]
 )
@@ -272,4 +277,112 @@ ANCHORING = Contract.from_abi(
         "event RevokeRole(address indexed caller, uint64 registryId, string checksum, address account, string role)",
     ],
     to=ANCHORING_ADDRESS,
+)
+
+# NVNMStaking: NVNM staked toward validators, sharing their fees pro-rata.
+STAKING = Contract.from_abi(
+    [
+        "function stake(address validator, uint256 amount)",
+        "function unstake(address validator, uint256 amount)",
+        "function depositReward(address validator, uint256 amount)",
+        "function compoundReward(address validator, uint256 amount)",
+        "function claim(address validator) returns (uint256 amount)",
+        "function earned(address validator, address user) view returns (uint256)",
+        # a deposit vests over `rewardDuration`; `rewardStream` is its rate and end
+        "function setRewardDuration(uint256 duration)",
+        "function rewardStream(address validator) view returns (uint256 rate, uint256 finish)",
+        "function stakedOf(address validator, address user) view returns (uint256)",
+        "function stakeToken() view returns (address)",
+        "function rewardToken() view returns (address)",
+        # election: top `maxSeats` by acquired*acquiredWeight + delegated; under `minSeats` elects nobody.
+        "function setCandidate(address validator, bool active)",
+        "function setCommitteeConfig(uint256 maxSeats, uint256 acquiredWeight, uint256 maxDelegated)",
+        "function candidates() view returns (address[])",
+        # `eligible` is the node's registry: nobody else is elected.
+        "function computeCommittee(address[] eligible) view returns (address[] vals)",
+        "function setMinSeats(uint256 minSeats)",
+        # candidacy: a bond bridged in from Ethereum stands its validator once it reaches the bar.
+        "function setCandidacyBond(uint256 bond)",
+        "function setBondGateway(address gateway)",
+        "function registerCandidate()",
+        "function resignCandidate()",
+        "function bondOf(address validator) view returns (uint256)",
+        # slashing: the slasher, not the timelocked owner, seizes the candidacy bond, even one
+        # unbonding, here and on Ethereum; never delegated stake.
+        "function slash(address validator, uint256 bps) returns (uint256 seized)",
+        "function setSlasher(address slasher)",
+        # unbonding: exiting stake and a resigned bond each wait out the period, then withdraw.
+        # Never 0 once the election is configured or a bond is posted.
+        "function setUnbondingPeriod(uint256 period)",
+        "function withdraw(address validator) returns (uint256 amount)",
+        "function pendingUnstakeOf(address validator, address user) view returns (uint256 amount, uint256 releaseAt)",
+        "function withdrawBond() returns (uint256 amount)",
+        "function pendingBondOf(address validator) view returns (uint256 amount, uint256 releaseAt)",
+    ]
+)
+
+# Its one-shot deployer (nvnmchain-contracts StakingDeployer.sol): the staking proxy over given tokens.
+STAKING_DEPLOYER = Contract.from_abi(["function staking() view returns (address)"])
+
+# FeeRouter: protocol cuts (devshare/buybacks) then validator remainder → commission + delegators.
+FEE_ROUTER = Contract.from_abi(
+    [
+        # `flush()` routes the token FeeManager pays in; `flush(token)` anything else sent here.
+        "function flush() returns (uint256 deposited)",
+        "function flush(address token) returns (uint256 deposited)",
+        # Read live off the staking proxy, so it follows a reward-token migration.
+        "function rewardToken() view returns (address)",
+        # The delegators' share of a token the pool cannot account in, never flushed twice.
+        "function heldForDelegators(address token) view returns (uint256)",
+        # The buyback cut no swap has taken yet, retried by every flush, never paid as stablecoin.
+        "function heldForBuyback(address token) view returns (uint256)",
+    ]
+)
+FEE_ROUTER_FACTORY = Contract.from_abi(
+    [
+        "function create(address validator, address operator, uint256 commissionBps) returns (address router)",
+        "function setSwapper(address swapper, uint256 swapGas)",
+        # Devshare's recipient is fixed at deploy, buybacks' is the sink; the ratios are the lockbox's.
+        "function cuts() view returns (address dev, address buy, uint256 devBps, uint256 buyBps, address swapper, uint256 swapGas)",
+        "function BUYBACK_SINK() view returns (address)",
+        "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps)",
+    ]
+)
+
+# FeeLockbox: holds the validator share until distribution commences, and the fee split the
+# registry's active validators vote on.
+FEE_LOCKBOX = Contract.from_abi(
+    [
+        "function owed(address token, address operator) view returns (uint256)",
+        "function claim(address token, address operator) returns (uint256 amount)",
+        "function setAffiliated(address validator, bool affiliated)",
+        "function vote(bool support)",
+        "function commence()",
+        "function proposeSplit(uint256 devBps, uint256 buyBps) returns (uint256 id)",
+        "function voteSplit(uint256 id, bool support)",
+        "function applySplit(uint256 id)",
+        "function split() view returns (uint256 devBps, uint256 buyBps)",
+    ]
+)
+
+# GuardedSwapper: the buyback-market wrapper the factory's `swapper` points at.
+GUARDED_SWAPPER = Contract.from_abi(
+    [
+        "function setGuards(address inner, uint256 maxAmountIn, uint256 maxDeviationBps, uint256 emaAlphaBps)",
+        # A second floor, `maxDriftBps` under the seeded `refPrice`, so the EMA cannot be walked down.
+        "function setDriftBand(uint256 maxDriftBps)",
+        # This factory's routers only, whose output goes to the buyback sink.
+        "function setRouterFactory(address routerFactory)",
+        "function seedPrice(uint256 price)",
+        "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) returns (uint256 out)",
+    ]
+)
+
+# BridgedNVNM: BRIDGE=1 role holders mint/burn; owner curates the role (setRole from EnumerableRoles).
+BRIDGED_NVNM = Contract.from_abi(
+    [
+        "function setRole(address holder, uint256 role, bool active)",
+        "function bridgeMint(address to, uint256 amount)",
+        "function bridgeBurn(address from, uint256 amount)",
+    ]
 )

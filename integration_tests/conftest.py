@@ -16,14 +16,13 @@ from tempo.devnet.cluster import ClusterCLI
 from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
-from web3.middleware import ExtraDataToPOAMiddleware
 
 from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
 from .drivers import get_driver
 from .drivers.base import CAP_CONSENSUS_NET, CAP_INDEXER, CAP_TEMPO_NATIVE
 from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin
-from .utils import new_account
+from .utils import connect, new_account
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -96,9 +95,7 @@ def tempo(request, driver, tmp_path_factory):
 
 @pytest.fixture
 async def w3(tempo):
-    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(tempo.rpc_url))
-    # A consensus node's headers carry DKG payloads in extraData, past web3.py's 32-byte cap.
-    client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    client = connect(tempo.rpc_url)
     yield client
     await client.provider.disconnect()
 
@@ -318,6 +315,32 @@ def _consensus_net_supervisord(request, base, data_dir):
         _shutdown(cluster, proc)
         if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
+
+
+LOCALNET_CHAIN_ID = 1337
+
+
+def localnet(request, tmp_path_factory, name: str, validators: int, *, epoch_length: int, genesis: dict):
+    """A supervisord localnet whose genesis config carries ``genesis``. Needs ``--consensus``."""
+    if not request.config.getoption("--consensus"):
+        pytest.skip(f"{name} needs --consensus")
+    if request.config.getoption("--tempo-bin"):
+        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
+    base = tmp_path_factory.mktemp(name)
+    config = {
+        "chain_id": LOCALNET_CHAIN_ID,
+        "accounts": 20,
+        "epoch_length": epoch_length,
+        "seed": 0,
+        "tempo_bin": resolve_tempo_bin(),
+        "tempo_xtask_bin": resolve_xtask_bin(),
+        "validators": [
+            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"}
+            for i, port in enumerate(find_free_base_ports(validators))
+        ],
+        "patch_genesis": {"config": genesis},
+    }
+    yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
 
 
 def _docker_image_exists(image: str) -> bool:

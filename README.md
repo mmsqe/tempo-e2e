@@ -185,6 +185,13 @@ variant.
 | `test_anchoring_service.py` | — | nvnmchain-anchoring translating the node's search onto the module's REST route: its JSON, its mode names and `/health` |
 | `test_anchoring_name_index.py` | — | the node's own name index (`--anchoring.name-index`): the seeded corpus, which emitted no logs, and a live registry |
 
+### Staking & bridge
+
+| File | TIP(s) | Covers |
+|---|---|---|
+| `test_staking.py` | — | staking, election, unbonding, slashing, fee routers, their lockbox and the buyback swapper |
+| `test_epoch_feed.py` | — | the node seats the committee the staking contract elects; block fees reach the routers (`consensus`) |
+
 ### Consensus & networking (`consensus` marker)
 
 | File | TIP(s) | Covers |
