@@ -166,6 +166,7 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         f"function validatorByPublicKey(bytes32 publicKey) view returns ({_VALIDATOR_TUPLE})",
         # The block beneficiary, so a validator's fees accrue in FeeManager under it.
         "function setFeeRecipient(uint64 idx, address feeRecipient)",
+        "function transferValidatorOwnership(uint64 idx, address newAddress)",
         "function transferOwnership(address newOwner)",
     ]
 )
