@@ -321,6 +321,10 @@ STAKING = Contract.from_abi(
         # slashing: the slasher, not the timelocked owner, seizes the candidacy bond, even one
         # unbonding, here and on Ethereum; never delegated stake.
         "function slash(address validator, uint256 bps) returns (uint256 seized)",
+        "function slashEquivocation(bytes evidence) returns (uint256 seized)",
+        "function setEquivocation(uint256 bps, uint256 evidenceEpochs)",
+        "function equivocationBps() view returns (uint256)",
+        "function upgradeToAndCall(address newImplementation, bytes data) payable",
         "function setSlasher(address slasher)",
         # unbonding: exiting stake and a resigned bond each wait out the period, then withdraw.
         # Never 0 once the election is configured or a bond is posted.

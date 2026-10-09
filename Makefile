@@ -31,6 +31,7 @@ contract-artifacts:
 	cd bridge/layerzero && npm ci --silent && forge build
 	cd erc20 && forge build
 	$(call _artifact,contracts,StakingDeployer,StakingDeployer,staking.json)
+	$(call _artifact,contracts,NVNMStaking,NVNMStaking,staking_implementation.json)
 	$(call _artifact,contracts,FeeRouter,FeeRouterFactory,feerouter_factory.json)
 	$(call _artifact,contracts,FeeRouter,FeeRouter,feerouter.json)
 	$(call _artifact,contracts,FeeLockbox,FeeLockbox,fee_lockbox.json)
