@@ -158,6 +158,7 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         "function addValidator(address validatorAddress, bytes32 publicKey, string ingress, string egress,"
         " address feeRecipient, bytes signature) returns (uint64)",
         "function deactivateValidator(uint64 idx)",
+        "function rotateValidator(uint64 idx, bytes32 publicKey, string ingress, string egress, bytes signature)",
         f"function validatorByAddress(address validatorAddress) view returns ({_VALIDATOR_TUPLE})",
         f"function validatorByPublicKey(bytes32 publicKey) view returns ({_VALIDATOR_TUPLE})",
         "function transferOwnership(address newOwner)",

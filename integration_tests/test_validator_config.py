@@ -31,6 +31,7 @@ from .utils import call_revert, new_account, send_call, send_type_2
 pytestmark = pytest.mark.tempo
 
 NS_ADD = b"TEMPO_VALIDATOR_CONFIG_V2_ADD_VALIDATOR"
+NS_ROTATE = b"TEMPO_VALIDATOR_CONFIG_V2_ROTATE_VALIDATOR"
 
 
 def enrolment(
@@ -40,8 +41,10 @@ def enrolment(
     egress: str | None = None,
     fee: str | None = None,
     key: ECC.EccKey | None = None,
+    namespace: bytes = NS_ADD,
 ):
-    """An Ed25519 key and the signature `addValidator` demands over its own terms.
+    """An Ed25519 key and the signature `addValidator` demands over its own terms, or
+    `rotateValidator` under `NS_ROTATE`, whose terms leave the fee recipient out.
 
     The digest binds the chain, this contract, the address, both endpoints and the fee recipient,
     so an enrolment cannot be lifted to another chain or another address. The namespace is
@@ -63,9 +66,9 @@ def enrolment(
         + ingress.encode()
         + bytes([len(egress)])
         + egress.encode()
-        + bytes.fromhex(fee[2:])
+        + (bytes.fromhex(fee[2:]) if namespace == NS_ADD else b"")
     )
-    signature = eddsa.new(key, "rfc8032").sign(bytes([len(NS_ADD)]) + NS_ADD + digest)
+    signature = eddsa.new(key, "rfc8032").sign(bytes([len(namespace)]) + namespace + digest)
     return key.public_key().export_key(format="raw"), signature, egress, fee
 
 
@@ -125,6 +128,23 @@ class TestJoining:
         assert joiner.address not in [
             to_checksum_address(v[1]) for v in await V2.fns.getActiveValidators().call(w3, to=V2_ADDR)
         ]
+
+    async def test_a_rotated_key_still_leads_to_its_validator(self, w3, chain_id, owner, funded_account):
+        """A validator replaces its own key, and the old one stays on record under its address."""
+        validator = funded_account.address
+        # The second endpoint stays held, so each run takes a pair of its own.
+        subnet = 1 + await V2.fns.validatorCount().call(w3, to=V2_ADDR) % 250
+        first, second = (f"10.9.{subnet}.{host}:26656" for host in (1, 2))
+        old, _ = await join(w3, chain_id, owner, validator, first)
+        index = (await V2.fns.validatorByAddress(validator).call(w3, to=V2_ADDR))[5]
+
+        new, signature, egress, _ = enrolment(chain_id, validator, second, namespace=NS_ROTATE)
+        rotate = V2.fns.rotateValidator(index, new, second, egress, signature)
+        await send_call(w3, chain_id, funded_account, V2_ADDR, rotate.data)
+
+        was, now = [await V2.fns.validatorByPublicKey(key).call(w3, to=V2_ADDR) for key in (old, new)]
+        assert to_checksum_address(was[1]) == to_checksum_address(now[1]) == validator
+        assert was[7] != 0 and now[7] == 0, "the old key is kept deactivated, the new one is live"
 
 
 class TestRefusals:
