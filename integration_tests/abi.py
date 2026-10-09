@@ -347,6 +347,8 @@ FEE_ROUTER_FACTORY = Contract.from_abi(
         # Devshare's recipient is fixed at deploy, buybacks' is the sink; the ratios are the lockbox's.
         "function cuts() view returns (address dev, address buy, uint256 devBps, uint256 buyBps, address swapper, uint256 swapGas)",
         "function BUYBACK_SINK() view returns (address)",
+        # Each validator's latest router, the only fee recipient the node's registry takes for it.
+        "function routerOf(address validator) view returns (address router)",
         "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps)",
     ]
 )
