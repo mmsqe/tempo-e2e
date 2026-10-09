@@ -171,6 +171,14 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
     ]
 )
 
+# Served at the registry's own address once consensus votes carry their signer's signature.
+EQUIVOCATION = Contract.from_abi(
+    [
+        "function equivocator(bytes evidence) view"
+        " returns (address validator, uint64 epoch, uint64 viewNumber, uint64 epochsAgo)",
+    ]
+)
+
 # Current committee precompile (ICurrentCommittee, TIP-1070, T8+): the committee picked by
 # the epoch-boundary DKG outcome, written by a system call.
 CURRENT_COMMITTEE_ADDRESS = to_checksum_address("0xC077E00000000000000000000000000000000000")

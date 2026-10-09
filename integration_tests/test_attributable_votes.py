@@ -1,19 +1,25 @@
 """Validators whose votes carry their signer's own signature keep finalizing, serve those votes
 and hold no evidence against one another. From then on only the registry owner moves a
 validator's entry, which is how evidence reaches its bond; a validator still rotates its own key.
+The registry reads evidence of two conflicting votes and names the validator that signed them.
 
 Needs ``--consensus`` and a tempo built from ``staking``."""
 
 import json
 import subprocess
+import sys
 
 import pytest
-from tempo.constants import VALIDATOR_CONFIG_V2_ADDRESS
+from Crypto.PublicKey import ECC
+from eth_account import Account
+from eth_utils import to_checksum_address
+from tempo.constants import FEE_MANAGER_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS
 
-from .abi import VALIDATOR_CONFIG_V2
+from .abi import EQUIVOCATION, FEE, VALIDATOR_CONFIG_V2
 from .conftest import localnet
-from .network import resolve_tempo_bin
-from .test_validator_config import NS_ROTATE, enrolment
+from .evidence import double_notarize
+from .network import FAUCET_PRIVATE_KEY, free_port, resolve_tempo_bin
+from .test_validator_config import NS_ROTATE, enrolment, join
 from .utils import call_revert, connect, cs, new_account, wait_for_block
 
 pytestmark = pytest.mark.tempo
@@ -93,5 +99,45 @@ async def test_a_validator_still_rotates_its_own_key(signed_net):
             "eth_call", [{"from": validator, "to": registry, "data": rotate}, "latest"]
         )
         assert "error" not in by_validator, by_validator
+    finally:
+        await w3.provider.disconnect()
+
+
+@pytest.mark.consensus
+@pytest.mark.slow
+async def test_the_registry_names_the_validator_evidence_convicts(signed_net, tmp_path):
+    """Last in the file: it enrols a validator that never comes online."""
+    registry, owner = VALIDATOR_CONFIG_V2_ADDRESS, Account.from_key(FAUCET_PRIVATE_KEY)
+    url = signed_net.node_rpc_url("node0")
+    w3 = connect(url)
+    try:
+        chain_id, genesis = await w3.eth.chain_id, bytes((await w3.eth.get_block(0))["hash"])
+        token = to_checksum_address(await FEE.fns.userTokens(owner.address).call(w3, to=FEE_MANAGER_ADDRESS))
+        newcomer, key = new_account(), ECC.generate(curve="ed25519")
+        await join(w3, chain_id, owner, newcomer.address, f"127.0.0.1:{free_port()}", key=key, fee_token=token)
+        epoch = await w3.eth.block_number // EPOCH_LENGTH
+
+        def evidence(chain_id, genesis, first, second):
+            return EQUIVOCATION.fns.equivocator(double_notarize(key, chain_id, genesis, epoch, (first, second)))
+
+        # Two proposals notarized in one round, signed for this chain.
+        validator, at_epoch, view, _ = await evidence(chain_id, genesis, 1, 2).call(w3, to=registry)
+        assert (cs(validator), at_epoch, view) == (newcomer.address, epoch, 3)
+
+        # The command line makes the same evidence from the node's key file.
+        signing_key = tmp_path / "signing.key"
+        signing_key.write_text("0x" + key.seed.hex())
+        command = [sys.executable, "-m", "integration_tests.evidence", "--key", str(signing_key)]
+        command += ["--epoch", str(epoch), "--rpc-url", url]
+        printed = subprocess.run(command, capture_output=True, text=True, check=True).stdout.strip()
+        assert printed == "0x" + double_notarize(key, chain_id, genesis, epoch).hex()
+
+        # The same votes signed for another chain, or the same vote twice, convict nobody.
+        for nothing in [
+            evidence(chain_id + 1, genesis, 1, 2),
+            evidence(chain_id, bytes(32), 1, 2),
+            evidence(chain_id, genesis, 1, 1),
+        ]:
+            assert "InvalidSignature" in await call_revert(w3, registry, nothing.data)
     finally:
         await w3.provider.disconnect()
