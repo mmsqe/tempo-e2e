@@ -16,14 +16,14 @@ from tempo.devnet.cluster import ClusterCLI
 from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
 from web3 import AsyncWeb3, Web3
-from web3.middleware import ExtraDataToPOAMiddleware
 
+from . import anvil as anvil_mod
 from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
 from .drivers import get_driver
 from .drivers.base import CAP_CONSENSUS_NET, CAP_INDEXER, CAP_TEMPO_NATIVE
 from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin
-from .utils import new_account
+from .utils import connect, new_account
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -96,9 +96,7 @@ def tempo(request, driver, tmp_path_factory):
 
 @pytest.fixture
 async def w3(tempo):
-    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(tempo.rpc_url))
-    # A consensus node's headers carry DKG payloads in extraData, past web3.py's 32-byte cap.
-    client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    client = connect(tempo.rpc_url)
     yield client
     await client.provider.disconnect()
 
@@ -146,6 +144,38 @@ def tidx(request, driver, tempo, tmp_path_factory):
         stack.down()
         if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def ethereum(request, tmp_path_factory):
+    """An anvil standing in for Ethereum beside the node, skipped where there is no anvil."""
+    base = tmp_path_factory.mktemp("anvil")
+    fork_url = request.config.getoption("--eth-fork-url")
+    try:
+        node = anvil_mod.AnvilNode(log_path=base / "anvil.log", fork_url=fork_url)
+    except RuntimeError as e:
+        pytest.skip(str(e))
+    try:
+        try:
+            node.start().wait_for_rpc()
+        except (RuntimeError, TimeoutError) as e:
+            # A fork's endpoint is someone else's, and its rate limit not this suite's failure.
+            if not fork_url:
+                raise
+            pytest.skip(f"fork endpoint {fork_url} did not come up: {e}")
+        yield node
+    finally:
+        node.stop()
+        if request.config.getoption("--clean-data"):
+            shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture
+async def eth(ethereum):
+    """A client for the Ethereum side, as ``w3`` is for the tempo node."""
+    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(ethereum.rpc_url))
+    yield client
+    await client.provider.disconnect()
 
 
 @pytest.fixture
@@ -318,6 +348,32 @@ def _consensus_net_supervisord(request, base, data_dir):
         _shutdown(cluster, proc)
         if request.config.getoption("--clean-data"):
             shutil.rmtree(base, ignore_errors=True)
+
+
+LOCALNET_CHAIN_ID = 1337
+
+
+def localnet(request, tmp_path_factory, name: str, validators: int, *, epoch_length: int, genesis: dict):
+    """A supervisord localnet whose genesis config carries ``genesis``. Needs ``--consensus``."""
+    if not request.config.getoption("--consensus"):
+        pytest.skip(f"{name} needs --consensus")
+    if request.config.getoption("--tempo-bin"):
+        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
+    base = tmp_path_factory.mktemp(name)
+    config = {
+        "chain_id": LOCALNET_CHAIN_ID,
+        "accounts": 20,
+        "epoch_length": epoch_length,
+        "seed": 0,
+        "tempo_bin": resolve_tempo_bin(),
+        "tempo_xtask_bin": resolve_xtask_bin(),
+        "validators": [
+            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"}
+            for i, port in enumerate(find_free_base_ports(validators))
+        ],
+        "patch_genesis": {"config": genesis},
+    }
+    yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
 
 
 def _docker_image_exists(image: str) -> bool:
