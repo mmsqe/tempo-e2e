@@ -134,7 +134,7 @@ def _wait_past(w3: Web3, activation: int, timeout: float = 120.0) -> None:
 def head_chain(tmp_path_factory):
     """A chain launched with every fork active at genesis — the state a boundary must reproduce.
 
-    Scheduled outright: xtask leaves T12 off unless asked.
+    Scheduled outright: xtask leaves the latest forks off unless asked.
     """
     node = dev_node(tmp_path_factory.mktemp("head"), log_name="head.log", fork_times=dict.fromkeys(xtask_forks(), 0))
     alloc = _read_alloc(node.genesis)

@@ -56,7 +56,8 @@ def _follower(cluster, base, *, gossip: bool) -> FollowerNode:
         log_path=base / "follower.log",
         genesis=cluster.data_dir / "genesis.json",
         http_port=free_port(),
-        extra_args=[GOSSIP] if gossip else [],
+        # Spelled out: off by default before v1.16, on from it.
+        extra_args=[f"{GOSSIP}={str(gossip).lower()}"],
     )
 
 
