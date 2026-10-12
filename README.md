@@ -19,6 +19,9 @@ make lint                  # ruff
 itself. `--eth-fork-url <rpc>` forks a live chain instead; use an endpoint you own, as a public one
 gets rate-limited.
 
+`python -m integration_tests.stack` stands the stack up by hand on a running dev node and anvil;
+`--staking <address>` builds only the bridge, around a staking already there.
+
 ## Consensus localnet
 
 `make test-consensus` (or `pytest -m consensus --consensus`) launches four
