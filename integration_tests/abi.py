@@ -166,7 +166,19 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         f"function validatorByPublicKey(bytes32 publicKey) view returns ({_VALIDATOR_TUPLE})",
         # The block beneficiary, so a validator's fees accrue in FeeManager under it.
         "function setFeeRecipient(uint64 idx, address feeRecipient)",
+        "function transferValidatorOwnership(uint64 idx, address newAddress)",
         "function transferOwnership(address newOwner)",
+    ]
+)
+
+# Served at the registry's own address: the vote keys from T12 where the genesis schedules
+# attributable votes, the evidence check once votes carry their signer's signature.
+EQUIVOCATION = Contract.from_abi(
+    [
+        "function setVoteKey(uint64 idx, bytes key, bytes proof)",
+        "function voteKey(bytes32 publicKey) view returns (bytes key)",
+        "function equivocator(bytes evidence) view"
+        " returns (address validator, uint64 epoch, uint64 viewNumber, uint64 epochsAgo)",
     ]
 )
 

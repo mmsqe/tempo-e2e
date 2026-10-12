@@ -353,8 +353,9 @@ def _consensus_net_supervisord(request, base, data_dir):
 LOCALNET_CHAIN_ID = 1337
 
 
-def localnet(request, tmp_path_factory, name: str, validators: int, *, epoch_length: int, genesis: dict):
-    """A supervisord localnet whose genesis config carries ``genesis``. Needs ``--consensus``."""
+def localnet(request, tmp_path_factory, name: str, validators: int, *, epoch_length: int, genesis: dict, flags=()):
+    """A supervisord localnet whose genesis config carries ``genesis``, made with the genesis tool's
+    extra ``flags``. Needs ``--consensus``."""
     if not request.config.getoption("--consensus"):
         pytest.skip(f"{name} needs --consensus")
     if request.config.getoption("--tempo-bin"):
@@ -372,6 +373,7 @@ def localnet(request, tmp_path_factory, name: str, validators: int, *, epoch_len
             for i, port in enumerate(find_free_base_ports(validators))
         ],
         "patch_genesis": {"config": genesis},
+        "patch_genesis_flags": list(flags),
     }
     yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
 
