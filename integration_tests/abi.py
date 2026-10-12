@@ -317,6 +317,7 @@ STAKING = Contract.from_abi(
         "function setMinSeats(uint256 minSeats)",
         # candidacy: a bond bridged in from Ethereum stands its validator once it reaches the bar.
         "function setCandidacyBond(uint256 bond)",
+        "function setMinAcquired(uint256 minAcquired)",
         "function setBondGateway(address gateway)",
         "function registerCandidate()",
         "function resignCandidate()",
