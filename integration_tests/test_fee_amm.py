@@ -184,7 +184,7 @@ class TestDeploymentGasToken:
         assert (await pool.call(w3, to=FEE_MANAGER_ADDRESS))[0] > reserve, "the nUSD fee went through the pool"
 
 
-def _dev_account(index: int):
+def dev_account(index: int):
     """An account of the dev mnemonic, which funds the localnet's genesis and names its validators."""
     Account.enable_unaudited_hdwallet_features()
     return Account.from_mnemonic(
@@ -210,7 +210,7 @@ class TestDeploymentGasTokenOnValidators:
             "chain_id": 1337,
             "accounts": 20,
             "seed": 0,
-            "patch_genesis_flags": ["--deployment-gas-token", "--deployment-gas-token-admin", _dev_account(0).address],
+            "patch_genesis_flags": ["--deployment-gas-token", "--deployment-gas-token-admin", dev_account(0).address],
             "tempo_bin": resolve_tempo_bin(),
             "tempo_xtask_bin": resolve_xtask_bin(),
             "validators": [{"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(ports)],
@@ -223,8 +223,8 @@ class TestDeploymentGasTokenOnValidators:
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         cs = Web3.to_checksum_address
         chain_id = await w3.eth.chain_id
-        admin, payer = _dev_account(0), _dev_account(10)
-        validators = [_dev_account(i) for i in range(1, self.VALIDATORS + 1)]
+        admin, payer = dev_account(0), dev_account(10)
+        validators = [dev_account(i) for i in range(1, self.VALIDATORS + 1)]
         transfer = ERC20.fns.transfer(new_account().address, 1).data
 
         token = cs(await FEE.fns.userTokens(payer.address).call(w3, to=FEE_MANAGER_ADDRESS))

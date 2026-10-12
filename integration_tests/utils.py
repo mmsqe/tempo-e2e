@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import shutil
@@ -30,6 +31,7 @@ from tempo.keychain import KeychainSignature
 from tempo.transaction import get_sign_payload
 from tempo.types import as_address
 from web3 import AsyncWeb3, Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 from .abi import FEE, NONCE, TIP20, TIP20_FACTORY, TIP20_ROLES, TIP403
 from .network import FAUCET_PRIVATE_KEY
@@ -37,6 +39,7 @@ from .network import FAUCET_PRIVATE_KEY
 # Every tempo tx the suite sends, at `--log-cli-level=INFO`: on a shared network the hash is
 # what ties a failure to a block an explorer can show.
 log = logging.getLogger(__name__)
+cs = Web3.to_checksum_address
 
 # The four enshrined TIP-20 stablecoins, by symbol.
 STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_USD, "THETA_USD": THETA_USD}
@@ -236,6 +239,14 @@ async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None
     return f"{err.get('message', '')} {err.get('data', '') or ''}".strip()
 
 
+async def rejects(w3, to, fn, error: str, *, sender: str):
+    """``fn`` from ``sender`` reverts with ``error`` itself, not merely some revert: a guard that
+    fires first would otherwise pass for the one under test."""
+    out = await call_revert(w3, to, fn.data, sender=sender)
+    selector = keccak(text=f"{error}()")[:4].hex()
+    assert selector in out.lower(), f"expected {error} (0x{selector}), got {out}"
+
+
 async def send_calls(
     w3: AsyncWeb3,
     *,
@@ -330,6 +341,12 @@ async def latest_timestamp(w3: AsyncWeb3) -> int:
     return (await w3.eth.get_block("latest"))["timestamp"]
 
 
+async def wait_for_timestamp(w3: AsyncWeb3, timestamp: int, *, poll: float = 0.2) -> None:
+    """Wait until the latest block is at least ``timestamp``: contracts see chain time, not ours."""
+    while await latest_timestamp(w3) < timestamp:
+        await asyncio.sleep(poll)
+
+
 async def active_forks(w3: AsyncWeb3) -> set[str]:
     """The hardforks the node reports as active, named as ``tempo_forkSchedule`` names them,
     so a test can state what each fork brings instead of pinning one binary."""
@@ -375,6 +392,7 @@ async def create_token(
     admin,
     quote: str = PATH_USD,
     name: str = "TUSD",
+    currency: str = "USD",
     mint=None,
     salt: bytes = bytes(32),
 ):
@@ -393,7 +411,7 @@ async def create_token(
         calls=[
             {
                 "to": TIP20_FACTORY_ADDRESS,
-                "data": TIP20_FACTORY.fns.createToken(name, name, "USD", quote, admin.address, salt).data,
+                "data": TIP20_FACTORY.fns.createToken(name, name, currency, quote, admin.address, salt).data,
             }
         ],
     )
@@ -557,6 +575,14 @@ async def fund_via_transfer(w3: AsyncWeb3, funder_key: str, address: str, amount
 # ── Devnet clusters and RPC transports ─────────────────────────────────────
 
 
+def connect(rpc_url: str) -> AsyncWeb3:
+    """A client that reads a consensus node's headers, whose extraData carries DKG payloads past
+    web3.py's 32-byte cap."""
+    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
+    client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    return client
+
+
 @asynccontextmanager
 async def rpc(node):
     """An RPC client for `node`, disconnected on the way out."""
@@ -609,3 +635,18 @@ def cluster_fixture(name: str, validators: int, *, env: dict[str, str] | None = 
                 shutil.rmtree(base, ignore_errors=True)
 
     return _cluster
+
+
+async def until(what: str, probe, *, want=None, timeout: float = 180.0):
+    """Poll ``probe`` until it equals ``want``, or is truthy without one: the services act on their
+    own schedule, so watch the chain."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = probe()
+        if inspect.isawaitable(last):
+            last = await last
+        if last == want if want is not None else last:
+            return last
+        await asyncio.sleep(1)
+    raise AssertionError(f"timed out after {timeout}s waiting for {what} (last saw {last!r})")

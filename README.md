@@ -13,6 +13,15 @@ make test-consensus-docker # same, but validators run in Docker containers
 make lint                  # ruff
 ```
 
+## The bridge suites
+
+`test_bridge.py` runs an anvil beside the node as Ethereum and relays LayerZero between them
+itself. `--eth-fork-url <rpc>` forks a live chain instead; use an endpoint you own, as a public one
+gets rate-limited.
+
+`python -m integration_tests.stack` stands the stack up by hand on a running dev node and anvil;
+`--staking <address>` builds only the bridge, around a staking already there.
+
 ## Consensus localnet
 
 `make test-consensus` (or `pytest -m consensus --consensus`) launches four
@@ -184,6 +193,16 @@ variant.
 | `test_anchoring.py` | — | anchoring contract at `0x…0a00`: the precompile's ABI, a seed corpus loaded at block 0, writes on top, EOA gate per sender type |
 | `test_anchoring_service.py` | — | nvnmchain-anchoring translating the node's search onto the module's REST route: its JSON, its mode names and `/health` |
 | `test_anchoring_name_index.py` | — | the node's own name index (`--anchoring.name-index`): the seeded corpus, which emitted no logs, and a live registry |
+
+### Staking & bridge
+
+| File | TIP(s) | Covers |
+|---|---|---|
+| `test_staking.py` | — | staking, election, unbonding, slashing, fee routers, their lockbox and the buyback swapper |
+| `test_epoch_feed.py` | — | the node seats the committee the staking contract elects; block fees reach the routers (`consensus`) |
+| `test_weighted_proposers.py` | — | from T12 proposers are drawn by stake (`consensus`) |
+| `test_fee_recipient.py` | — | from T12 a validator's fee recipient is its own router (`consensus`) |
+| `test_bridge.py` | — | NVNM over LayerZero between anvil and the node: locks, bonds, slashes and the way home |
 
 ### Consensus & networking (`consensus` marker)
 

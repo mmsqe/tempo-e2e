@@ -469,14 +469,10 @@ wheels = [
 [[package]]
 name = "eth-contract"
 version = "0.4.1"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/yihuang/eth-contract.git?branch=main#fc1f64f806441561f251c3df1163107c72bd4869" }
 dependencies = [
     { name = "eth-abi" },
     { name = "web3" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f6/d4/3d3988b0cb9eee80c6bc205f4b56a4e6e6306b9685f67a3312a352d58926/eth_contract-0.4.1.tar.gz", hash = "sha256:157522506f254bbfd1f9546187ce9c7852378f84beb0fbffee086a7b21f5f03f", size = 128998, upload-time = "2026-06-03T08:15:14.24Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6c/01/811d91abed4d75822399890e87284fbb54d19d7b8c7086e609f813544af8/eth_contract-0.4.1-py3-none-any.whl", hash = "sha256:58fa898285f4bd12520b50e1cbacbee43efa1b1ad94702f481ad0481ee8146a6", size = 108549, upload-time = "2026-06-03T08:14:48.826Z" },
 ]
 
 [[package]]
@@ -1478,7 +1474,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "eth-account", specifier = ">=0.13.0" },
-    { name = "eth-contract", specifier = ">=0.4.0" },
+    { name = "eth-contract", git = "https://github.com/yihuang/eth-contract.git?branch=main" },
     { name = "tempo-py", extras = ["devnet"], git = "https://github.com/yihuang/tempo-py.git?branch=main" },
     { name = "web3", specifier = ">=7.0.0" },
 ]
