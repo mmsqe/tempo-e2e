@@ -210,8 +210,8 @@ async def new_registry(w3, chain_id: int, creator, name: str = "tempo-e2e") -> i
     return registry_id
 
 
-def emitted(receipt, event: str) -> list[tuple]:
+def emitted(receipt, event: str, contract=ANCHORING, address: str = ANCHORING_ADDRESS) -> list[tuple]:
     """Each ``event`` the contract logged in ``receipt``, as a tuple of its arguments in ABI order."""
-    abi = getattr(ANCHORING.events, event)
-    logs = [log for log in receipt["logs"] if log["address"] == ANCHORING_ADDRESS]
+    abi = getattr(contract.events, event)
+    logs = [log for log in receipt["logs"] if log["address"] == address]
     return [tuple(parsed["args"][i["name"]] for i in abi.abi["inputs"]) for parsed in abi.parse_logs(logs)]

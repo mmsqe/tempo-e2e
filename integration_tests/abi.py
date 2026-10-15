@@ -165,6 +165,48 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
     ]
 )
 
+# Zone factory precompile (TIP-1091, T10+): slot 0 packs the owner above a 32-bit nextZoneId.
+ZONE_FACTORY_ADDRESS = to_checksum_address("0x5AF2000000000000000000000000000000000000")
+_ZONE_PARAMS = (
+    "(address initialToken, bool accessMode, bool gatewayMode, address[] allowedAccounts,"
+    " address[] zoneGateways, address admin, address[] sequencers, uint8 threshold, string rpcUrl)"
+)
+_ZONE_INFO = (
+    "(uint32 zoneId, address portal, bool accessMode, bool gatewayMode, address admin,"
+    " address[] sequencers, uint8 threshold, address verifier, string rpcUrl)"
+)
+ZONE_FACTORY = Contract.from_abi(
+    [
+        "function owner() view returns (address)",
+        "function nextZoneId() view returns (uint32)",
+        "function transferOwnership(address newOwner)",
+        f"function createZone({_ZONE_PARAMS} params) returns (uint32 zoneId, address portal)",
+        f"function zones(uint32 id) view returns ({_ZONE_INFO} info)",
+        "function isZonePortal(address portal) view returns (bool)",
+        "event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)",
+        "event ZoneCreated(uint32 indexed zoneId, address indexed portal, address initialToken, bool accessMode,"
+        " bool gatewayMode, address admin, address[] sequencers, uint8 threshold, address verifier)",
+    ]
+)
+UPSTREAM_ZONE_OWNER = to_checksum_address("0xaF571FD4B3AD43a5807A5E58bFb25ea1aB327A14")  # INITIAL_FACTORY_OWNER
+
+# Each zone's portal is an ERC-1167 proxy to this one implementation, which keeps no state of its own.
+ZONE_PORTAL_IMPLEMENTATION = to_checksum_address("0x5AD1000000000000000000000000000000000000")
+ZONE_MESSENGER_ADDRESS = to_checksum_address("0x5A4D000000000000000000000000000000000000")
+ZONE_VERIFIER_ADDRESS = to_checksum_address("0x5A56000000000000000000000000000000000000")
+ZONE_PORTAL = Contract.from_abi(
+    [
+        "function zoneId() view returns (uint32)",
+        "function admin() view returns (address)",
+        "function messenger() view returns (address)",
+        "function verifier() view returns (address)",
+        "function leader() view returns (address)",
+        "function sequencerThreshold() view returns (uint8)",
+        "function isSequencer(address account) view returns (bool)",
+        "function isTokenEnabled(address token) view returns (bool)",
+    ]
+)
+
 # Current committee precompile (ICurrentCommittee, TIP-1070, T8+): the committee picked by
 # the epoch-boundary DKG outcome, written by a system call.
 CURRENT_COMMITTEE_ADDRESS = to_checksum_address("0xC077E00000000000000000000000000000000000")

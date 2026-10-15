@@ -336,7 +336,7 @@ class TestCrossingT12:
         )
         out = replay.stdout + replay.stderr
         assert replay.returncode == 0, out[-4000:]
-        for rule in ("t12.anchoring-upgrade", "t12.anchoring-calls"):
+        for rule in ("t12.anchoring-upgrade", "t12.anchoring-calls", "t12.zone-factory-handover"):
             assert rule in out, f"{rule} explained nothing"
 
 
