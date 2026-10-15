@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
+from eth_utils import to_checksum_address
+
 from .abi import ANCHORING, ANCHORING_ADDRESS
 from .network import TempoNode, default_genesis, free_port, generate_dev_genesis, resolve_tempo_bin
 from .utils import deploy_contract, send_call
@@ -17,7 +19,22 @@ from .utils import deploy_contract, send_call
 LAYOUT = Path(__file__).parent.parent / "contracts" / "layout"
 if not LAYOUT.is_dir():
     raise RuntimeError(f"{LAYOUT} is missing: run `git submodule update --init contracts`")
-RUNTIME_CODE = bytes.fromhex((LAYOUT / "anchoring.bin").read_text().strip().removeprefix("0x"))
+
+
+def _code(name: str) -> bytes:
+    return bytes.fromhex((LAYOUT / name).read_text().strip().removeprefix("0x"))
+
+
+RUNTIME_CODE = _code("anchoring.bin")  # the implementation, as deployed at IMPLEMENTATION
+INIT_CODE = _code("anchoring.init.bin")  # what a deployment sends the factory after the salt
+PROXY_CODE = _code("proxy.bin")  # what T12 puts at 0x…0a00
+_DEPLOYMENT = json.loads((LAYOUT / "deployment.json").read_text())
+FACTORY = to_checksum_address(_DEPLOYMENT["factory"])
+IMPLEMENTATION = to_checksum_address(_DEPLOYMENT["implementation"])
+OWNER_SLOT = 11  # `_owner` in layout/anchoring.json, past every slot the seed writes
+# tempo's T11_ANCHORING_RUNTIME_HASH: the ownerless build the testnet launched on
+LAUNCH_RUNTIME_HASH = bytes.fromhex("893a2f955868c80ae17905aa36cc4f71a771731b530e72ff6cfb063f559a7c0e")
+IMPLEMENTATION_SLOT = 0x360894A13BA1A3210667C828492DB98DCA3E2076CC3735A920A3CA505D382BBC  # ERC-1967
 
 # Go's time.Time.String() in UTC, whole seconds: how the contract writes block time.
 GO_TIME = "%Y-%m-%d %H:%M:%S +0000 UTC"
@@ -75,15 +92,18 @@ def genesis_with_anchoring(
     storage: dict[int, int] | None = None,
     fork_times: dict[str, int] | None = None,
 ) -> Path:
-    """The dev genesis plus the contract's code, and ``storage`` if given, at ``ANCHORING_ADDRESS``.
+    """The dev genesis plus the contract as T12 leaves it: the proxy at ``ANCHORING_ADDRESS`` over
+    ``storage``, if given, and its implementation.
 
     What the generator itself writes is `test_genesis.py`'s subject.
     """
     base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
     genesis = json.loads(base.read_text())
+    alloc = genesis["alloc"]
     key = ANCHORING_ADDRESS.lower()
-    assert key not in genesis["alloc"], f"xtask's genesis already has {key}"
-    genesis["alloc"][key] = _account(RUNTIME_CODE, storage)
+    assert key not in alloc, f"xtask's genesis already has {key}"
+    alloc[key] = _account(PROXY_CODE, {**(storage or {}), IMPLEMENTATION_SLOT: int(IMPLEMENTATION, 16)})
+    alloc[IMPLEMENTATION.lower()] = _account(RUNTIME_CODE)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "genesis.json"
     path.write_text(json.dumps(genesis))
@@ -107,10 +127,10 @@ def load_dump(genesis: Path, datadir: Path, slots: dict[int, int]) -> None:
 
 
 @contextmanager
-def anchoring_node(base: Path, *, extra_args: list[str] | None = None) -> Iterator[TempoNode]:
-    """A dev node with the contract in genesis and the seed fixture loaded. The datadir is kept;
-    ``-s`` prints how to resume it."""
-    genesis = genesis_with_anchoring(base)
+def anchoring_node(base: Path, *, owner: str | None = None, extra_args: list[str] | None = None) -> Iterator[TempoNode]:
+    """A dev node with the contract in genesis, ``owner`` named there if given, and the seed
+    fixture loaded. The datadir is kept; ``-s`` prints how to resume it."""
+    genesis = genesis_with_anchoring(base, storage={OWNER_SLOT: int(owner, 16)} if owner else None)
     load_dump(genesis, base / "node0", seed_fixture())
     node = TempoNode(
         datadir=base / "node0",
@@ -134,7 +154,6 @@ RELAY_RUNTIME = (
 
 
 async def deploy_relay(w3, chain_id: int, account) -> str:
-    """A contract that forwards a call to the anchoring contract, which the EOA gate refuses."""
     runtime = bytes.fromhex(RELAY_RUNTIME.format(addr=ANCHORING_ADDRESS[2:]))
     size = f"60{len(runtime):02x}"
     init = bytes.fromhex(f"{size} 600c 6000 39 {size} 6000 f3") + runtime  # copy the runtime out, return it

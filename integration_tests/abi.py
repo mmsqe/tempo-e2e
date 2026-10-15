@@ -262,9 +262,15 @@ ANCHORING = Contract.from_abi(
         f" view returns ({_ANCHORING_REGISTRY}[] registriesOut, {_ANCHORING_PAGE_OUT} paginationOut)",
         "function grantRole(uint64 registryId, string checksum, address account, string role)",
         "function revokeRole(uint64 registryId, string checksum, address account, string role)",
-        # The contract's own role views; the precompile had none.
+        # The contract's own role views and ERC-173 ownership; the precompile had neither.
         "function hasRole(bytes32 role, address account) view returns (bool)",
         "function roleMemberCount(bytes32 role) view returns (uint256)",
+        "function owner() view returns (address)",
+        "function transferOwnership(address newOwner)",
+        "event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)",
+        # UUPS, behind the ERC-1967 proxy T12 puts here.
+        "function upgradeToAndCall(address newImplementation, bytes data) payable",
+        "event Upgraded(address indexed implementation)",
         "event AddRegistry(address indexed caller, uint64 registryId, string name)",
         "event AddRecord(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string checksum)",
         "event UpdateRecordStatus(address indexed caller, uint64 registryId, uint64 recordId, uint64 index, string status)",

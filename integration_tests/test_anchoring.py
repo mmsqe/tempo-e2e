@@ -4,14 +4,14 @@ the seed fixture loaded at block 0."""
 import time
 
 import pytest
-from eth_utils import filter_abi_by_type, function_abi_to_4byte_selector, keccak
+from eth_utils import filter_abi_by_type, function_abi_to_4byte_selector, keccak, to_checksum_address
 from tempo import Signer, add_fee_payer_signature, serialize, sign_transaction
 from tempo.keychain import sign_tx_access_key
 
 from .abi import ANCHORING, ANCHORING_ADDRESS
 from .anchoring import (
     GO_TIME,
-    RUNTIME_CODE,
+    PROXY_CODE,
     Page,
     Record,
     Registry,
@@ -32,6 +32,7 @@ from .utils import (
     build_tempo_tx,
     call_revert,
     deploy_contract,
+    fund,
     funded,
     get_nonce,
     new_account,
@@ -45,6 +46,8 @@ from .utils import (
 )
 
 pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
+
+OWNER = new_account()  # named in this module's genesis
 
 
 def intrinsic(data: bytes) -> int:
@@ -60,7 +63,7 @@ def tempo(request, tmp_path_factory):
     if rpc_url:
         yield ExternalNode(rpc_url, request.config.getoption("--tempo-ws")).wait_for_rpc()
         return
-    with anchoring_node(tmp_path_factory.mktemp("anchoring")) as node:
+    with anchoring_node(tmp_path_factory.mktemp("anchoring"), owner=OWNER.address) as node:
         yield node
 
 
@@ -93,7 +96,7 @@ class TestBinding:
 
     async def test_the_code_answers_under_t10(self, w3):
         """T10 once put a precompile here, and a precompile answers before code."""
-        assert bytes(await w3.eth.get_code(ANCHORING_ADDRESS)) == RUNTIME_CODE
+        assert bytes(await w3.eth.get_code(ANCHORING_ADDRESS)) == PROXY_CODE
         schedule = (await w3.provider.make_request("tempo_forkSchedule", []))["result"]["schedule"]
         assert next(fork for fork in schedule if fork["name"] == "T10")["active"]
         assert [r.id for r in await registries(w3, 1)] == [1]
@@ -182,10 +185,8 @@ class TestSeededCorpus:
         assert across[:2] == [self.SECOND, self.ELSEWHERE]
         assert across[-1].registry_id == registry_id
 
-    async def test_registry_3_cannot_be_recovered(self, w3):
-        """Registry 3's only admin has no key, and this build names no module admin, so nobody can
-        appoint one: the registry stays readable and frozen until a fork installs a build that
-        names an admin."""
+    async def test_registry_3_is_frozen_to_everyone_but_the_owner(self, w3):
+        """Registry 3's only admin has no key, so no key can appoint another."""
         successor = await funded(w3)
         grant = ANCHORING.fns.grantRole(3, "", successor.address, "admin").data
         assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, grant, sender=successor.address)
@@ -291,8 +292,8 @@ class TestFieldLimits:
         assert "checksum algorithm exceeds max length" in refused
 
 
-class TestEoaGate:
-    """Each way Tempo sends reaches the contract as the signer; a contract in between is refused."""
+class TestCaller:
+    """Each way Tempo sends reaches the contract as the signer, and a contract reaches it as itself."""
 
     @staticmethod
     async def assert_created_by(w3, receipt, account: str) -> None:
@@ -350,7 +351,7 @@ class TestEoaGate:
         await self.assert_created_by(w3, receipt, root.address)
 
     async def test_a_7702_delegation(self, w3, chain_id, funded_account):
-        """Its 23 bytes of code are the one kind the gate admits."""
+        """Its 23 bytes of code do not make it a contract."""
         authority = await funded(w3)
         _, delegate = await deploy_contract(
             w3, chain_id=chain_id, private_key=funded_account.key.hex(), bytecode=RETURN_42_INIT
@@ -370,47 +371,61 @@ class TestEoaGate:
             w3, await send_call(w3, chain_id, authority, ANCHORING_ADDRESS, data), authority.address
         )
 
-    async def test_a_contract_is_refused(self, w3, chain_id, funded_account):
+    async def test_a_contract_anchors_as_itself(self, w3, chain_id, funded_account):
         relay = await deploy_relay(w3, chain_id, funded_account)
         data = ANCHORING.fns.addRegistry("relayed", "", "").data
-        assert "sender not an eoa" in await call_revert(w3, relay, data, sender=funded_account.address)
-
-        [last] = await registries(w3, page=Page(limit=1, reverse=True))
         calls = [{"to": relay, "data": data}]
         receipt = await send_calls(
             w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=calls, gas_limit=STATE_WRITE_GAS
         )
-        assert receipt["status"] == 0
-        assert await registries(w3, page=Page(limit=1, reverse=True)) == [last], "nothing was written"
+        await self.assert_created_by(w3, receipt, relay)
+        [(_, registry_id, _)] = emitted(receipt, "AddRegistry")
+        assert not await ANCHORING.fns.hasRole(
+            keccak(text=f"registry:{registry_id}:admin"), funded_account.address
+        ).call(w3)
 
-    @staticmethod
-    def constructs_by_calling(data: bytes) -> bytes:
-        """Init code that calls the contract while constructing and deploys nothing: copy the
-        appended calldata to memory, call, keep whether it worked in slot 0, return no runtime."""
-        addr, size = ANCHORING_ADDRESS[2:], f"{len(data):04x}"
-        body = (
-            f"61{size} 61{{at}} 6000 39"  # codecopy(dest=0, at, size)
-            f" 6000 6000 61{size} 6000 6000 73{addr} 5a f1"  # call(gas, addr, 0, 0, size, 0, 0)
-            " 6000 55 6000 6000 f3"  # sstore(0, worked), return nothing
-        )
-        at = len(bytes.fromhex(body.format(at="0000").replace(" ", "")))
-        return bytes.fromhex(body.format(at=f"{at:04x}").replace(" ", "")) + data
 
-    async def test_a_constructor_is_refused(self, w3, chain_id, funded_account):
-        """A caller under construction has no code yet, so an extcodesize check alone would
-        admit it; the gate compares the sender to the origin first."""
-        [last] = await registries(w3, page=Page(limit=1, reverse=True))
-        data = ANCHORING.fns.addRegistry("constructed", "", "").data
+class TestOwner:
+    """The module's admin, named in the genesis."""
 
-        receipt, deployed = await deploy_contract(
-            w3,
-            chain_id=chain_id,
-            private_key=funded_account.key.hex(),
-            bytecode=self.constructs_by_calling(data),
-        )
+    @pytest.fixture(autouse=True)
+    async def owner_funded(self, request, w3):
+        if request.config.getoption("--tempo-rpc"):
+            pytest.skip("an external node names its own owner")
+        await fund(w3, OWNER.address)
 
-        assert receipt["status"] == 1, "the deployment itself survives the refusal"
-        # Slot 0 holds the call's own verdict, so an init that never called would fail here too.
-        assert int.from_bytes(await w3.eth.get_storage_at(deployed, 0)) == 0, "the call was refused"
-        assert emitted(receipt, "AddRegistry") == []
-        assert await registries(w3, page=Page(limit=1, reverse=True)) == [last], "nothing was written"
+    async def test_the_owner_recovers_registry_3(self, w3, chain_id):
+        assert to_checksum_address(await ANCHORING.fns.owner().call(w3)) == OWNER.address
+        role = keccak(text="registry:3:admin")
+
+        successor = await funded(w3)
+        grant = ANCHORING.fns.grantRole(3, "", successor.address, "admin").data
+        receipt = await send_call(w3, chain_id, OWNER, ANCHORING_ADDRESS, grant)
+        assert emitted(receipt, "GrantRole") == [(OWNER.address, 3, "", successor.address, "admin")]
+        assert await ANCHORING.fns.roleMemberCount(role).call(w3) == 2
+        receipt = await send_call(w3, chain_id, successor, ANCHORING_ADDRESS, add_record(3, "sha:recovered"))
+        assert emitted(receipt, "AddRecord") == [(successor.address, 3, 1, 1, "sha:recovered")]
+
+        # The break-glass is a registry admin and nothing else.
+        editor = ANCHORING.fns.grantRole(3, "", successor.address, "editor").data
+        assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, editor, sender=OWNER.address)
+
+    async def test_the_ownership_moves_to_a_contract(self, w3, chain_id, funded_account):
+        relay = await deploy_relay(w3, chain_id, funded_account)
+        zero = ANCHORING.fns.transferOwnership("0x" + "00" * 20).data
+        assert "new owner is the zero address" in await call_revert(w3, ANCHORING_ADDRESS, zero, sender=OWNER.address)
+        handover = ANCHORING.fns.transferOwnership(relay).data
+        receipt = await send_call(w3, chain_id, OWNER, ANCHORING_ADDRESS, handover)
+        assert emitted(receipt, "OwnershipTransferred") == [(OWNER.address, relay)]
+        assert to_checksum_address(await ANCHORING.fns.owner().call(w3)) == relay
+
+        grant = ANCHORING.fns.grantRole(2, "", funded_account.address, "admin").data
+        assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, grant, sender=OWNER.address)
+        through = dict(chain_id=chain_id, private_key=funded_account.key.hex(), gas_limit=STATE_WRITE_GAS)
+        receipt = await send_calls(w3, calls=[{"to": relay, "data": grant}], **through)
+        assert emitted(receipt, "GrantRole") == [(relay, 2, "", funded_account.address, "admin")]
+
+        # And back, for the rest of the module.
+        back = ANCHORING.fns.transferOwnership(OWNER.address).data
+        receipt = await send_calls(w3, calls=[{"to": relay, "data": back}], **through)
+        assert emitted(receipt, "OwnershipTransferred") == [(relay, OWNER.address)]

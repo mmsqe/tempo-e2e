@@ -118,6 +118,7 @@ def generate_dev_genesis(
     chain_id: int | None = None,
     epoch_length: int | None = None,
     anchoring: bool = False,
+    anchoring_owner: str | None = None,
     gas_token_admin: str | None = None,
     validator_address: str | None = None,
     dkg: bool = False,
@@ -157,6 +158,7 @@ def generate_dev_genesis(
         *(("--chain-id", str(chain_id)) if chain_id is not None else ()),
         *(("--epoch-length", str(epoch_length)) if epoch_length is not None else ()),
         *(("--anchoring",) if anchoring else ()),
+        *(("--anchoring-owner", anchoring_owner) if anchoring_owner else ()),
         *(("--deployment-gas-token", "--deployment-gas-token-admin", gas_token_admin) if gas_token_admin else ()),
         *(("--validator-addresses", validator_address) if validator_address else ()),
     ]
