@@ -100,14 +100,20 @@ async def test_t11_widens_the_window(w3, chain_id):
     assert receipt["status"] == 1
 
 
-async def test_nonzero_nonce_is_rejected(w3, chain_id):
-    """E4: an expiring-nonce tx must carry nonce == 0 (replay protection is hash-based)."""
+async def test_nonzero_nonce_is_a_discriminator_from_t12(w3, chain_id):
+    """E4: before T12 an expiring-nonce tx must carry nonce == 0; TIP-1106 makes it an opaque
+    discriminator at T12, and the protocol nonce stays untouched."""
     acct = new_account()
     await fund(w3, acct.address)
     soon = await latest_timestamp(w3) + 15
     tx = _expiring_tx(chain_id, valid_before=soon, max_fee=await suggested_max_fee(w3), nonce=1)
-    with pytest.raises(Exception):
-        await w3.eth.send_raw_transaction(_raw(tx, acct))
+    if "T12" not in await active_forks(w3):
+        with pytest.raises(Exception):
+            await w3.eth.send_raw_transaction(_raw(tx, acct))
+        return
+    receipt = await send_tempo_tx(w3, tx, acct.key.hex())
+    assert receipt["status"] == 1
+    assert await w3.eth.get_transaction_count(acct.address) == 0
 
 
 async def test_missing_valid_before_is_rejected(w3, chain_id):
