@@ -42,7 +42,16 @@ from .network import (
     resolve_tempo_bin,
     xtask_forks,
 )
-from .utils import FAR_FUTURE, STATE_WRITE_GAS, call_revert, latest_timestamp, rpc, send_call, send_calls
+from .utils import (
+    FAR_FUTURE,
+    STATE_WRITE_GAS,
+    call_revert,
+    latest_timestamp,
+    rpc,
+    send_call,
+    send_calls,
+    wait_for_block,
+)
 
 pytestmark = [pytest.mark.tempo, pytest.mark.slow]
 
@@ -217,8 +226,11 @@ async def _implementation(w3: AsyncWeb3) -> str:
     return to_checksum_address((await w3.eth.get_storage_at(ANCHORING_ADDRESS, IMPLEMENTATION_SLOT))[12:])
 
 
-async def _wait_for_timestamp(w3: AsyncWeb3, timestamp: int) -> None:
-    while (await w3.eth.get_block("latest"))["timestamp"] < timestamp:
+async def _wait_for_timestamp(w3: AsyncWeb3, timestamp: int, timeout: float = 120.0) -> None:
+    deadline = time.time() + timeout
+    while await latest_timestamp(w3) < timestamp:
+        if time.time() > deadline:
+            raise TimeoutError(f"no block reached timestamp {timestamp} within {timeout}s")
         await asyncio.sleep(0.5)
 
 
@@ -289,8 +301,7 @@ class TestCrossingT12:
                 w3, chain_id=node.chain_id, private_key=ADMIN.key.hex(), calls=calls, gas_limit=STATE_WRITE_GAS
             )
             assert refused["status"] == 0, "the launch build refuses a contract"
-            while await w3.eth.block_number < refused["blockNumber"] + 20:  # until the blocks above persist
-                await asyncio.sleep(0.2)
+            await wait_for_block(w3, refused["blockNumber"] + 20)  # until the blocks above persist
 
         replay = subprocess.run(
             [resolve_tempo_bin(), "shadow-replay", "--chain", str(genesis), "--datadir", str(node.datadir)]

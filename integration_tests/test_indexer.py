@@ -156,11 +156,8 @@ async def _indexed(w3, sender, want: set[str]) -> dict | None:
 
 
 async def _covered(w3, sender, want: set[str]) -> set[str] | None:
-    """``sender``'s hashes across *every* page, once they cover ``want``; else None.
-
-    A page caps at 100, so a completeness check built on :func:`_indexed` would silently
-    pass for any sender busier than that -- claiming coverage it never verified.
-    """
+    """``sender``'s hashes across *every* page, once they cover ``want``; else None. A page caps at
+    100, so :func:`_indexed` never sees the rest of a busier sender's history."""
     seen, cursor = set(), None
     while True:
         page = await _page(w3, {"from": sender}, **({"cursor": cursor} if cursor else {}))
@@ -466,6 +463,6 @@ class TestTidxDifferential:
             rows = tidx.sql(f'SELECT hash FROM txs WHERE "from" = {_sql_literal(sender)} AND block_num <= {head}')
             want = {_hex(row["hash"]) for row in rows}
             await _eventually(
-                lambda want=want, sender=sender: _indexed(w3, sender, want),
+                lambda want=want, sender=sender: _covered(w3, sender, want),
                 what=f"the node's indexer to cover tidx's txs for {sender}",
             )

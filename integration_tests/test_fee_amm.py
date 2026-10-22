@@ -3,8 +3,10 @@
 import asyncio
 
 import pytest
+from eth_abi import encode
 from eth_account import Account
 from eth_contract.erc20 import ERC20
+from eth_utils import keccak
 from hexbytes import HexBytes
 from tempo import Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, FEE_MANAGER_ADDRESS, PATH_USD, THETA_USD
@@ -40,8 +42,7 @@ async def test_mint_seeds_pool_for_ungenesised_token(w3, chain_id):
 
 async def test_pool_id_is_deterministic(w3):
     pool_id = await FEE.fns.getPoolId(ALPHA_USD, PATH_USD).call(w3)
-    assert pool_id == await FEE.fns.getPoolId(ALPHA_USD, PATH_USD).call(w3)
-    assert pool_id != b"\x00" * 32
+    assert pool_id == keccak(encode(["address", "address"], [ALPHA_USD, PATH_USD]))
 
 
 async def test_pool_has_reserves(w3):

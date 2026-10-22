@@ -237,13 +237,9 @@ class TestWrites:
 class TestGas:
     """What the node charges: forge prices its own VM, and an estimate is not a receipt."""
 
-    async def test_an_estimate_covers_the_write(self, w3, chain_id, funded_account):
+    async def test_an_estimate_covers_the_write(self, w3, funded_account):
         data = ANCHORING.fns.addRegistry("estimate", "covers the receipt", "{}").data
-        tx = {"to": ANCHORING_ADDRESS, "from": funded_account.address, "data": data}
-
-        estimated = await w3.eth.estimate_gas(tx)
-        receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data, gas=estimated)
-        assert estimated >= receipt["gasUsed"]
+        await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data)  # at the estimate, which must not run out
 
     async def test_every_write_costs_more_than_its_calldata(self, w3, chain_id, funded_account):
         """Each method runs: one that did nothing would stop at the intrinsic cost."""

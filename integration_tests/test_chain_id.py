@@ -8,11 +8,10 @@ import time
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
-from web3 import AsyncWeb3
 from web3.exceptions import Web3RPCError
 
 from .network import DEAD_UPSTREAM, FollowerNode, dev_node, free_port, generate_dev_genesis, node_log
-from .utils import funded, new_account, send_call, transfer_call
+from .utils import funded, new_account, rpc, send_call, transfer_call
 
 # An id no binary claims -- upstream keys chains off 4217/42431.
 UNCLAIMED_CHAIN_ID = 424242
@@ -55,20 +54,19 @@ class TestUnclaimedChainId:
         """Editing ``chainId`` in genesis is enough: nothing the node needs is keyed off it."""
         node = dev_node(tmp_path, log_name="unclaimed-chain-id.log", chain_id=UNCLAIMED_CHAIN_ID)
         try:
-            node.start().wait_for_rpc()
-            w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(node.rpc_url))
-            assert await w3.eth.chain_id == UNCLAIMED_CHAIN_ID
-            assert int(await w3.net.version) == UNCLAIMED_CHAIN_ID
+            async with rpc(node.start().wait_for_rpc()) as w3:
+                assert await w3.eth.chain_id == UNCLAIMED_CHAIN_ID
+                assert int(await w3.net.version) == UNCLAIMED_CHAIN_ID
 
-            signer = await funded(w3)
-            recipient = new_account().address
-            transfer = transfer_call(recipient, 1)
-            await send_call(w3, UNCLAIMED_CHAIN_ID, signer, **transfer)
-            assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 1
+                signer = await funded(w3)
+                recipient = new_account().address
+                transfer = transfer_call(recipient, 1)
+                await send_call(w3, UNCLAIMED_CHAIN_ID, signer, **transfer)
+                assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 1
 
-            # Signed one id over, the same write has to bounce.
-            with pytest.raises(Web3RPCError, match="chain ID"):
-                await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, **transfer)
+                # Signed one id over, the same write has to bounce.
+                with pytest.raises(Web3RPCError, match="chain ID"):
+                    await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, **transfer)
         finally:
             node.stop()
 
