@@ -1,9 +1,6 @@
-"""TIP-1017 ValidatorConfig V2 (0xCccC…01): the validator set after genesis.
+"""TIP-1017 ValidatorConfig V2: the owner adds validators after genesis; the owner or a validator deactivates.
 
-The set genesis writes is not the set the chain keeps — the owner may add, and an owner or the
-validator itself may deactivate. The dev genesis seeds the registry initialized at height 0 with
-zero validators, owned by the prefunded dev account, so both halves are assertable here. The DKG
-half of a join needs consensus: `TestJoiningTheCommittee`.
+The dev genesis seeds it initialized and empty, owned by the prefunded dev account.
 """
 
 import asyncio
@@ -17,16 +14,13 @@ from eth_contract.erc20 import ERC20
 from eth_utils import keccak, to_checksum_address
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 from tempo.constants import VALIDATOR_CONFIG_V2_ADDRESS as V2_ADDR
-from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import _trusted_peers
-from web3 import AsyncWeb3
-from web3.middleware import ExtraDataToPOAMiddleware
 
-from .abi import CURRENT_COMMITTEE, CURRENT_COMMITTEE_ADDRESS, FEE
+from .abi import CURRENT_COMMITTEE, FEE
 from .abi import VALIDATOR_CONFIG_V2 as V2
-from .conftest import _consensus_net_supervisord, _run_devnet_init
-from .network import FAUCET_PRIVATE_KEY, ValidatorNode, free_port, resolve_tempo_bin, resolve_xtask_bin
-from .utils import call_revert, new_account, send_call, send_type_2
+from .conftest import supervisord_net
+from .network import FAUCET_PRIVATE_KEY, ValidatorNode, free_port
+from .utils import call_revert, new_account, rpc, send_call, send_type_2
 
 pytestmark = pytest.mark.tempo
 
@@ -43,18 +37,8 @@ def enrolment(
     key: ECC.EccKey | None = None,
     namespace: bytes = NS_ADD,
 ):
-    """An Ed25519 key and the signature `addValidator` demands over its own terms, or
-    `rotateValidator` under `NS_ROTATE`, whose terms leave the fee recipient out.
-
-    The digest binds the chain, this contract, the address, both endpoints and the fee recipient,
-    so an enrolment cannot be lifted to another chain or another address. The namespace is
-    prepended as `len ‖ namespace` rather than hashed in, which is what keeps a signature made for
-    a rotation from passing as one made for a join.
-
-    `ingress` is `ip:port` and `egress` a bare `ip` — the endpoints are validated before the
-    signature, so neither may be empty, and by default a node dials out from where it listens.
-    Pass `key` for a node that has to run under it.
-    """
+    """An Ed25519 key and its signature on `addValidator`'s terms, or `rotateValidator`'s under `NS_ROTATE`.
+    Endpoints are validated before the signature, so neither may be empty; `egress` defaults to the ingress IP."""
     key = key or ECC.generate(curve="ed25519")
     egress = ingress.rsplit(":", 1)[0] if egress is None else egress
     fee = fee or address
@@ -87,32 +71,31 @@ def owner():
 class TestGenesisState:
     async def test_the_dev_genesis_seeds_an_empty_registry(self, w3, owner):
         """Read at block 0, so a validator another test adds cannot make this pass or fail."""
-        assert await V2.fns.isInitialized().call(w3, to=V2_ADDR, block_identifier=0)
-        assert await V2.fns.getInitializedAtHeight().call(w3, to=V2_ADDR, block_identifier=0) == 0
-        assert await V2.fns.validatorCount().call(w3, to=V2_ADDR, block_identifier=0) == 0
-        assert not await V2.fns.getActiveValidators().call(w3, to=V2_ADDR, block_identifier=0)
-        assert await V2.fns.getNextNetworkIdentityRotationEpoch().call(w3, to=V2_ADDR, block_identifier=0) == 0
-        held = await V2.fns.owner().call(w3, to=V2_ADDR, block_identifier=0)
+        assert await V2.fns.isInitialized().call(w3, block_identifier=0)
+        assert await V2.fns.getInitializedAtHeight().call(w3, block_identifier=0) == 0
+        assert await V2.fns.validatorCount().call(w3, block_identifier=0) == 0
+        assert not await V2.fns.getActiveValidators().call(w3, block_identifier=0)
+        assert await V2.fns.getNextNetworkIdentityRotationEpoch().call(w3, block_identifier=0) == 0
+        held = await V2.fns.owner().call(w3, block_identifier=0)
         assert to_checksum_address(held) == owner.address  # the prefunded dev account
 
 
 class TestJoining:
-    """The set grows after block 0, which is the whole point of the registry being on chain."""
+    """The set grows after block 0."""
 
     async def test_the_owner_adds_a_validator(self, w3, chain_id, owner):
-        before = await V2.fns.validatorCount().call(w3, to=V2_ADDR)
+        before = await V2.fns.validatorCount().call(w3)
         joiner = new_account()
         ingress = f"10.0.0.{1 + before % 250}:26656"
-        pubkey, receipt = await join(w3, chain_id, owner, joiner.address, ingress)
-        assert receipt["status"] == 1
+        pubkey, _ = await join(w3, chain_id, owner, joiner.address, ingress)
 
-        assert await V2.fns.validatorCount().call(w3, to=V2_ADDR) == before + 1
-        entry = await V2.fns.validatorByAddress(joiner.address).call(w3, to=V2_ADDR)
+        assert await V2.fns.validatorCount().call(w3) == before + 1
+        entry = await V2.fns.validatorByAddress(joiner.address).call(w3)
         assert entry[0] == pubkey and to_checksum_address(entry[1]) == joiner.address
         assert entry[2] == ingress
         assert entry[7] == 0, "a fresh validator is active, not deactivated"
-        assert entry == await V2.fns.validatorByPublicKey(pubkey).call(w3, to=V2_ADDR)
-        active = await V2.fns.getActiveValidators().call(w3, to=V2_ADDR)
+        assert entry == await V2.fns.validatorByPublicKey(pubkey).call(w3)
+        active = await V2.fns.getActiveValidators().call(w3)
         assert joiner.address in [to_checksum_address(v[1]) for v in active]
 
     async def test_a_validator_deactivates_itself(self, w3, chain_id, owner, funded_account):
@@ -120,35 +103,32 @@ class TestJoining:
         joiner = funded_account
         ingress = "10.9.0.1:26656"
         await join(w3, chain_id, owner, joiner.address, ingress)
-        index = (await V2.fns.validatorByAddress(joiner.address).call(w3, to=V2_ADDR))[5]
+        index = (await V2.fns.validatorByAddress(joiner.address).call(w3))[5]
 
-        receipt = await send_call(w3, chain_id, joiner, V2_ADDR, V2.fns.deactivateValidator(index).data)
-        assert receipt["status"] == 1
-        assert (await V2.fns.validatorByAddress(joiner.address).call(w3, to=V2_ADDR))[7] != 0
-        assert joiner.address not in [
-            to_checksum_address(v[1]) for v in await V2.fns.getActiveValidators().call(w3, to=V2_ADDR)
-        ]
+        await send_call(w3, chain_id, joiner, V2_ADDR, V2.fns.deactivateValidator(index).data)
+        assert (await V2.fns.validatorByAddress(joiner.address).call(w3))[7] != 0
+        assert joiner.address not in [to_checksum_address(v[1]) for v in await V2.fns.getActiveValidators().call(w3)]
 
     async def test_a_rotated_key_still_leads_to_its_validator(self, w3, chain_id, owner, funded_account):
         """A validator replaces its own key, and the old one stays on record under its address."""
         validator = funded_account.address
         # The second endpoint stays held, so each run takes a pair of its own.
-        subnet = 1 + await V2.fns.validatorCount().call(w3, to=V2_ADDR) % 250
+        subnet = 1 + await V2.fns.validatorCount().call(w3) % 250
         first, second = (f"10.9.{subnet}.{host}:26656" for host in (1, 2))
         old, _ = await join(w3, chain_id, owner, validator, first)
-        index = (await V2.fns.validatorByAddress(validator).call(w3, to=V2_ADDR))[5]
+        index = (await V2.fns.validatorByAddress(validator).call(w3))[5]
 
         new, signature, egress, _ = enrolment(chain_id, validator, second, namespace=NS_ROTATE)
         rotate = V2.fns.rotateValidator(index, new, second, egress, signature)
         await send_call(w3, chain_id, funded_account, V2_ADDR, rotate.data)
 
-        was, now = [await V2.fns.validatorByPublicKey(key).call(w3, to=V2_ADDR) for key in (old, new)]
+        was, now = [await V2.fns.validatorByPublicKey(key).call(w3) for key in (old, new)]
         assert to_checksum_address(was[1]) == to_checksum_address(now[1]) == validator
         assert was[7] != 0 and now[7] == 0, "the old key is kept deactivated, the new one is live"
 
 
 class TestRefusals:
-    """What the registry will not accept, which is what makes the owner's power bounded."""
+    """What the registry will not accept, which bounds the owner's power."""
 
     async def test_mutators_are_owner_gated(self, w3):
         outsider = new_account()
@@ -180,26 +160,9 @@ class TestRefusals:
 @pytest.fixture(scope="module")
 def onboarding_net(request, tmp_path_factory):
     """Three validators paying fees in xtask's temporary token, as the testnet does; short epochs."""
-    if not request.config.getoption("--consensus"):
-        pytest.skip("consensus localnet not requested (pass --consensus)")
+    flags = ["--deployment-gas-token", "--deployment-gas-token-admin", Account.from_key(FAUCET_PRIVATE_KEY).address]
     base = tmp_path_factory.mktemp("onboarding-net")
-    config = {
-        "chain_id": 1337,
-        "accounts": 20,
-        "seed": 0,
-        "epoch_length": 20,
-        "patch_genesis_flags": [
-            "--deployment-gas-token",
-            "--deployment-gas-token-admin",
-            Account.from_key(FAUCET_PRIVATE_KEY).address,
-        ],
-        "tempo_bin": resolve_tempo_bin(),
-        "tempo_xtask_bin": resolve_xtask_bin(),
-        "validators": [
-            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(find_free_base_ports(3))
-        ],
-    }
-    yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
+    yield from supervisord_net(request, base, 3, epoch_length=20, patch_genesis_flags=flags)
 
 
 @pytest.mark.consensus
@@ -211,47 +174,45 @@ class TestJoiningTheCommittee:
     BLOCKS = 60
 
     async def test_a_newcomer_signs_and_proposes_after_the_next_dkg(self, onboarding_net, owner, tmp_path):
-        w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(onboarding_net.node_rpc_url("node0")))
-        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)  # boundary extraData is past 32 bytes
-        chain_id = await w3.eth.chain_id
-        # The owner also issues the token the network still pays fees in.
-        token = to_checksum_address(await FEE.fns.userTokens(owner.address).call(w3, to=FEE_MANAGER_ADDRESS))
-        newcomer, key, ingress = new_account(), ECC.generate(curve="ed25519"), f"127.0.0.1:{free_port()}"
-        signing_key = tmp_path / "signing.key"
-        signing_key.write_text("0x" + key.seed.hex())
+        async with rpc(onboarding_net.node_rpc_url("node0")) as w3:
+            chain_id = await w3.eth.chain_id
+            # The owner also issues the token the network still pays fees in.
+            token = to_checksum_address(await FEE.fns.userTokens(owner.address).call(w3))
+            newcomer, key, ingress = new_account(), ECC.generate(curve="ed25519"), f"127.0.0.1:{free_port()}"
+            signing_key = tmp_path / "signing.key"
+            signing_key.write_text("0x" + key.seed.hex())
 
-        # Without the token its blocks could collect no fee.
-        await send_type_2(w3, owner, token, ERC20.fns.transfer(newcomer.address, 10**9).data)
-        take = FEE.fns.setValidatorToken(token).data
-        await send_call(w3, chain_id, newcomer, FEE_MANAGER_ADDRESS, take, fee_token=token)
-        pubkey, _ = await join(w3, chain_id, owner, newcomer.address, ingress, key=key, fee_token=token)
+            # Without the token its blocks could collect no fee.
+            await send_type_2(w3, owner, token, ERC20.fns.transfer(newcomer.address, 10**9).data)
+            take = FEE.fns.setValidatorToken(token).data
+            await send_call(w3, chain_id, newcomer, FEE_MANAGER_ADDRESS, take, fee_token=token)
+            pubkey, _ = await join(w3, chain_id, owner, newcomer.address, ingress, key=key, fee_token=token)
 
-        node = ValidatorNode(
-            signing_key=signing_key,
-            ingress=ingress,
-            trusted_peers=_trusted_peers(onboarding_net.config, onboarding_net.data_dir),
-            datadir=tmp_path / "node",
-            log_path=tmp_path / "newcomer.log",
-            genesis=onboarding_net.data_dir / "genesis.json",
-            http_port=free_port(),
-        )
-        node.start()
-        try:
-            deadline = time.time() + self.SHARE_TIMEOUT
-            while not node.is_signer():
-                assert node.proc.poll() is None, f"the newcomer exited; see {node.log_path}"
-                assert time.time() < deadline, f"no share within {self.SHARE_TIMEOUT}s; see {node.log_path}"
-                await asyncio.sleep(2)
-            _, members = await CURRENT_COMMITTEE.fns.getCommitteeMembers().call(w3, to=CURRENT_COMMITTEE_ADDRESS)
-            assert pubkey in members
+            node = ValidatorNode(
+                signing_key=signing_key,
+                ingress=ingress,
+                trusted_peers=_trusted_peers(onboarding_net.config, onboarding_net.data_dir),
+                datadir=tmp_path / "node",
+                log_path=tmp_path / "newcomer.log",
+                genesis=onboarding_net.data_dir / "genesis.json",
+                http_port=free_port(),
+            )
+            node.start()
+            try:
+                deadline = time.time() + self.SHARE_TIMEOUT
+                while not node.is_signer():
+                    assert node.proc.poll() is None, f"the newcomer exited; see {node.log_path}"
+                    assert time.time() < deadline, f"no share within {self.SHARE_TIMEOUT}s; see {node.log_path}"
+                    await asyncio.sleep(2)
+                _, members = await CURRENT_COMMITTEE.fns.getCommitteeMembers().call(w3)
+                assert pubkey in members
 
-            transfer = ERC20.fns.transfer(new_account().address, 1).data
-            for _ in range(self.BLOCKS):
-                receipt = await send_type_2(w3, owner, token, transfer)
-                if (await w3.eth.get_block(receipt["blockNumber"]))["miner"] == newcomer.address:
-                    break
-            else:
-                pytest.fail(f"none of {self.BLOCKS} blocks was the newcomer's; see {node.log_path}")
-        finally:
-            node.stop()
-            await w3.provider.disconnect()
+                transfer = ERC20.fns.transfer(new_account().address, 1).data
+                for _ in range(self.BLOCKS):
+                    receipt = await send_type_2(w3, owner, token, transfer)
+                    if (await w3.eth.get_block(receipt["blockNumber"]))["miner"] == newcomer.address:
+                        break
+                else:
+                    pytest.fail(f"none of {self.BLOCKS} blocks was the newcomer's; see {node.log_path}")
+            finally:
+                node.stop()

@@ -1,15 +1,5 @@
-"""tempoxyz/tidx as a differential oracle for the indexer RPCs (see ``test_indexer.py``).
-
-tidx is a standalone indexer: it polls a node's JSON-RPC for blocks/txs/logs into
-PostgreSQL and exposes SQL over HTTP at ``GET /query``. It does not serve
-``eth_getTransactions`` or the ``token_`` namespace -- what it gives the suite is a
-second, independent ingest path over the same chain, queryable in O(1) instead of a
-block walk.
-
-Only PostgreSQL is enabled, which covers ``blocks``/``txs``/``logs``/``receipts``.
-tidx's token projections are ClickHouse-only, so the ``token_`` endpoints have no
-oracle here.
-"""
+"""tempoxyz/tidx as a differential oracle for ``test_indexer.py``: a second, independent ingest of the
+chain into PostgreSQL, queried as SQL. Its token tables are ClickHouse-only, so ``token_`` has no oracle."""
 
 from __future__ import annotations
 
@@ -104,12 +94,8 @@ class QueryRefused(RuntimeError):
 
 
 def bytea(value) -> str:
-    """A byte string as PostgreSQL's SQL literal. ClickHouse takes ``'0x…'``, and a
-    predicate carried between them matches nothing -- an empty result, not an error.
-
-    Uncast, though PostgreSQL would take ``::bytea``: the cast is redundant, and tidx's
-    pushdown extractor reads a bare literal but not a cast expression.
-    """
+    """A byte string as PostgreSQL's ``'\\x…'`` literal (ClickHouse's ``'0x…'`` matches nothing), uncast
+    because tidx's pushdown reads no cast."""
     return "'\\x" + HexBytes(value).hex() + "'"
 
 
@@ -178,17 +164,8 @@ class Tidx:
             raise QueryRefused(f"{e.code} {e.reason}: {e.read().decode(errors='replace')}\n  {url}") from e
 
     def sql(self, query: str, *, signature: str | list[str] | None = None, limit: int = 1000) -> list[dict]:
-        """Run a SELECT and return rows as dicts.
-
-        tidx answers ``{"columns": [...], "rows": [[...]], "row_count": n}``; zipping them
-        here keeps the assertions readable at the call site. ``signature`` generates a
-        decoded event table named after the event; without one only the base tables exist.
-        Several may be passed, each becoming its own table.
-
-        A refusal comes back 200 with ``ok: false``, so an unchecked read turns SQL tidx
-        would not take into an empty result set -- what a correct query over an empty chain
-        also returns.
-        """
+        """Run a SELECT and return rows as dicts; ``signature`` adds a decoded table per event. A refusal comes
+        back 200 with ``ok: false``, so it raises instead of reading as empty."""
         params = {"sql": query, "chainId": self.chain_id, "limit": limit}
         if signature is not None:
             params["signature"] = [signature] if isinstance(signature, str) else list(signature)
@@ -198,23 +175,14 @@ class Tidx:
         return [dict(zip(result["columns"], row)) for row in result["rows"]]
 
     def synced_block(self) -> int:
-        """Highest block written to PostgreSQL, or -1 before the first one.
-
-        ``blocks`` numbers its column ``num``; only ``txs``/``logs``/``receipts`` call
-        it ``block_num``.
-        """
+        """Highest block in PostgreSQL (``blocks.num``), or -1 before the first."""
         rows = self.sql("SELECT max(num) AS head FROM blocks")
         head = rows[0]["head"] if rows else None
         return -1 if head is None else int(head)
 
     def wait_for_block(self, number: int, timeout: float = 180.0) -> int:
-        """Block until tidx has indexed through ``number``.
-
-        tidx polls, so it trails the chain and every oracle read has to pass through
-        here or it races the sync loop. ``number=0`` doubles as the readiness check:
-        the API may still be booting, so transport errors are retried, and the default
-        timeout is generous because a first poll under arm64 emulation is slow.
-        """
+        """Wait until tidx has indexed through ``number``; ``0`` doubles as the readiness check, retrying
+        while the API boots."""
         deadline = time.time() + timeout
         head, last = -1, None
         while time.time() < deadline:
@@ -241,12 +209,8 @@ def _docker(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _retag(image: str) -> bool:
-    """Put `image` back on the id `docker images` still lists it under.
-
-    Docker Desktop's containerd store loses a local image's *name* while keeping the
-    image, which no amount of asking again recovers. Writing the tag back is the fix
-    by hand. An image nothing lists is genuinely absent and stays a skip.
-    """
+    """Put ``image`` back on the id ``docker images`` lists it under: Docker Desktop's containerd store can
+    lose a local image's name."""
     listed = _docker("images", "--filter", f"reference={image}", "--format", "{{.ID}}")
     at = listed.stdout.split("\n")[0].strip()
     return bool(at) and _docker("tag", at, image).returncode == 0
@@ -290,11 +254,7 @@ def preflight() -> None:
 
 
 def rpc_url_for_container(rpc_url: str) -> str:
-    """``rpc_url`` as the tidx container sees it.
-
-    A node on the host's loopback is only reachable through docker's host alias;
-    an external node (``--tempo-rpc``) is already routable from the container.
-    """
+    """``rpc_url`` as the container sees it: loopback goes through docker's host alias."""
     parts = urllib.parse.urlparse(rpc_url)
     if parts.hostname not in ("127.0.0.1", "localhost", "0.0.0.0"):
         return rpc_url

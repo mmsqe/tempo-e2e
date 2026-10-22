@@ -1,22 +1,17 @@
-"""allegro payload-preparation tests.
+"""allegro payload preparation: a proposal reuses the job started on the block just accepted.
 
-allegro starts the next view's payload job on the block just accepted, so a
-proposal reuses a job already filling instead of building from cold. Nothing
-exports the hit/miss counters, so this module reads them out of the node log.
-
-Gated on the ``embedded-validators`` capability (allegro); skips elsewhere.
+Nothing exports the hit/miss counters, so the tests read them from the node log.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 from web3 import Web3
 
 from .network import node_log
-from .utils import cluster_fixture, rpc
+from .utils import cluster_fixture, rpc, wait_for_block
 
 pytestmark = pytest.mark.requires("embedded-validators")
 
@@ -73,11 +68,7 @@ def test_prepared_payloads_are_not_wasted(payload_cluster):
 
 
 async def test_transactions_land_promptly(payload_cluster, driver):
-    """A job started before a transaction arrives still picks it up.
-
-    reth keeps building until the payload is resolved, so preparing early must
-    not push transactions into a later block.
-    """
+    """reth builds until the payload is resolved, so a job started early still takes a later transaction."""
     async with rpc(payload_cluster[0]) as w3:
         recipient = Web3.to_checksum_address("0x00000000000000000000000000000000000b10c5")
         before = await w3.eth.block_number
@@ -93,11 +84,7 @@ async def test_transactions_land_promptly(payload_cluster, driver):
 
 
 async def test_finalized_never_regresses(payload_cluster):
-    """Finalization only moves forward, and never past the head.
-
-    Preparation moves the head to a block that is not notarized yet, so
-    `latest` may name one that never makes it; `finalized` must not.
-    """
+    """`latest` may name a prepared block that never lands; `finalized` only moves forward, never past it."""
     async with rpc(payload_cluster[0]) as w3:
         heights = []
         for _ in range(10):
@@ -132,11 +119,7 @@ async def test_speculative_head_stays_a_real_block(payload_cluster):
     strict=False,
 )
 async def test_chain_recovers_after_a_validator_outage(payload_cluster):
-    """Losing quorum and regaining it resumes block production.
-
-    Two validators means no quorum while one is down, and on its return every
-    parent the node is asked about predates its restart.
-    """
+    """Two validators lose quorum while one is down; on return, every parent it is asked about predates it."""
     survivor, casualty = payload_cluster[0], payload_cluster[1]
     async with rpc(survivor) as w3:
         casualty.stop()
@@ -145,10 +128,4 @@ async def test_chain_recovers_after_a_validator_outage(payload_cluster):
 
         casualty.start()
         casualty.wait_for_rpc(timeout=90.0, want_block=stalled)
-
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if await w3.eth.block_number > stalled:
-                return
-            await asyncio.sleep(0.5)
-        pytest.fail(f"chain did not resume past {stalled} after the validator returned")
+        await wait_for_block(w3, stalled + 1, timeout=15)

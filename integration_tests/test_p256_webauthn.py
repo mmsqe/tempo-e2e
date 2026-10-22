@@ -1,12 +1,6 @@
-"""P-256 and WebAuthn (passkey) signatures on tempo (``0x76``) txs.
+"""P-256 and WebAuthn (passkey) signatures on tempo txs, as the sender or as an access key.
 
-A passkey account's address is derived from the credential's public key, so its owner
-holds no private key. The same credential either *is* the sender, or is registered on an
-ordinary account's keychain as an access key that spends on that account's behalf.
-
-tempo-py builds every valid envelope; what is assembled here is the deliberately broken
-ones, which the SDK is right not to offer -- `WebAuthnSignature` refuses a high-s scalar,
-and `sign_webauthn` only ever attests to the hash it was given.
+tempo-py builds every valid envelope; only the deliberately broken ones are assembled here.
 """
 
 from types import SimpleNamespace
@@ -14,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
-from tempo.contracts import ACCOUNT_KEYCHAIN as KC
 from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
 from tempo.keychain import SignatureType, sign_tx_registered_key
 from tempo.p256 import (
@@ -31,8 +24,8 @@ from tempo.p256 import (
 )
 from tempo.transaction import get_sign_payload
 
-from .abi import KEYCHAIN_VIEWS
-from .utils import fund, key_restrictions, new_account, prepare_tx, send_call, send_signed, transfer_call
+from .abi import ACCOUNT_KEYCHAIN as KC
+from .utils import fund, funded, key_restrictions, new_account, prepare_tx, send_call, send_signed, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -51,16 +44,11 @@ async def passkey(w3):
 @pytest.fixture
 async def root(w3):
     """A funded secp256k1 account, to register passkeys on."""
-    account = new_account()
-    await fund(w3, account.address)
-    return account
+    return await funded(w3)
 
 
 async def spend(w3, chain_id, key, recipient, amount, *, account=None, **kwargs):
-    """A transfer signed by ``key``: from its own address, or from ``account``'s if it keys one.
-
-    ``kwargs`` go to `sign_tx`.
-    """
+    """A transfer signed by ``key``, from its own address or ``account``'s; ``kwargs`` go to `sign_tx`."""
     tx = await prepare_tx(w3, chain_id, account or key, [transfer_call(recipient, amount)])
     return await send_signed(w3, sign_tx(tx, key, account=account, **kwargs))
 
@@ -71,10 +59,7 @@ async def authorize(w3, chain_id, root, key, key_type):
 
 
 def sign_tx(tx, signer: P256Signer, *, account=None, webauthn: bool = False, **kwargs):
-    """Sign ``tx`` with ``signer``: as the passkey account itself, or as ``account``'s key.
-
-    ``kwargs`` reach the signer -- ``pre_hash`` for P-256, ``flags`` for an assertion.
-    """
+    """Sign ``tx`` as the passkey account itself or as ``account``'s key; ``kwargs`` reach the signer."""
     if webauthn:
         kwargs.setdefault("rp_id", RP_ID)
     if account is not None:
@@ -101,15 +86,11 @@ def broken_assertion(
 
 
 def malleable(tx, signer: P256Signer, *, webauthn: bool = False):
-    """The ``(r, n-s)`` twin of a valid signature, as raw bytes the SDK would refuse to hold.
-
-    The serializer asks a sender signature only for ``to_bytes()``.
-    """
+    """The ``(r, n-s)`` twin of a valid signature, as bare ``to_bytes()``: the SDK refuses a high s."""
     payload = get_sign_payload(tx)
     signed = signer.sign_webauthn(payload, rp_id=RP_ID) if webauthn else signer.sign(payload)
     raw = bytearray(signed.to_bytes())
-    # s follows r in both layouts, counted from the front for P-256 and from the back for
-    # WebAuthn, whose assertion data sits in between.
+    # s follows r: counted from the front for P-256, from the back for WebAuthn (assertion data sits between)
     start, end = (-96, -64) if webauthn else (33, 65)
     raw[start:end] = (P256_N - int.from_bytes(signed.s, "big")).to_bytes(32, "big")
     return SimpleNamespace(to_bytes=lambda: bytes(raw))
@@ -160,11 +141,7 @@ class TestAsSender:
         ],
     )
     async def test_assertion_validation_rejects(self, w3, chain_id, passkey, kwargs):
-        """Each assertion field the node checks, broken one at a time.
-
-        The P-256 signature over the tampered assertion is still valid, so these fail on
-        WebAuthn validation rather than on the curve.
-        """
+        """Each checked assertion field, broken one at a time; the P-256 signature itself stays valid."""
         recipient = new_account().address
 
         tx = await prepare_tx(w3, chain_id, passkey, [transfer_call(recipient, 1)])
@@ -189,10 +166,7 @@ class TestAsSender:
         assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 0
 
     async def test_another_credential_spends_only_its_own_address(self, w3, chain_id, passkey):
-        """The embedded pubkey *is* the sender, so a stranger's signature cannot spend here.
-
-        The signature is fine; the node just derives a different, unfunded sender from it.
-        """
+        """The embedded pubkey is the sender, so a stranger's valid signature names an unfunded one."""
         recipient = new_account().address
         tx = await prepare_tx(w3, chain_id, passkey, [transfer_call(recipient, 1)])
 
@@ -202,11 +176,7 @@ class TestAsSender:
 
 
 class TestAsAccessKey:
-    """The passkey spends for an ordinary account, without becoming the sender.
-
-    ``authorizeKey`` records a ``SignatureType`` next to the key id, and the node checks
-    the envelope against it, so a key registered under one scheme can't be used with another.
-    """
+    """The passkey spends for an ordinary account, under the ``SignatureType`` it was registered with."""
 
     @pytest.mark.parametrize(
         "key_type, webauthn", [(SignatureType.P256, False), (SignatureType.WEBAUTHN, True)], ids=["p256", "webauthn"]
@@ -215,11 +185,11 @@ class TestAsAccessKey:
         key, recipient = P256Signer.generate(), new_account().address
         await authorize(w3, chain_id, root, key, key_type)
 
-        signature_type, key_id, _expiry, _enforce_limits, is_revoked = await KEYCHAIN_VIEWS.fns.getKey(
+        signature_type, key_id, _expiry, _enforce_limits, is_revoked = await KC.fns.getKey(
             root.address, key.checksum_address
-        ).call(w3, to=KC_ADDR)
+        ).call(w3)
         assert (signature_type, key_id.lower(), is_revoked) == (int(key_type), key.checksum_address.lower(), False)
-        assert not await KC.fns.isAdminKey(root.address, key.checksum_address).call(w3, to=KC_ADDR)
+        assert not await KC.fns.isAdminKey(root.address, key.checksum_address).call(w3)
 
         receipt = await spend(w3, chain_id, key, recipient, 1500, account=root, webauthn=webauthn)
 

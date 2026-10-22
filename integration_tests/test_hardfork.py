@@ -1,11 +1,5 @@
-"""Hardfork boundaries crossed on a running chain, rather than baked into genesis.
-
-Every other test launches with its forks active, so xtask writes their state into the
-alloc and the executor's boundary installers never fire. Scheduling a fork past genesis
-makes the node install that state itself — the shape of every real upgrade. Which forks
-own such state is discovered by diffing generated allocs: T3 (SignatureVerifier),
-T6 (ReceivePolicyGuard) and T10 (TIP-1091 zone state) today.
-"""
+"""Hardfork boundaries crossed on a running chain. Elsewhere forks start active, so xtask writes their state
+into the alloc and the boundary installers never fire; which forks own such state is found by diffing allocs."""
 
 from __future__ import annotations
 
@@ -22,9 +16,7 @@ from pathlib import Path
 import pytest
 from eth_account import Account
 from eth_utils import keccak, to_checksum_address
-from tempo.constants import VALIDATOR_CONFIG_V2_ADDRESS
 from web3 import AsyncWeb3, Web3
-from web3.middleware import ExtraDataToPOAMiddleware
 
 from .abi import ANCHORING, ANCHORING_ADDRESS, UPSTREAM_ZONE_OWNER, VALIDATOR_CONFIG_V2
 from .anchoring import (
@@ -50,18 +42,14 @@ from .network import (
     resolve_tempo_bin,
     xtask_forks,
 )
-from .utils import STATE_WRITE_GAS, call_revert, send_call, send_calls
+from .utils import FAR_FUTURE, STATE_WRITE_GAS, call_revert, latest_timestamp, rpc, send_call, send_calls
 
 pytestmark = [pytest.mark.tempo, pytest.mark.slow]
 
-# Timestamp no run will reach.
-FAR_FUTURE = 4_000_000_000
-
-# Gap between launching a node and the fork activating: enough for startup and still some
-# pre-fork blocks to observe. Blocks land every 50ms, so a generous value costs only time.
+# Launch-to-fork gap: startup plus some pre-fork blocks; blocks land every 50ms, so generous is cheap.
 ACTIVATION_LEAD = 30
 
-MMR_FORK = "t10_time"  # put a precompile, which answers before code, at 0x…0a00 until nvnmchain-tempo#10
+MMR_FORK = "t10_time"  # once put a precompile, which answers before code, at 0x…0a00
 OWNER_FORK = "t12_time"
 DEPLOY_GAS = 25_000_000  # 20.7 KB of code at 1,000 gas a byte, and the creation around it
 ADMIN = Account.from_key(FAUCET_PRIVATE_KEY)  # the generated genesis's validator admin
@@ -76,23 +64,16 @@ def _generate_alloc(output_dir: Path, fork_times: dict[str, int] | None = None) 
 
 
 def _schedule(fork: str, activation: int) -> dict[str, int]:
-    """Activate ``fork`` and every later fork at ``activation``, leaving earlier ones at genesis.
-
-    Later forks come along because a schedule has to stay ordered: no chain sits at T5
-    with T6 pending while T7 is live.
-    """
+    """Activate ``fork`` and every later fork at ``activation``, leaving earlier ones at genesis; later
+    forks come along because a schedule has to stay ordered."""
     order = xtask_forks()
     return {f: activation for f in order[order.index(fork) :]}
 
 
 @functools.lru_cache(maxsize=1)
 def boundary_forks() -> tuple[str, ...]:
-    """Forks whose state xtask writes into the alloc only when they are active at genesis.
-
-    Each fork is scheduled alone — an ordering no chain would run, but these allocs are
-    only read, so it isolates one fork's footprint. Empty when xtask is unavailable,
-    which collects as a skip rather than an error.
-    """
+    """Forks whose state xtask writes into the alloc only when active at genesis, each scheduled alone to
+    isolate its footprint. Empty without xtask, which collects as a skip rather than an error."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
             head = set(_generate_alloc(Path(tmp) / "head", dict.fromkeys(xtask_forks(), 0)))
@@ -116,13 +97,8 @@ def _code(w3: Web3, address: str) -> bytes:
 
 
 def _fingerprint(w3: Web3, address: str, slots) -> dict[str, str]:
-    """Everything a boundary install must reproduce at ``address``: code, storage, dispatch.
-
-    ``slots`` are the storage keys the genesis alloc declares. Dispatch is probed with an
-    unknown selector, since a marker that landed without its spec gate opening answers
-    unlike a live precompile — something reading state cannot see. Compared across chains,
-    so no precompile's ABI is baked in here.
-    """
+    """Code, declared ``slots`` and dispatch at ``address``. Dispatch is probed with an unknown selector: a
+    marker whose spec gate never opened answers unlike a live precompile, which state alone cannot show."""
     to = Web3.to_checksum_address(address)
     try:
         answer = "returned:" + bytes(w3.eth.call({"to": to, "data": b"\0\0\0\0"})).hex()
@@ -164,10 +140,7 @@ def _wait_past(w3: Web3, activation: int, timeout: float = 120.0) -> None:
 
 @pytest.fixture(scope="module")
 def head_chain(tmp_path_factory):
-    """A chain launched with every fork active at genesis — the state a boundary must reproduce.
-
-    Scheduled outright: xtask leaves T12 off unless asked.
-    """
+    """A chain with every fork active at genesis, T12 named outright since xtask leaves it off unless asked."""
     node = dev_node(tmp_path_factory.mktemp("head"), log_name="head.log", fork_times=dict.fromkeys(xtask_forks(), 0))
     alloc = _read_alloc(node.genesis)
     with _running(node) as w3:
@@ -176,12 +149,8 @@ def head_chain(tmp_path_factory):
 
 @pytest.mark.parametrize("fork", boundary_forks())
 def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_path):
-    """Crossing ``fork`` installs exactly the state a chain launched with it already holds.
-
-    Both paths build from the same constructors upstream, so the two chains must come out
-    identical — otherwise a node that upgraded through the fork carries different state
-    than one synced from genesis.
-    """
+    """Crossing ``fork`` installs exactly the state a chain launched with it holds; otherwise a node that
+    upgraded through the fork would differ from one synced from genesis."""
     head_w3, head_alloc = head_chain
     forks = xtask_forks()
     activation = int(time.time()) + ACTIVATION_LEAD
@@ -257,13 +226,10 @@ async def _wait_for_timestamp(w3: AsyncWeb3, timestamp: int) -> None:
 async def _launched(base: Path, genesis: Path):
     """A node on ``genesis``, its async client, and a sender bound to ``ADMIN``."""
     node = TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
-    w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(node.rpc_url))
-    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     try:
-        node.start().wait_for_rpc()
-        yield node, w3, functools.partial(send_call, w3, node.chain_id, ADMIN)
+        async with rpc(node.start().wait_for_rpc()) as w3:
+            yield node, w3, functools.partial(send_call, w3, node.chain_id, ADMIN)
     finally:
-        await w3.provider.disconnect()
         node.stop()
 
 
@@ -281,7 +247,7 @@ class TestCrossingT12:
         assert await _added(send, "after") == [(ADMIN.address, 2, "after")]
         assert bytes(await w3.eth.get_code(ANCHORING_ADDRESS)) == PROXY_CODE
         assert await _implementation(w3) == IMPLEMENTATION
-        registry_owner = await VALIDATOR_CONFIG_V2.fns.owner().call(w3, to=VALIDATOR_CONFIG_V2_ADDRESS)
+        registry_owner = await VALIDATOR_CONFIG_V2.fns.owner().call(w3)
         assert to_checksum_address(registry_owner) == ADMIN.address
         assert to_checksum_address(await ANCHORING.fns.owner().call(w3)) == ADMIN.address
 
@@ -290,7 +256,7 @@ class TestCrossingT12:
         async with _launched(tmp_path, self.genesis(tmp_path, activation)) as (_, w3, send):
             assert await _added(send, "before") == [(ADMIN.address, 1, "before")]
             await _deploy(send)
-            assert (await w3.eth.get_block("latest"))["timestamp"] < activation, "deployed too late to test"
+            assert await latest_timestamp(w3) < activation, "deployed too late to test"
             await _wait_for_timestamp(w3, activation)
             await self.assert_behind_the_proxy(w3, send)
 

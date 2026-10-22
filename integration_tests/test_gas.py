@@ -1,12 +1,10 @@
-"""Gas estimation and accounting, incl. TIP-1000 state-creation costs and the
-TIP-1010 per-transaction gas cap.
-"""
+"""Gas estimation and accounting, incl. TIP-1000 state-creation costs and the TIP-1010 per-tx gas cap."""
 
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import ALPHA_USD, PATH_USD
 
-from .utils import fund, new_account, send_calls, transfer_call
+from .utils import funded, new_account, send_call, send_calls, transfer_call
 
 pytestmark = pytest.mark.requires("tempo-native")
 
@@ -15,11 +13,7 @@ TX_GAS_CAP = 30_000_000  # TIP-1010: per-transaction gas limit cap
 
 
 async def _transfer_gas(w3, chain_id, sender, recipient):
-    receipt = await send_calls(
-        w3, chain_id=chain_id, private_key=sender.key.hex(), calls=[transfer_call(recipient, 100)]
-    )
-    assert receipt["status"] == 1
-    return receipt["gasUsed"]
+    return (await send_call(w3, chain_id, sender, **transfer_call(recipient, 100)))["gasUsed"]
 
 
 async def test_estimate_gas_for_transfer(w3, funded_account):
@@ -51,24 +45,18 @@ async def test_estimate_gas_for_0x76_honors_fee_token(w3, funded_account):
 
 
 async def test_receipt_reports_gas_used(w3, chain_id, funded_account):
-    receipt = await send_calls(
-        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 100)]
-    )
-    assert receipt["status"] == 1
+    receipt = await send_call(w3, chain_id, funded_account, **transfer_call(new_account().address, 100))
     assert 0 < receipt["gasUsed"] <= receipt["cumulativeGasUsed"]
 
 
 async def test_effective_gas_price_covers_base_fee(w3, chain_id, funded_account):
-    receipt = await send_calls(
-        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 100)]
-    )
+    receipt = await send_call(w3, chain_id, funded_account, **transfer_call(new_account().address, 100))
     base_fee = (await w3.eth.get_block(receipt["blockNumber"])).get("baseFeePerGas") or 0
     assert receipt["effectiveGasPrice"] >= base_fee
 
 
 async def test_new_balance_slot_costs_state_creation(w3, chain_id, funded_account):
-    """TIP-1000: a transfer creating the recipient's balance slot costs ~250k more
-    than the same transfer to a recipient whose slot already exists."""
+    """TIP-1000: creating the recipient's balance slot costs ~250k more than writing an existing one."""
     fresh = new_account().address
     await _transfer_gas(w3, chain_id, funded_account, funded_account.address)  # warm the sender's account first
     creating = await _transfer_gas(w3, chain_id, funded_account, fresh)  # creates the balance slot
@@ -78,10 +66,8 @@ async def test_new_balance_slot_costs_state_creation(w3, chain_id, funded_accoun
 
 
 async def test_first_tx_pays_account_creation(w3, chain_id, funded_account):
-    """TIP-1000: a sender's first tx (nonce 0) additionally pays account creation.
-    The recipient's balance slot pre-exists, so the sender's account entry is the only diff."""
-    sender, recipient = new_account(), funded_account.address
-    await fund(w3, sender.address)  # creates the balance slot but NOT the account (nonce) entry
+    """TIP-1000: a sender's first tx (nonce 0) also pays account creation; the recipient's slot pre-exists."""
+    sender, recipient = await funded(w3), funded_account.address  # funding creates the balance slot, not the nonce
     first = await _transfer_gas(w3, chain_id, sender, recipient)  # nonce 0 -> 1: creates the account entry
     second = await _transfer_gas(w3, chain_id, sender, recipient)  # existing account
     delta = first - second

@@ -1,12 +1,4 @@
-"""allegro devnet tests: genesis-embedded validator set and block timestamps.
-
-Runs a fresh 2-validator devnet and checks that ``genesis.json`` embeds the
-validator set, every node loads exactly it, consensus finalizes and stays in
-sync, standard eth JSON-RPC and funding work, and block production is not
-throttled by reth timestamp rejections.
-
-Gated on the ``embedded-validators`` capability (allegro); skips elsewhere.
-"""
+"""allegro devnet: the genesis-embedded validator set and block timestamps."""
 
 from __future__ import annotations
 
@@ -24,9 +16,7 @@ pytestmark = pytest.mark.requires("embedded-validators")
 
 N_VALIDATORS = 2
 
-# A broken proposer that reuses the parent's seconds timestamp gets every
-# same-second proposal rejected by reth, capping production at 1 block/s; the
-# fixed proposer is limited only by consensus speed (~8 blocks/s locally).
+# Reusing the parent's seconds timestamp caps reth at 1 block/s; a fixed proposer makes ~8/s locally.
 MEASURE_SECONDS = 10
 MIN_BLOCKS = 15
 
@@ -58,9 +48,7 @@ def test_all_nodes_load_the_full_validator_set(valset_cluster):
 async def test_consensus_finalizes_and_stays_in_sync(valset_cluster):
     """Blocks advance past genesis on every node and heights track together."""
     async with rpc_all(valset_cluster) as clients:
-        start = {}
-        for i, w3 in enumerate(clients):
-            start[i] = await w3.eth.block_number
+        start = [await w3.eth.block_number for w3 in clients]
         deadline = time.time() + 20
         while time.time() < deadline:
             heights = [await w3.eth.block_number for w3 in clients]

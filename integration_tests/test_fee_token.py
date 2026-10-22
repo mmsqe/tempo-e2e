@@ -6,22 +6,19 @@ from tempo import Signer, serialize, sign_transaction
 from tempo.constants import ALPHA_USD, BETA_USD, PATH_USD, THETA_USD
 
 from .utils import (
-    build_tempo_tx,
     fund_token,
     gas_cost_in_token,
     new_account,
+    prepare_tx,
     seed_fee_pool,
-    send_tempo_tx,
-    suggested_max_fee,
+    send_calls,
     transfer_call,
 )
 
 pytestmark = pytest.mark.tempo
 
 
-# Gas in a non-default fee token is swapped via the FeeAMM, so the token needs a
-# pool. ALPHA_USD is seeded in genesis; BETA/THETA are seeded here via
-# FeeManager.mint. PATH_USD is the default (validator) fee token.
+# A non-default fee token swaps through the FeeAMM, so it needs a pool; only ALPHA_USD has one at genesis.
 @pytest.mark.parametrize("token", [ALPHA_USD, BETA_USD, THETA_USD])
 async def test_gas_paid_in_chosen_stablecoin(w3, chain_id, token):
     await seed_fee_pool(w3, chain_id=chain_id, user_token=token)
@@ -30,14 +27,8 @@ async def test_gas_paid_in_chosen_stablecoin(w3, chain_id, token):
     before = await ERC20.fns.balanceOf(acct.address).call(w3, to=token)
     recipient = new_account().address
 
-    tx = build_tempo_tx(
-        chain_id=chain_id,
-        nonce=0,
-        fee_token=token,
-        max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[transfer_call(recipient, 1000, token)],
-    )
-    receipt = await send_tempo_tx(w3, tx, acct.key.hex())
+    calls = [transfer_call(recipient, 1000, token)]
+    receipt = await send_calls(w3, chain_id=chain_id, private_key=acct.key.hex(), fee_token=token, calls=calls)
 
     assert receipt["status"] == 1
     assert await ERC20.fns.balanceOf(recipient).call(w3, to=token) == 1000
@@ -47,13 +38,8 @@ async def test_gas_paid_in_chosen_stablecoin(w3, chain_id, token):
 
 async def test_fee_token_without_balance_is_rejected(w3, chain_id, funded_account):
     """funded_account holds only PATH_USD; paying gas in ALPHA_USD must fail."""
-    tx = build_tempo_tx(
-        chain_id=chain_id,
-        nonce=0,
-        fee_token=ALPHA_USD,
-        max_fee_per_gas=await suggested_max_fee(w3),
-        calls=[transfer_call(new_account().address, 1)],
-    )
+    calls = [transfer_call(new_account().address, 1)]
+    tx = await prepare_tx(w3, chain_id, funded_account, calls, fee_token=ALPHA_USD)
     signed = sign_transaction(tx, Signer(funded_account.key.hex()))
     with pytest.raises(Exception):
         await w3.eth.send_raw_transaction(serialize(signed))

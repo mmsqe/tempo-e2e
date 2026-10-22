@@ -1,15 +1,12 @@
-"""TIP-1067 dynamic base fee: a block whose gas exceeds the target raises the next
-block's baseFeePerGas; idle blocks decay it back toward the floor. A burst of
-state-creating transfers congests a block, and the surrounding idle blocks decay.
-"""
+"""TIP-1067 dynamic base fee: a block over the gas target raises the next block's baseFeePerGas, and
+idle blocks decay it toward the floor."""
 
 import asyncio
 
 import pytest
-from web3 import AsyncWeb3
 
 from .network import dev_node
-from .utils import STATE_WRITE_GAS, fund, new_account, send_calls, transfer_call, wait_for_block
+from .utils import STATE_WRITE_GAS, funded, new_account, rpc, send_calls, transfer_call, wait_for_block
 
 pytestmark = pytest.mark.tempo
 
@@ -18,9 +15,8 @@ BASE_FEE_FLOOR = 600_000_000  # cap / 20
 BASE_FEE_CAP = 12_000_000_000
 
 
-# A single AA tx is capped at 32 calls (~8M gas), below the 10M target, so congestion needs
-# several txs packed into one block. The fast default block time mines before the mempool
-# fills, so this module runs on its own 1sec node where concurrent txs accumulate first.
+# One AA tx caps at 32 calls (~8M gas), under the 10M target, so congestion needs several txs per
+# block; the default block time mines before the mempool fills, so this module runs a 1sec node.
 @pytest.fixture(scope="module")
 def basefee_node(tmp_path_factory):
     base = tmp_path_factory.mktemp("basefee")
@@ -34,9 +30,8 @@ def basefee_node(tmp_path_factory):
 
 @pytest.fixture
 async def w3(basefee_node):
-    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(basefee_node.rpc_url))
-    yield client
-    await client.provider.disconnect()
+    async with rpc(basefee_node) as client:
+        yield client
 
 
 @pytest.fixture
@@ -45,8 +40,7 @@ def chain_id(basefee_node) -> int:
 
 
 def _next_base_fee(fee: int, gas: int) -> int:
-    """TIP-1067: EIP-1559's integer update (denominator 8) against the fixed 10M target,
-    clamped to [floor, cap]."""
+    """EIP-1559's integer update (denominator 8) against the fixed 10M target, clamped to [floor, cap]."""
     if gas > GAS_TARGET:
         nxt = fee + max(1, fee * (gas - GAS_TARGET) // GAS_TARGET // 8)
     else:
@@ -54,21 +48,16 @@ def _next_base_fee(fee: int, gas: int) -> int:
     return min(max(nxt, BASE_FEE_FLOOR), BASE_FEE_CAP)
 
 
-async def _load_window(w3, chain_id, *, senders, transfers, gas_limit, tail=8):
-    """Fire one batched tx per sender (each ``transfers`` fresh-account creations), then
-    return the contiguous blocks from just before the first load block through ``tail``
-    blocks past the last one -- covering the fee rise and the idle decay after.
-
-    The window is derived from the receipts, not a fixed offset from ``start``, so it is
-    independent of the dev block time (fast blocks would otherwise outrun the load).
-    """
+async def _load_window(w3, chain_id, *, senders, transfers, tail=8):
+    """Fire one tx of ``transfers`` fresh-account creations per sender; return the blocks from just
+    before the first receipt to ``tail`` past the last, covering the fee rise and the idle decay."""
     receipts = await asyncio.gather(
         *[
             send_calls(
                 w3,
                 chain_id=chain_id,
                 private_key=s.key.hex(),
-                gas_limit=gas_limit,
+                gas_limit=STATE_WRITE_GAS,
                 calls=[transfer_call(new_account().address, 1) for _ in range(transfers)],
             )
             for s in senders
@@ -81,13 +70,10 @@ async def _load_window(w3, chain_id, *, senders, transfers, gas_limit, tail=8):
 
 
 async def test_base_fee_rises_on_congestion_and_decays_when_idle(w3, chain_id):
-    senders = [new_account() for _ in range(6)]
-    for s in senders:
-        await fund(w3, s.address)
+    senders = [await funded(w3) for _ in range(6)]
 
-    # each tx is 30 fresh-account creations (~7.5M gas); on the 1sec node the concurrent txs
-    # accumulate in the mempool, so a block packs several of them well past the 10M target
-    blocks = await _load_window(w3, chain_id, senders=senders, transfers=30, gas_limit=STATE_WRITE_GAS)
+    # each tx is 30 fresh-account creations (~7.5M gas); a block packs several, well past the 10M target
+    blocks = await _load_window(w3, chain_id, senders=senders, transfers=30)
     fee = [b["baseFeePerGas"] for b in blocks]
     gas = [b["gasUsed"] for b in blocks]
 
@@ -98,13 +84,10 @@ async def test_base_fee_rises_on_congestion_and_decays_when_idle(w3, chain_id):
 
 
 async def test_base_fee_follows_the_update_formula(w3, chain_id):
-    """Every observed transition matches the exact TIP-1067 integer formula, and every
-    value stays inside [floor, cap]."""
-    senders = [new_account() for _ in range(3)]
-    for s in senders:
-        await fund(w3, s.address)
+    """Every observed transition matches the TIP-1067 integer formula and stays inside [floor, cap]."""
+    senders = [await funded(w3) for _ in range(3)]
 
-    blocks = await _load_window(w3, chain_id, senders=senders, transfers=20, gas_limit=STATE_WRITE_GAS)
+    blocks = await _load_window(w3, chain_id, senders=senders, transfers=20)
     assert any(b["gasUsed"] > 0 for b in blocks)  # the load landed inside the window
     for prev, nxt in zip(blocks, blocks[1:]):
         assert BASE_FEE_FLOOR <= nxt["baseFeePerGas"] <= BASE_FEE_CAP

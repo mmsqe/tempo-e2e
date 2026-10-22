@@ -1,16 +1,14 @@
-"""Optional P2P sync: ``--consensus.devp2p.finalizations`` gossips finalization certificates over
-devp2p (the ``tempo/1`` subprotocol), so a follower keeps up from its peers when its upstream RPC
-is gone, backlog included."""
+"""``--consensus.devp2p.finalizations`` gossips finalization certificates over devp2p (``tempo/1``), so
+a follower whose upstream RPC is gone keeps up from its peers, backlog included."""
 
 import re
 import subprocess
 
 import pytest
-from tempo.devnet.ports import find_free_base_ports
 from web3 import Web3
 
-from .conftest import _consensus_net_supervisord, _run_devnet_init
-from .network import DEAD_UPSTREAM, FollowerNode, free_port, resolve_tempo_bin, resolve_xtask_bin
+from .conftest import supervisord_net
+from .network import DEAD_UPSTREAM, FollowerNode, free_port, resolve_tempo_bin
 from .utils import poll_height, wait_height
 
 pytestmark = [pytest.mark.tempo, pytest.mark.consensus, pytest.mark.slow]
@@ -26,20 +24,7 @@ def gossip_net(request, tmp_path_factory):
         pytest.skip("consensus localnet not requested (pass --consensus)")
     if GOSSIP not in subprocess.run([resolve_tempo_bin(), "node", "--help"], capture_output=True, text=True).stdout:
         pytest.skip(f"this tempo has no {GOSSIP}")
-    base = tmp_path_factory.mktemp("gossip-net")
-    config = {
-        "chain_id": 1337,
-        "accounts": 20,
-        "seed": 0,
-        "patch_node_flags": [GOSSIP],
-        "tempo_bin": resolve_tempo_bin(),
-        "tempo_xtask_bin": resolve_xtask_bin(),
-        "validators": [
-            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"}
-            for i, port in enumerate(find_free_base_ports(VALIDATORS))
-        ],
-    }
-    yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
+    yield from supervisord_net(request, tmp_path_factory.mktemp("gossip-net"), VALIDATORS, patch_node_flags=[GOSSIP])
 
 
 def _follower(cluster, base, *, gossip: bool) -> FollowerNode:
@@ -81,8 +66,8 @@ def test_without_the_gossip_a_dead_upstream_leaves_a_follower_at_genesis(gossip_
 
 
 def test_a_late_follower_recovers_the_backlog_over_devp2p(gossip_net, tmp_path):
-    """Blocks the follower never saw announced come from its peers too. Now and then a follower has
-    exited doing this, its log ending with the genesis header refused as a payload."""
+    """Blocks the follower never saw announced come from its peers too. Known flake: the follower
+    exits, its log ending with the genesis header refused as a payload."""
     validator = gossip_net.node_rpc_url("node0")
     backlog = wait_height(validator, poll_height(validator) + 20)
     follower = _follower(gossip_net, tmp_path, gossip=True).start()

@@ -15,21 +15,18 @@ from eth_account import Account
 from eth_contract.erc20 import ERC20
 from eth_utils import keccak
 from hexbytes import HexBytes
-from tempo import Builder, Signer, serialize, sign_transaction
+from tempo import Builder, Signer, add_fee_payer_signature, serialize, sign_transaction
 from tempo.constants import (
     ALPHA_USD,
     BETA_USD,
     FEE_MANAGER_ADDRESS,
-    NONCE_ADDRESS,
     PATH_USD,
     THETA_USD,
     TIP20_FACTORY_ADDRESS,
     TIP403_REGISTRY_ADDRESS,
 )
-from tempo.keychain import KeychainSignature
-from tempo.transaction import get_sign_payload
-from tempo.types import as_address
 from web3 import AsyncWeb3, Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 from .abi import FEE, NONCE, TIP20, TIP20_FACTORY, TIP20_ROLES, TIP403
 from .network import FAUCET_PRIVATE_KEY
@@ -48,6 +45,7 @@ WHITELIST, BLACKLIST = 0, 1
 ISSUER_ROLE = keccak(text="ISSUER_ROLE")  # TIP-20 mint role
 
 MAX_UINT = 2**256 - 1  # unlimited ERC-20 approval
+ZERO_ADDRESS = "0x" + "00" * 20
 # TIP-1009 expiring nonces: the reserved nonce key (uint256 max). A tx on this key
 # must carry nonce=0 and a valid_before within 30s; replay protection is hash-based.
 EXPIRING_NONCE_KEY = 2**256 - 1
@@ -60,12 +58,12 @@ STATE_WRITE_GAS = 8_000_000
 FUNDED_AMOUNT = 5_000_000
 SET_CODE_GAS = 500_000  # a 7702 delegation, plus whatever the delegated code then does
 
-# Default KeyRestrictions expiry (year ~2096): the on-chain authorizeKey path needs a real
-# timestamp (0 is ExpiryInPast), unlike the inline sign path's never-expire sentinel.
-NEVER_EXPIRES = 4_000_000_000
+# A timestamp no run reaches (year ~2096): a key that never expires, a fork that never activates.
+# authorizeKey needs a real one, since 0 is ExpiryInPast.
+FAR_FUTURE = 4_000_000_000
 
 
-def key_restrictions(*, expiry=NEVER_EXPIRES, enforce_limits=False, limits=(), allow_any_calls=True, allowed_calls=()):
+def key_restrictions(*, expiry=FAR_FUTURE, enforce_limits=False, limits=(), allow_any_calls=True, allowed_calls=()):
     """A KeyRestrictions ABI tuple: (expiry, enforceLimits, limits[], allowAnyCalls, allowedCalls[])."""
     return (expiry, enforce_limits, list(limits), allow_any_calls, list(allowed_calls))
 
@@ -114,11 +112,8 @@ def funder():
 
 
 async def fund(w3: AsyncWeb3, address: str, timeout: float = 60.0, amount: int = FUNDED_AMOUNT):
-    """Fund ``address`` with the faucet TIP-20 via ``tempo_fundAddress``; await any returned txs.
-
-    A network without the faucet — anything but a devnet — is funded by transfer from
-    [`funder`] instead, which is what lets the suite run against one.
-    """
+    """Fund ``address`` through the faucet's ``tempo_fundAddress``, or by transfer from [`funder`] on a
+    network without one."""
     resp = await w3.provider.make_request("tempo_fundAddress", [AsyncWeb3.to_checksum_address(address)])
     if error := resp.get("error"):
         if error.get("code") != -32601:
@@ -155,12 +150,8 @@ def build_tempo_tx(
     valid_after: int | None = None,
     awaiting_fee_payer: bool = False,
 ):
-    """Build an unsigned tempo (``0x76``) tx. Each call is ``{to (None=create), value?, data?}``.
-
-    Set ``awaiting_fee_payer`` when a fee payer will sponsor gas: the sender then
-    signs a payload that omits ``fee_token`` (the node recomputes the sender hash
-    with ``skip_fee_token`` once a fee-payer signature is present).
-    """
+    """An unsigned tempo (``0x76``) tx; each call is ``{to (None=create), value?, data?}``. With
+    ``awaiting_fee_payer`` the sender's signature leaves out ``fee_token``, for a fee payer to sign."""
     builder = (
         Builder()
         .chain_id(chain_id)
@@ -193,40 +184,45 @@ async def send_signed(w3: AsyncWeb3, signed, timeout: float = 60.0):
     return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw), timeout=timeout)
 
 
-def sign_tx_registered_key(tx, access_key_sk: str, account):
-    """Sign ``tx`` with an access key already authorized on-chain.
-
-    A bare Keychain V2 signature with no inline authorization: the node resolves
-    the key from ``account``'s stored keychain, so only the root's address is
-    needed, not its private key.
-    """
-    root_addr = as_address(account)
-    inner = Signer(access_key_sk).sign(KeychainSignature.signing_hash(get_sign_payload(tx), root_addr))
-    return tx._replace_fields(sender_signature=KeychainSignature.from_inner(inner, root_addr), sender_address=root_addr)
-
-
-async def prepare_tx(w3: AsyncWeb3, chain_id: int, sender, calls: Sequence[dict], *, gas_limit: int = STATE_WRITE_GAS):
-    """An unsigned tempo tx from ``sender`` over ``calls``, with nonce and fee filled (gas in PATH_USD).
-
-    For custom-signature paths (access keys, keychain) that sign and broadcast separately;
-    root-key flows should prefer ``send_calls``/``send_call``.
-    """
+async def prepare_tx(
+    w3: AsyncWeb3,
+    chain_id: int,
+    sender,
+    calls: Sequence[dict],
+    *,
+    gas_limit: int = STATE_WRITE_GAS,
+    fee_token: str = PATH_USD,
+    awaiting_fee_payer: bool = False,
+):
+    """An unsigned tempo tx from ``sender`` over ``calls``, with nonce and fee filled, for a caller that
+    signs or sends it some other way than ``send_calls``."""
     return build_tempo_tx(
         chain_id=chain_id,
         nonce=await get_nonce(w3, sender.address),
-        fee_token=PATH_USD,
+        fee_token=fee_token,
         gas_limit=gas_limit,
         max_fee_per_gas=await suggested_max_fee(w3),
         calls=calls,
+        awaiting_fee_payer=awaiting_fee_payer,
     )
 
 
-async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None) -> str:
-    """eth_call that MUST revert; return the joined error message+data for assertions.
+async def sign_sponsored(w3: AsyncWeb3, chain_id: int, sender, payer, calls: Sequence[dict]):
+    """A tx from ``sender`` over ``calls`` whose gas ``payer`` pays, signed by both."""
+    tx = await prepare_tx(w3, chain_id, sender, calls, awaiting_fee_payer=True)
+    return add_fee_payer_signature(sign_transaction(tx, Signer(sender.key.hex())), Signer(payer.key.hex()))
 
-    Tempo precompiles surface the custom error name in the message (e.g. "PolicyForbids")
-    and the 4-byte selector in ``data``, so callers can match on either.
-    """
+
+async def rpc_result(w3: AsyncWeb3, method: str, params: Sequence = ()):
+    """``method``'s result; fails the test on a JSON-RPC error."""
+    resp = await w3.provider.make_request(method, list(params))
+    assert "error" not in resp, f"{method} failed: {resp['error']}"
+    return resp["result"]
+
+
+async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None) -> str:
+    """``eth_call`` that must revert; the error message and data joined, so a test can match a precompile's
+    error name or selector."""
     tx = {"to": to, "data": data if isinstance(data, str) else "0x" + bytes(data).hex()}
     if sender is not None:
         tx["from"] = sender
@@ -248,12 +244,7 @@ async def send_calls(
     max_priority_fee_per_gas: int = DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
     max_fee_per_gas: int | None = None,
 ):
-    """Build, sign, and send a tempo tx from ``calls``, filling nonce and fees.
-
-    ``max_fee_per_gas`` defaults to a comfortable multiple of the current base fee
-    plus the tip; pass it together with ``max_priority_fee_per_gas`` to drive the
-    fee market explicitly (e.g. EIP-1559 / priority-fee tests).
-    """
+    """Build, sign and send a tempo tx over ``calls``, filling the nonce and a fee above the base fee."""
     sender = Account.from_key(private_key).address
     if nonce is None:
         nonce = await get_nonce(w3, sender)
@@ -303,16 +294,15 @@ async def send_call(
     return receipt
 
 
-async def send_type_2(w3: AsyncWeb3, account, to: str, data, *, gas: int | None = None):
-    """A plain EIP-1559 transaction from ``account``, asserting success. It is what
-    ``eth_estimateGas`` models, and unlike a tempo tx it names no fee token, so the payer's own
-    setting decides. The limit is the estimate unless given: TIP-1016 charges per new slot."""
+async def send_type_2(w3: AsyncWeb3, account, to: str, data, *, gas: int | None = None, value: int = 0):
+    """A plain EIP-1559 tx from ``account``, asserting success. It names no fee token, so the payer's own
+    setting decides; gas defaults to the estimate, since TIP-1016 charges per new slot."""
     if gas is None:
-        gas = await w3.eth.estimate_gas({"to": to, "from": account.address, "data": data})
+        gas = await w3.eth.estimate_gas({"to": to, "from": account.address, "data": data, "value": value})
     tx = {
         "to": to,
         "data": data,
-        "value": 0,
+        "value": value,
         "nonce": await w3.eth.get_transaction_count(account.address),
         "chainId": await w3.eth.chain_id,
         "gas": gas,
@@ -333,10 +323,8 @@ async def latest_timestamp(w3: AsyncWeb3) -> int:
 async def active_forks(w3: AsyncWeb3) -> set[str]:
     """The hardforks the node reports as active, named as ``tempo_forkSchedule`` names them,
     so a test can state what each fork brings instead of pinning one binary."""
-    resp = await w3.provider.make_request("tempo_forkSchedule", [])
-    if resp.get("error"):
-        raise RuntimeError(f"tempo_forkSchedule failed: {resp['error']}")
-    return {fork["name"].upper() for fork in resp["result"]["schedule"] if fork["active"]}
+    schedule = (await rpc_result(w3, "tempo_forkSchedule"))["schedule"]
+    return {fork["name"].upper() for fork in schedule if fork["active"]}
 
 
 async def wait_for_block(w3: AsyncWeb3, number: int, *, timeout: float = 300.0, poll: float = 0.5) -> int:
@@ -378,13 +366,8 @@ async def create_token(
     mint=None,
     salt: bytes = bytes(32),
 ):
-    """Create a TIP-20 via the factory; optionally grant issuer and mint ``(holder, amount)``.
-
-    The address is derived from ``admin`` and ``salt``, so creating more than one token from
-    the same admin needs distinct salts.
-
-    Returns the new token address (read from the factory's TokenCreated event).
-    """
+    """A TIP-20 from the factory, optionally minting ``(holder, amount)``; its address derives from ``admin``
+    and ``salt``."""
     created = await send_calls(
         w3,
         chain_id=chain_id,
@@ -417,7 +400,7 @@ async def create_token(
 
 async def blacklist_token(w3: AsyncWeb3, *, chain_id: int, admin, token: str, blocked: str) -> int:
     """Bind ``token``'s transfer policy to a fresh BLACKLIST policy that rejects ``blocked``."""
-    policy_id = await TIP403.fns.policyIdCounter().call(w3, to=TIP403_REGISTRY_ADDRESS)
+    policy_id = await TIP403.fns.policyIdCounter().call(w3)
     await send_calls(
         w3,
         chain_id=chain_id,
@@ -433,7 +416,7 @@ async def blacklist_token(w3: AsyncWeb3, *, chain_id: int, admin, token: str, bl
         ],
     )
     assert await TIP20.fns.transferPolicyId().call(w3, to=token) == policy_id
-    assert not await TIP403.fns.isAuthorized(policy_id, blocked).call(w3, to=TIP403_REGISTRY_ADDRESS)
+    assert not await TIP403.fns.isAuthorized(policy_id, blocked).call(w3)
     return policy_id
 
 
@@ -441,12 +424,10 @@ async def fund_token(
     w3: AsyncWeb3, *, chain_id: int, to: str, token: str, amount: int, funder_pk: str = FAUCET_PRIVATE_KEY
 ):
     """Transfer ``token`` from the prefunded genesis account, to test paying gas in a non-PATH_USD token."""
-    funder = Account.from_key(funder_pk).address
     return await send_calls(
         w3,
         chain_id=chain_id,
         private_key=funder_pk,
-        nonce=await get_nonce(w3, funder),
         fee_token=token,
         calls=[{"to": token, "data": ERC20.fns.transfer(to, amount).data}],
     )
@@ -461,11 +442,7 @@ async def seed_fee_pool(
     amount: int = 50_000_000_000,
     funder_pk: str = FAUCET_PRIVATE_KEY,
 ):
-    """Mint a FeeAMM pool so gas can be paid in ``user_token``.
-
-    The dev genesis only seeds ``ALPHA_USD``/``PATH_USD``; other stablecoins need
-    a pool first. Gas is paid in ``validator_token`` (needs no pool).
-    """
+    """Mint a FeeAMM pool so gas can be paid in ``user_token``; the dev genesis seeds only the ALPHA_USD pool."""
     funder = Account.from_key(funder_pk).address
     return await send_calls(
         w3,
@@ -492,12 +469,7 @@ async def send_set_code_tx(
     data=b"",
     gas: int = SET_CODE_GAS,
 ):
-    """Sponsor sends a type-0x04 tx delegating ``authority`` (which signs the authorization) to
-    ``delegate``; the sponsor pays gas and supplies the outer transaction.
-
-    Shared: one suite watches the delegation itself, one what the borrowed code does under the
-    authority's own address.
-    """
+    """A type-0x04 tx from ``sponsor`` delegating ``authority``, which signs the authorization, to ``delegate``."""
     signed_auth = Account.sign_authorization(
         {"chainId": chain_id, "address": AsyncWeb3.to_checksum_address(delegate), "nonce": auth_nonce}, authority.key
     )
@@ -530,28 +502,7 @@ async def get_nonce(w3: AsyncWeb3, address: str, nonce_key: int = 0) -> int:
     """Current nonce for ``address``: the account nonce for key 0, else the Nonce precompile."""
     if nonce_key == 0:
         return await w3.eth.get_transaction_count(AsyncWeb3.to_checksum_address(address))
-    return await NONCE.fns.getNonce(address, nonce_key).call(w3, to=NONCE_ADDRESS)
-
-
-async def fund_via_transfer(w3: AsyncWeb3, funder_key: str, address: str, amount: int) -> str:
-    """Fund ``address`` with a plain EIP-1559 transfer from ``funder_key``; await the receipt."""
-    funder = Account.from_key(funder_key)
-    base_fee = (await w3.eth.get_block("latest")).get("baseFeePerGas") or 0
-    priority = Web3.to_wei(1, "gwei")
-    tx = {
-        "chainId": await w3.eth.chain_id,
-        "nonce": await w3.eth.get_transaction_count(funder.address, "pending"),
-        "to": AsyncWeb3.to_checksum_address(address),
-        "value": amount,
-        "gas": 21_000,
-        "maxPriorityFeePerGas": priority,
-        "maxFeePerGas": base_fee * 2 + priority,
-        "type": 2,
-    }
-    signed = funder.sign_transaction(tx)
-    tx_hash = await w3.eth.send_raw_transaction(signed.raw_transaction)
-    await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60.0)
-    return tx_hash.hex()
+    return await NONCE.fns.getNonce(address, nonce_key).call(w3)
 
 
 # ── Devnet clusters and RPC transports ─────────────────────────────────────
@@ -559,8 +510,10 @@ async def fund_via_transfer(w3: AsyncWeb3, funder_key: str, address: str, amount
 
 @asynccontextmanager
 async def rpc(node):
-    """An RPC client for `node`, disconnected on the way out."""
-    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(node.rpc_url))
+    """An RPC client for ``node`` or its URL, disconnected on the way out."""
+    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(getattr(node, "rpc_url", node)))
+    # A consensus node's headers carry DKG payloads in extraData, past web3.py's 32-byte cap.
+    client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     try:
         yield client
     finally:
@@ -575,12 +528,8 @@ async def rpc_all(nodes):
 
 
 def cluster_fixture(name: str, validators: int, *, env: dict[str, str] | None = None, warmup: float = 0.0):
-    """A module-scoped fixture yielding a started `validators`-node devnet.
-
-    `env` is applied to the environment the nodes inherit and restored after;
-    `warmup` gives consensus time to get past the first few views before the
-    tests look at it. Skips on backends without ``make_cluster``.
-    """
+    """A module-scoped fixture yielding a started ``validators``-node devnet, ``env`` set for its nodes and
+    ``warmup`` seconds to settle; skips on backends without ``make_cluster``."""
 
     @pytest.fixture(scope="module")
     def _cluster(request, driver, tmp_path_factory):

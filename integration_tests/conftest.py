@@ -15,15 +15,14 @@ from tempo.devnet.cli import init as devnet_init
 from tempo.devnet.cluster import ClusterCLI
 from tempo.devnet.ports import find_free_base_ports
 from tempo.devnet.supervisor import SUPERVISOR_CONFIG_FILE
-from web3 import AsyncWeb3, Web3
-from web3.middleware import ExtraDataToPOAMiddleware
+from web3 import Web3
 
 from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
 from .drivers import get_driver
 from .drivers.base import CAP_CONSENSUS_NET, CAP_INDEXER, CAP_TEMPO_NATIVE
 from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin
-from .utils import new_account
+from .utils import new_account, rpc
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -40,6 +39,8 @@ def pytest_configure(config):
     # Set before the `tempo` fixture builds the command line.
     if config.getoption("--tidx"):
         os.environ["TEMPO_HTTP_ADDR"] = "0.0.0.0"
+    if config.getoption("--tempo-bin"):
+        os.environ["TEMPO_BIN"] = config.getoption("--tempo-bin")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -67,21 +68,11 @@ def driver(request):
 
 @pytest.fixture(scope="session")
 def tempo(request, driver, tmp_path_factory):
-    """A single dev node for the session, from the active backend.
-
-    By default launches a fresh dev node (tempo's ``--dev`` node, or a solo
-    validator for consensus backends) and tears it down at the end. With
-    ``--tempo-rpc URL`` (or ``$TEMPO_RPC``) it instead attaches to an
-    already-running node and leaves it running; ``--tempo-ws`` supplies that
-    node's WebSocket URL for the eth_subscribe tests.
-    """
+    """The session's node: a fresh dev node from the backend, or the running one ``--tempo-rpc`` names."""
     rpc_url = request.config.getoption("--tempo-rpc")
     if rpc_url:
         yield ExternalNode(rpc_url, request.config.getoption("--tempo-ws")).wait_for_rpc()
         return
-
-    if request.config.getoption("--tempo-bin"):
-        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
 
     base = tmp_path_factory.mktemp(driver.name)
     node = driver.dev_node(base, log_name=f"{driver.name}.log")
@@ -96,11 +87,8 @@ def tempo(request, driver, tmp_path_factory):
 
 @pytest.fixture
 async def w3(tempo):
-    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(tempo.rpc_url))
-    # A consensus node's headers carry DKG payloads in extraData, past web3.py's 32-byte cap.
-    client.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-    yield client
-    await client.provider.disconnect()
+    async with rpc(tempo) as client:
+        yield client
 
 
 @pytest.fixture
@@ -110,12 +98,7 @@ def chain_id(tempo) -> int:
 
 @pytest.fixture(scope="session")
 def tidx(request, driver, tempo, tmp_path_factory):
-    """tempoxyz/tidx indexing the session node, as a differential oracle (``--tidx``).
-
-    Skips rather than fails when docker or the image is missing, so a developer
-    without them still gets the rest of the suite. Session-scoped: the stack takes
-    tens of seconds to come up and backfill.
-    """
+    """tempoxyz/tidx indexing the session node (``--tidx``); skips without docker or its image."""
     if not request.config.getoption("--tidx"):
         pytest.skip("tidx oracle not requested (pass --tidx)")
     # tidx decodes tempo's block shape, not plain Ethereum's: it requires the
@@ -187,27 +170,31 @@ def _wait_all_running(cluster: ClusterCLI, timeout: float = 30.0) -> None:
     raise RuntimeError(f"supervisord did not start all nodes; see {cluster.data_dir}")
 
 
-def _wait_for_finalization(cluster, timeout: float = 120.0) -> None:
-    """Wait until node0 finalizes a block via consensus (not just produces one).
-
-    Works for both the supervisord ``ClusterCLI`` and the ``DockerCluster``:
-    both expose ``node_rpc_url`` and a crash-listing method (``_crashed_nodes``).
-    """
-    w3 = Web3(Web3.HTTPProvider(cluster.node_rpc_url("node0")))
+def _wait_until(cluster, ready, what: str, timeout: float) -> None:
+    """Poll ``ready()`` until it holds, failing at once if a node crashes."""
     deadline = time.time() + timeout
     last_err: Exception | None = None
     while time.time() < deadline:
-        crashed = _crashed_nodes(cluster)
-        if crashed:
-            raise RuntimeError(f"validators crashed: {crashed}; see {cluster.data_dir}")
+        if crashed := _crashed_nodes(cluster):
+            raise RuntimeError(f"nodes crashed: {crashed}; see {cluster.data_dir}")
         try:
-            finalized = (w3.provider.make_request("consensus_getLatest", []).get("result") or {}).get("finalized")
-            if finalized and finalized.get("view", 0) >= 1 and w3.eth.block_number >= 1:
+            if ready():
                 return
-        except Exception as e:  # noqa: BLE001 - consensus warming up
+        except Exception as e:  # noqa: BLE001 - still coming up
             last_err = e
         time.sleep(1.0)
-    raise TimeoutError(f"consensus did not finalize within {timeout}s (last error: {last_err})")
+    raise TimeoutError(f"{what} within {timeout}s (last error: {last_err})")
+
+
+def _wait_for_finalization(cluster, timeout: float = 120.0) -> None:
+    """Wait until node0 finalizes a block through consensus."""
+    w3 = Web3(Web3.HTTPProvider(cluster.node_rpc_url("node0")))
+
+    def finalized():
+        latest = (w3.provider.make_request("consensus_getLatest", []).get("result") or {}).get("finalized")
+        return latest and latest.get("view", 0) >= 1 and w3.eth.block_number >= 1
+
+    _wait_until(cluster, finalized, "consensus did not finalize", timeout)
 
 
 def _crashed_nodes(cluster) -> list[str]:
@@ -244,56 +231,51 @@ def _run_devnet_init(base, config: dict, *, gen_compose_file: bool):
     return data_dir
 
 
-def _init_consensus_devnet(request, base, *, docker: bool):
-    """Build a 4-validator devnet config and run ``tempo-devnet init``.
-
-    Returns the resolved ``data_dir``.  In Docker mode the node binary lives in
-    the image (``tempo_bin`` stays the in-image name) and a ``docker-compose.yml``
-    is generated; ``tempo-xtask`` always runs on the host to build genesis + keys.
-    """
-    n = request.config.getoption("--consensus-validators")
-    # Random free base ports (baked into genesis) so runs don't collide with each other or a dev node.
-    config = {
+def _devnet_config(ports: list[int], *, tempo_bin: str, **extra) -> dict:
+    """A ``tempo-devnet`` config with a validator per free base port; xtask always runs on the host."""
+    return {
         "chain_id": 1337,
-        "accounts": 200,
-        "epoch_length": 100,
         "seed": 0,
-        # Docker runs the in-image `tempo`; supervisord runs the host binary.
-        "tempo_bin": "tempo" if docker else resolve_tempo_bin(),
+        "tempo_bin": tempo_bin,
         "tempo_xtask_bin": resolve_xtask_bin(),
-        "validators": [
-            {"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(find_free_base_ports(n))
-        ],
+        "validators": [{"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(ports)],
+        **extra,
     }
-    if docker:
-        config["docker"] = {"image": request.config.getoption("--tempo-image"), "network": "tempo-devnet"}
-    return _run_devnet_init(base, config, gen_compose_file=docker)
 
 
 @pytest.fixture(scope="session")
 def consensus_net(request, tmp_path_factory):
-    """A 4-validator consensus localnet, run by tempo-devnet.
-
-    Opt-in: ``--consensus`` (supervisord) or ``--consensus-docker`` (containers).
-    Yields a cluster handle (``ClusterCLI`` or ``DockerCluster``); both expose
-    ``node_rpc_url`` plus ``start_node``/``stop_node``/``start_all``/``stop_all``,
-    so the consensus tests are identical across both backends.
-    """
+    """A localnet under supervisord (``--consensus``) or docker compose (``--consensus-docker``); both
+    handles expose the same node controls."""
     docker = request.config.getoption("--consensus-docker")
     if not (docker or request.config.getoption("--consensus")):
         pytest.skip("consensus localnet not requested (pass --consensus or --consensus-docker)")
     if docker:
         _skip_unless_docker_image(request)
-    if request.config.getoption("--tempo-bin"):
-        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
 
     base = tmp_path_factory.mktemp("consensus-docker" if docker else "consensus")
-    data_dir = _init_consensus_devnet(request, base, docker=docker)
+    ports = find_free_base_ports(request.config.getoption("--consensus-validators"))
+    # Docker runs the in-image `tempo`; supervisord runs the host binary.
+    config = _devnet_config(ports, tempo_bin="tempo" if docker else resolve_tempo_bin(), accounts=200, epoch_length=100)
+    if docker:
+        config["docker"] = {"image": request.config.getoption("--tempo-image"), "network": "tempo-devnet"}
+    data_dir = _run_devnet_init(base, config, gen_compose_file=docker)
 
     if docker:
-        yield from _consensus_net_docker(request, base, data_dir)
+        yield from _serve_docker_cluster(
+            request, base, data_dir, _wait_for_finalization, label="docker consensus localnet"
+        )
     else:
         yield from _consensus_net_supervisord(request, base, data_dir)
+
+
+def supervisord_net(request, base, validators: int, *, accounts: int = 20, **extra):
+    """A module's own ``validators``-node localnet under supervisord; skips without ``--consensus``."""
+    if not request.config.getoption("--consensus"):
+        pytest.skip("consensus localnet not requested (pass --consensus)")
+    ports = find_free_base_ports(validators)
+    config = _devnet_config(ports, tempo_bin=resolve_tempo_bin(), accounts=accounts, **extra)
+    yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
 
 
 def _consensus_net_supervisord(request, base, data_dir):
@@ -320,15 +302,11 @@ def _consensus_net_supervisord(request, base, data_dir):
             shutil.rmtree(base, ignore_errors=True)
 
 
-def _docker_image_exists(image: str) -> bool:
-    return subprocess.run(["docker", "image", "inspect", image], capture_output=True, text=True).returncode == 0
-
-
 def _skip_unless_docker_image(request) -> None:
     if shutil.which("docker") is None:
         pytest.skip("--consensus-docker requested but the docker CLI is not available")
     image = request.config.getoption("--tempo-image")
-    if not _docker_image_exists(image):
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
         pytest.skip(
             f"--consensus-docker: image {image!r} not found locally. Build/pull it first "
             f"(e.g. `docker buildx bake tempo --load`), or point --tempo-image/$TEMPO_IMAGE at an existing image."
@@ -336,11 +314,8 @@ def _skip_unless_docker_image(request) -> None:
 
 
 def _serve_docker_cluster(request, base, data_dir, wait_ready, *, label):
-    """Bring up ``data_dir``'s compose stack, wait for readiness, yield it, then tear down.
-
-    On failure, surfaces compose stderr and recent container logs (which docker
-    otherwise swallows).  Shared by the single- and two-network docker fixtures.
-    """
+    """Bring up ``data_dir``'s compose stack and yield it once ready, with compose and container logs
+    on failure."""
     cluster = DockerCluster(data_dir)
     try:
         try:
@@ -363,10 +338,6 @@ def _serve_docker_cluster(request, base, data_dir, wait_ready, *, label):
             shutil.rmtree(base, ignore_errors=True)
 
 
-def _consensus_net_docker(request, base, data_dir):
-    yield from _serve_docker_cluster(request, base, data_dir, _wait_for_finalization, label="docker consensus localnet")
-
-
 @pytest.fixture(scope="session")
 def num_validators(request) -> int:
     """Validator count of the consensus localnet (see ``--consensus-validators``)."""
@@ -375,9 +346,8 @@ def num_validators(request) -> int:
 
 @pytest.fixture
 async def consensus_w3(consensus_net):
-    client = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(consensus_net.node_rpc_url("node0")))
-    yield client
-    await client.provider.disconnect()
+    async with rpc(consensus_net.node_rpc_url("node0")) as client:
+        yield client
 
 
 TWO_NET_FOLLOWER = "follower0"
@@ -386,24 +356,18 @@ TWO_NET_PUBLIC = "public0"
 
 
 def _init_two_network_devnet(request, base):
-    """Init a two-network devnet (validators + follower + P2P proxy + public node).
-
-    Docker-only (needs the two bridge networks).  Returns the resolved ``data_dir``.
-    """
+    """Init the docker-only two-network devnet: validators, a follower, a P2P proxy and a public node."""
     n = request.config.getoption("--consensus-validators")
     # n validator port-blocks + 3 more for the follower, proxy, and public node
     # host-published ports (each service needs a full 6-port block).
     ports = find_free_base_ports(n + 3)
     val_ports, follow_port, proxy_port, public_port = ports[:n], ports[n], ports[n + 1], ports[n + 2]
-    config = {
-        "chain_id": 1337,
-        "accounts": 200,
-        "epoch_length": 100,
-        "seed": 0,
-        "tempo_bin": "tempo",  # in-image binary
-        "tempo_xtask_bin": resolve_xtask_bin(),
-        "validators": [{"host": "127.0.0.1", "port": p, "moniker": f"node{i}"} for i, p in enumerate(val_ports)],
-        "docker": {
+    config = _devnet_config(
+        val_ports,
+        tempo_bin="tempo",  # in-image binary
+        accounts=200,
+        epoch_length=100,
+        docker={
             "image": request.config.getoption("--tempo-image"),
             "validator_network": {"name": "tempo-2net-validators", "subnet": "10.90.0.0/24"},
             "public_network": {"name": "tempo-2net-public", "subnet": "10.91.0.0/24"},
@@ -411,44 +375,23 @@ def _init_two_network_devnet(request, base):
             "p2p_proxies": [{"moniker": TWO_NET_PROXY, "port": proxy_port}],
             "public_nodes": [{"moniker": TWO_NET_PUBLIC, "port": public_port}],
         },
-    }
+    )
     return _run_devnet_init(base, config, gen_compose_file=True)
 
 
 def _wait_public_node_synced(cluster, timeout: float = 150.0) -> None:
-    """Wait until the public node has synced its first block from the follower.
-
-    Advancing past genesis proves the whole chain works end to end. Validators
-    bind RPC to their private IP (host-unreachable), so the public node's own
-    published port is the observation point.
-    """
+    """Wait until the public node syncs block 1 from the follower; validators' RPC is not reachable
+    from the host."""
     w3 = Web3(Web3.HTTPProvider(cluster.node_rpc_url(TWO_NET_PUBLIC)))
-    deadline = time.time() + timeout
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        crashed = _crashed_nodes(cluster)
-        if crashed:
-            raise RuntimeError(f"containers crashed: {crashed}; see {cluster.data_dir}")
-        try:
-            if w3.eth.block_number >= 1:
-                return
-        except Exception as e:
-            last_err = e
-        time.sleep(1.0)
-    raise TimeoutError(f"public node did not sync within {timeout}s (last error: {last_err})")
+    _wait_until(cluster, lambda: w3.eth.block_number >= 1, "public node did not sync", timeout)
 
 
 @pytest.fixture(scope="session")
 def two_network_net(request, tmp_path_factory):
-    """Two-network devnet: follower + P2P proxy + public node (Docker only).
-
-    Reach any node from the host via ``cluster.node_rpc_url(<moniker>)``.
-    """
+    """The two-network devnet (``--consensus-docker``); reach a node with ``cluster.node_rpc_url(moniker)``."""
     if not request.config.getoption("--consensus-docker"):
         pytest.skip("two-network topology requires --consensus-docker")
     _skip_unless_docker_image(request)
-    if request.config.getoption("--tempo-bin"):
-        os.environ["TEMPO_BIN"] = request.config.getoption("--tempo-bin")
 
     base = tmp_path_factory.mktemp("two-network")
     data_dir = _init_two_network_devnet(request, base)

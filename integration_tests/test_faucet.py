@@ -5,7 +5,7 @@ from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 
 from .network import FAUCET_AMOUNT
-from .utils import fund, new_account, send_calls
+from .utils import fund, funded, new_account, send_call, transfer_call
 
 pytestmark = pytest.mark.requires("faucet")
 
@@ -29,12 +29,4 @@ async def test_repeated_funding_accumulates(w3):
 
 
 async def test_funded_account_can_spend(w3, chain_id):
-    acct = new_account()
-    await fund(w3, acct.address)
-    receipt = await send_calls(
-        w3,
-        chain_id=chain_id,
-        private_key=acct.key.hex(),
-        calls=[{"to": PATH_USD, "data": ERC20.fns.transfer(new_account().address, 1_000).data}],
-    )
-    assert receipt["status"] == 1
+    await send_call(w3, chain_id, await funded(w3), **transfer_call(new_account().address, 1_000))

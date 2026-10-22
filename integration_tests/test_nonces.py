@@ -2,7 +2,6 @@
 
 import pytest
 from tempo import Signer, serialize, sign_transaction
-from tempo.constants import NONCE_ADDRESS
 
 from .abi import NONCE
 from .utils import build_tempo_tx, get_nonce, new_account, send_tempo_tx, suggested_max_fee, transfer_call
@@ -45,14 +44,14 @@ async def test_replayed_nonce_is_rejected(w3, chain_id, funded_account):
 async def test_nonce_precompile_tracks_increments(w3, chain_id, funded_account):
     """getNonce(account, key) on the Nonce precompile starts at 0 and increments per tx."""
     pk, key = funded_account.key.hex(), 42
-    assert await NONCE.fns.getNonce(funded_account.address, key).call(w3, to=NONCE_ADDRESS) == 0
+    assert await NONCE.fns.getNonce(funded_account.address, key).call(w3) == 0
     for expected in (1, 2):
         await send_tempo_tx(w3, await _transfer_tx(w3, chain_id, nonce=expected - 1, nonce_key=key), pk)
-        assert await NONCE.fns.getNonce(funded_account.address, key).call(w3, to=NONCE_ADDRESS) == expected
+        assert await NONCE.fns.getNonce(funded_account.address, key).call(w3) == expected
     assert await get_nonce(w3, funded_account.address, key) == 2
 
 
 async def test_nonce_precompile_rejects_protocol_key(w3, funded_account):
     """Nonce key 0 is the protocol nonce, held in account state; the precompile reverts."""
     with pytest.raises(Exception):
-        await NONCE.fns.getNonce(funded_account.address, 0).call(w3, to=NONCE_ADDRESS)
+        await NONCE.fns.getNonce(funded_account.address, 0).call(w3)

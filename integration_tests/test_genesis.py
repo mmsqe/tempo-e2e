@@ -1,8 +1,6 @@
-"""What ``tempo-xtask generate-genesis`` writes into the alloc for this chain.
+"""What ``tempo-xtask generate-genesis`` writes into the alloc for this chain; no node needed.
 
-The launch genesis is generated rather than patched by hand, so the contract a chain starts on is
-the runtime the binary embeds. Nothing here needs a node: the generated JSON is the subject.
-"""
+The launch genesis is generated, not hand-patched, so a chain starts on the runtime the binary embeds."""
 
 from __future__ import annotations
 
@@ -79,9 +77,8 @@ def test_the_reserved_stablecoin_is_named_nusd(tmp_path):
 
 
 def test_the_deployment_gas_token_is_what_the_genesis_pays_fees_in(tmp_path):
-    """A temporary token for fees before any stablecoin is bridged: the genesis accounts and the
-    validator hold it and pay in it, the coinbase and the validator take it. The validator is named
-    by address, as a real network's are, so the genesis has to fund it too."""
+    """The genesis accounts and the validator hold and pay in the temporary fee token, and the coinbase
+    and validator take it; the validator is named by address, as a real network's are, so it is funded too."""
     alloc = _alloc(generate_dev_genesis(tmp_path, gas_token_admin="0x" + "11" * 20, validator_address="0x" + "22" * 20))
     [token] = [a for a in alloc if a.startswith("0x20c0") and b"DONOTUSE" in _strings(alloc[a].get("storage", {}))]
     fee_tokens = [v[-40:] for v in alloc[FEE_MANAGER_ADDRESS.lower()]["storage"].values()]

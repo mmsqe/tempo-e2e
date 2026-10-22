@@ -32,8 +32,7 @@ def test_restart_resumes_from_persisted_state(tmp_path):
     block2_hash = w3.eth.get_block(2)["hash"]
     node.stop()
 
-    # Restart on the same datadir: the chain resumes past the persisted tip with
-    # identical history, rather than resetting to genesis.
+    # Same datadir: the chain resumes with identical history instead of resetting to genesis.
     node2 = dev_node(tmp_path, log_name="run2.log")
     node2.start().wait_for_rpc(want_block=height)
     try:

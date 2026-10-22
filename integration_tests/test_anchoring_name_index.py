@@ -17,7 +17,7 @@ from .anchoring import (
     registries,
     registries_by_name,
 )
-from .utils import call_revert, send_call
+from .utils import call_revert, rpc_result, send_call
 
 pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
 
@@ -32,15 +32,8 @@ def tempo(tmp_path_factory):
 
 async def search(w3, name: str, mode: str = "exact", **page) -> list[dict]:
     """``anchoring_searchRegistriesByName``, which only a node running the index answers."""
-    response = await w3.provider.make_request(
-        "anchoring_searchRegistriesByName", [{"name": name, "mode": mode, **page}]
-    )
-    assert "error" not in response, response
-    return response["result"]["registries"]
-
-
-async def status(w3) -> dict:
-    return (await w3.provider.make_request("anchoring_nameIndexStatus", []))["result"]
+    params = [{"name": name, "mode": mode, **page}]
+    return (await rpc_result(w3, "anchoring_searchRegistriesByName", params))["registries"]
 
 
 def ids(rows: list[dict]) -> set[int]:
@@ -50,14 +43,13 @@ def ids(rows: list[dict]) -> set[int]:
 async def indexed(w3, registry_id: int, timeout: float = 30) -> None:
     """Wait until the index has read as far as ``registry_id``."""
     deadline = time.monotonic() + timeout
-    while (await status(w3))["lastId"] < registry_id:
+    while (await rpc_result(w3, "anchoring_nameIndexStatus"))["lastId"] < registry_id:
         assert time.monotonic() < deadline, f"registry {registry_id} not indexed after {timeout} s"
         await asyncio.sleep(0.2)
 
 
 class TestWhatIsIndexed:
-    """Both ways in. The seed corpus arrives in the dump and emits no ``AddRegistry`` log, so
-    finding it proves the index reads state rather than blocks; a later registry proves the rest."""
+    """The dump's seed corpus emits no ``AddRegistry`` log, so finding it proves the index reads state."""
 
     async def test_the_seeded_registries(self, w3):
         """SeedFixture.t.sol's: us-ca1 (1 and 3) and us-ca9 (2), by Alice and Bob."""
@@ -76,7 +68,7 @@ class TestWhatIsIndexed:
         ]
 
     async def test_it_holds_what_the_contract_holds(self, w3):
-        reached = await status(w3)
+        reached = await rpc_result(w3, "anchoring_nameIndexStatus")
         assert reached["lastId"] == reached["registryCount"] != 0
         assert reached["blockNumber"] >= 1, "the index follows blocks, not only the backfill"
 
@@ -117,8 +109,7 @@ class TestQueries:
         await indexed(w3, tail)
 
         for name, mode, expected in (
-            # The numbers `RegistryNameMatchMode` used, so a caller keeps its spelling: 0 is
-            # UNSPECIFIED, which is exact, and 1 says so.
+            # `RegistryNameMatchMode`'s numbers still work: 0 (UNSPECIFIED) and 1 both mean exact.
             (base, "0", both),
             (base, "1", both),
             (base, "exact", both),
@@ -144,8 +135,7 @@ class TestQueries:
         assert all_three <= {r.id for r in await registries(w3, page=Page(limit=200))}
 
     async def test_a_metacharacter_matches_itself(self, w3, chain_id, funded_account):
-        """An index served by LIKE has to escape `%` and `_` or a query turns into a wildcard over
-        every registry; this one seeks bytes, so there is nothing to escape."""
+        """A LIKE-backed index must escape `%` and `_`; this one seeks bytes, so they match themselves."""
         tag = secrets.token_hex(3)
         wild = await new_registry(w3, chain_id, funded_account, f"nx-{tag}-100%-safe_ty")
         plain = await new_registry(w3, chain_id, funded_account, f"nx-{tag}-100-safety")
@@ -185,8 +175,7 @@ class TestRefusals:
             assert response["error"]["code"] == -32602, response
 
     async def test_the_contract_answers_only_exact(self, w3):
-        """Nothing in block execution can read the index, so nodes disagreeing about it — one
-        indexing, one not — cannot make them disagree about a block."""
+        """Block execution cannot read the index, so nodes that disagree about it still agree on blocks."""
         for mode in (2, 3, 4):
             err = await call_revert(w3, ANCHORING_ADDRESS, ANCHORING.fns.registriesByName("us-ca1", mode, Page()).data)
             assert "only exact match is on chain" in err, (mode, err)

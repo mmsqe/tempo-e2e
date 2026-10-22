@@ -1,6 +1,4 @@
-"""TIP-1004 permit (EIP-2612): an owner signs an offline 712 approval so a spender
-can approve+transferFrom in one tx. The 712 domain is {name(), "1", chainId, token}.
-"""
+"""TIP-1004 permit (EIP-2612): an offline 712 approval; the domain is {name(), "1", chainId, token}."""
 
 import pytest
 from eth_abi import encode
@@ -10,7 +8,7 @@ from eth_utils import keccak
 from tempo.constants import PATH_USD
 
 from .abi import TIP20_PERMIT as PERMIT
-from .utils import STATE_WRITE_GAS, call_revert, fund, latest_timestamp, new_account, send_call, send_calls
+from .utils import STATE_WRITE_GAS, call_revert, funded, latest_timestamp, new_account, send_call, send_calls
 
 pytestmark = pytest.mark.tempo
 
@@ -26,33 +24,19 @@ PERMIT_TYPES = {
 }
 
 
-def _sign_permit(owner, *, name, chain_id, token, spender, value, nonce, deadline, key=None):
-    signed = Account.sign_typed_data(
-        key if key is not None else owner.key,  # `key` forges a signature from someone other than `owner`
-        domain_data={"name": name, "version": "1", "chainId": chain_id, "verifyingContract": token},
-        message_types=PERMIT_TYPES,
-        message_data={"owner": owner.address, "spender": spender, "value": value, "nonce": nonce, "deadline": deadline},
-    )
-    return signed.v, signed.r.to_bytes(32, "big"), signed.s.to_bytes(32, "big")
-
-
 async def _fresh_permit(w3, chain_id, owner, spender, value, *, key=None, v_shift=0, deadline_offset=3600):
     """Permit calldata over ``owner``'s current nonce, valid until ``deadline_offset`` seconds from now."""
     nonce = await PERMIT.fns.nonces(owner.address).call(w3, to=PATH_USD)
     name = await PERMIT.fns.name().call(w3, to=PATH_USD)
     deadline = await latest_timestamp(w3) + deadline_offset
-    v, r, s = _sign_permit(
-        owner,
-        name=name,
-        chain_id=chain_id,
-        token=PATH_USD,
-        spender=spender,
-        value=value,
-        nonce=nonce,
-        deadline=deadline,
-        key=key,
+    signed = Account.sign_typed_data(
+        key if key is not None else owner.key,  # `key` forges a signature from someone other than `owner`
+        domain_data={"name": name, "version": "1", "chainId": chain_id, "verifyingContract": PATH_USD},
+        message_types=PERMIT_TYPES,
+        message_data={"owner": owner.address, "spender": spender, "value": value, "nonce": nonce, "deadline": deadline},
     )
-    return PERMIT.fns.permit(owner.address, spender, value, deadline, v + v_shift, r, s).data
+    r, s = signed.r.to_bytes(32, "big"), signed.s.to_bytes(32, "big")
+    return PERMIT.fns.permit(owner.address, spender, value, deadline, signed.v + v_shift, r, s).data
 
 
 async def test_domain_separator_matches_onchain(w3, chain_id):
@@ -67,9 +51,7 @@ async def test_domain_separator_matches_onchain(w3, chain_id):
 
 
 async def test_permit_authorizes_transfer_from(w3, chain_id):
-    owner, spender = new_account(), new_account()
-    await fund(w3, owner.address)
-    await fund(w3, spender.address)  # spender relays the tx and pays its gas
+    owner, spender = await funded(w3), await funded(w3)  # spender relays the tx and pays its gas
     recipient = new_account().address
 
     value = 1000
@@ -94,8 +76,7 @@ async def test_permit_authorizes_transfer_from(w3, chain_id):
 
 
 async def test_expired_permit_reverts(w3, chain_id):
-    owner = new_account()
-    await fund(w3, owner.address)
+    owner = await funded(w3)
     spender = new_account().address
     data = await _fresh_permit(w3, chain_id, owner, spender, 1000, deadline_offset=-1)  # already past
     reason = await call_revert(w3, PATH_USD, data)
@@ -103,8 +84,7 @@ async def test_expired_permit_reverts(w3, chain_id):
 
 
 async def test_permit_wrong_signer_reverts(w3, chain_id):
-    owner, stranger = new_account(), new_account()
-    await fund(w3, owner.address)
+    owner, stranger = await funded(w3), new_account()
     spender = new_account().address
     # a permit naming `owner` but signed by someone else recovers the wrong address
     data = await _fresh_permit(w3, chain_id, owner, spender, 1000, key=stranger.key)
@@ -112,8 +92,7 @@ async def test_permit_wrong_signer_reverts(w3, chain_id):
 
 
 async def test_permit_v_not_normalized(w3, chain_id):
-    owner = new_account()
-    await fund(w3, owner.address)
+    owner = await funded(w3)
     spender = new_account().address
     # tempo requires v in {27, 28} and does NOT normalize {0, 1} (many signing libs emit the latter)
     data = await _fresh_permit(w3, chain_id, owner, spender, 1000, v_shift=-27)
@@ -121,8 +100,7 @@ async def test_permit_v_not_normalized(w3, chain_id):
 
 
 async def test_permit_replay_and_zero_override(w3, chain_id):
-    owner = new_account()
-    await fund(w3, owner.address)
+    owner = await funded(w3)
     spender = new_account().address
 
     data = await _fresh_permit(w3, chain_id, owner, spender, 1000)

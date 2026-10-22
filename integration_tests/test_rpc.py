@@ -1,7 +1,7 @@
 import pytest
 from web3 import Web3
 
-from .utils import RETURN_42_RUNTIME, new_account, send_calls, transfer_call
+from .utils import RETURN_42_RUNTIME, new_account, send_call, transfer_call
 
 pytestmark = pytest.mark.requires("tempo-native")
 
@@ -15,18 +15,14 @@ async def test_node_is_not_syncing(w3):
 
 
 async def test_get_transaction_by_hash(w3, chain_id, funded_account):
-    receipt = await send_calls(
-        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 1)]
-    )
+    receipt = await send_call(w3, chain_id, funded_account, **transfer_call(new_account().address, 1))
     tx = await w3.eth.get_transaction(receipt["transactionHash"])
     assert tx["hash"] == receipt["transactionHash"]
     assert tx["type"] == 0x76  # the native tempo AA transaction type
 
 
 async def test_block_receipts_include_the_transaction(w3, chain_id, funded_account):
-    receipt = await send_calls(
-        w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 1)]
-    )
+    receipt = await send_call(w3, chain_id, funded_account, **transfer_call(new_account().address, 1))
     receipts = await w3.eth.get_block_receipts(receipt["blockNumber"])
     assert any(r["transactionHash"] == receipt["transactionHash"] for r in receipts)
 
@@ -40,7 +36,6 @@ async def test_call_with_state_override(w3):
 
 
 async def test_dev_blocks_have_no_consensus_context(w3):
-    """TIP-1031: the consensusContext header field is optional and only set by
-    consensus-produced blocks -- a dev-mode block omits it entirely."""
+    """TIP-1031: only consensus-produced blocks set the optional consensusContext header field."""
     block = await w3.eth.get_block("latest")
     assert block.get("consensusContext") is None

@@ -1,18 +1,14 @@
 """EIP-7702 set-code: a type-0x04 authorization list delegates an EOA to ``0xef0100 || impl``.
 
-The implementation only reads (returns a constant), sidestepping tempo's storage-credit
-accounting for writes from a fresh account; the sponsor pays gas in the default stablecoin.
-"""
+The implementation only reads, sidestepping storage-credit accounting for a fresh account's writes."""
 
 import pytest
 from hexbytes import HexBytes
 from web3 import AsyncWeb3
 
-from .utils import RETURN_42_INIT, deploy_contract, new_account, send_set_code_tx
+from .utils import RETURN_42_INIT, ZERO_ADDRESS, deploy_contract, new_account, send_set_code_tx
 
 pytestmark = pytest.mark.requires("tempo-native")
-
-ZERO_ADDRESS = "0x" + "00" * 20
 
 
 def _designator(delegate: str) -> HexBytes:
@@ -29,8 +25,7 @@ async def test_set_code_delegation_installs_and_executes(w3, chain_id, funded_ac
     authority = new_account()  # fresh EOA, nonce 0, no code
     assert await w3.eth.get_code(authority.address) == b""
 
-    # `to == authority`: the same tx installs the delegation and calls into it, so the
-    # implementation's RETURN(42) runs in the authority's context.
+    # `to == authority`: one tx installs the delegation and runs RETURN(42) in the authority's context.
     receipt = await send_set_code_tx(
         w3,
         chain_id=chain_id,

@@ -6,14 +6,13 @@ from tempo import Signer
 from tempo.constants import PATH_USD
 from tempo.keychain import sign_tx_access_key
 
-from .utils import fund, new_account, prepare_tx, send_signed, transfer_call
+from .utils import funded, new_account, prepare_tx, send_signed, transfer_call
 
 pytestmark = pytest.mark.tempo
 
 
 async def test_admin_access_key_authorizes_transfer(w3, chain_id):
-    root = new_account()
-    await fund(w3, root.address)
+    root = await funded(w3)
     access_key = new_account()
     recipient = new_account().address
 

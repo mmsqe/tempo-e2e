@@ -93,10 +93,7 @@ def genesis_with_anchoring(
     fork_times: dict[str, int] | None = None,
 ) -> Path:
     """The dev genesis plus the contract as T12 leaves it: the proxy at ``ANCHORING_ADDRESS`` over
-    ``storage``, if given, and its implementation.
-
-    What the generator itself writes is `test_genesis.py`'s subject.
-    """
+    ``storage``, and its implementation."""
     base = generate_dev_genesis(output_dir / "xtask", fork_times=fork_times) if fork_times else default_genesis()
     genesis = json.loads(base.read_text())
     alloc = genesis["alloc"]

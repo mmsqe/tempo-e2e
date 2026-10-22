@@ -6,7 +6,7 @@ import pytest
 from tempo.constants import PATH_USD
 from web3 import AsyncWeb3, WebSocketProvider
 
-from .utils import TRANSFER_TOPIC, new_account, send_calls, transfer_call
+from .utils import TRANSFER_TOPIC, new_account, send_call, transfer_call
 
 pytestmark = pytest.mark.requires("tempo-native")
 
@@ -39,8 +39,6 @@ async def test_subscribe_logs(w3, chain_id, ws_url, funded_account):
     async with AsyncWeb3(WebSocketProvider(ws_url)) as ws:
         await ws.eth.subscribe("logs", {"address": PATH_USD})
         # Trigger a transfer over HTTP; its Transfer log should arrive on the socket.
-        await send_calls(
-            w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=[transfer_call(new_account().address, 3)]
-        )
+        await send_call(w3, chain_id, funded_account, **transfer_call(new_account().address, 3))
         log = await _first_notification(ws)
     assert log["topics"][0] == TRANSFER_TOPIC

@@ -1,16 +1,6 @@
-"""Indexer JSON-RPC: ``eth_getTransactions`` and the ``token_`` namespace.
+"""Indexer JSON-RPC (``eth_getTransactions``, ``token_``): tempo's handlers are stubs, allegro implements them.
 
-tempo declares these methods (``crates/node/src/rpc/{eth_ext,token}``) but every
-handler returns ``unimplemented``, so that schema is the whole specification and
-allegro is the intended implementation.
-
-One class per tier, weakest evidence first -- registered, then correct against the
-chain, then agreed with a second indexer -- each declaring what it needs once, as
-its ``pytestmark``.
-
-"Filters" here are the query-filter objects these endpoints take, not
-``test_filters.py``'s ``eth_getLogs``. And none of these methods take a block tag,
-so answers are only eventually consistent: assertions poll through ``_eventually``.
+No method takes a block tag, so answers are eventually consistent and assertions poll through ``_eventually``.
 """
 
 from __future__ import annotations
@@ -26,7 +16,7 @@ from tempo.constants import PATH_USD
 from web3 import AsyncWeb3
 
 from .drivers.base import CAP_INDEXER, CAP_INDEXER_RPC, CAP_TEMPO_NATIVE
-from .utils import ISSUER_ROLE, create_token, new_account
+from .utils import ISSUER_ROLE, create_token, new_account, rpc_result
 
 pytestmark = pytest.mark.requires(CAP_INDEXER_RPC)
 # A live index actually answers, rather than the handler merely existing.
@@ -38,8 +28,7 @@ INVALID_PARAMS = -32602
 SOME_ADDRESS = "0x0000000000000000000000000000000000000001"
 SOME_ROLE = "0x" + "00" * 31 + "01"
 INDEXER_LAG = 60.0  # generous: an ExEx commits a block behind, a sidecar polls
-# How far back the completeness walk goes. A full-history walk would grow with every
-# test that ran before it, and a dropped block is no rarer near the tip.
+# Completeness walk depth: full history grows with every earlier test, and drops are no rarer near the tip.
 WALK_BLOCKS = 200
 
 # TIP-20 role audit trail; token_getRoleHistory is a projection of this log.
@@ -49,33 +38,17 @@ ROLE_MEMBERSHIP_UPDATED = keccak(text="RoleMembershipUpdated(bytes32,address,add
 # ------------------------------------------------------------------- helpers
 
 
-async def _raw(w3: AsyncWeb3, method: str, params: list) -> dict:
-    return await w3.provider.make_request(method, params)
-
-
-async def _call(w3: AsyncWeb3, method: str, params: list):
-    """``result`` of a successful call; fails the test on any JSON-RPC error."""
-    resp = await _raw(w3, method, params)
-    assert "error" not in resp, f"{method}{params} failed: {resp['error']}"
-    return resp["result"]
-
-
 def _code(resp: dict) -> int | None:
     return (resp.get("error") or {}).get("code")
 
 
 def _hex(value) -> str:
-    """Hashes and addresses compare as lowercase 0x-strings whichever side they came
-    from -- web3 hands back HexBytes, tidx serializes BYTEA as 0x-text."""
+    """A lowercase 0x-string, so web3's HexBytes and tidx's BYTEA text compare equal."""
     return HexBytes(value).to_0x_hex().lower()
 
 
 async def _eventually(fn, *, timeout: float = INDEXER_LAG, poll: float = 0.5, what: str = "the indexer to catch up"):
-    """Poll ``fn`` until it returns something truthy, then return it.
-
-    With no block tag to pin a read to the tip, a merely *late* answer is
-    indistinguishable from a wrong one until the deadline.
-    """
+    """Poll ``fn`` until it returns something truthy, then return it."""
     deadline = time.monotonic() + timeout
     while True:
         last = await fn()
@@ -96,8 +69,7 @@ BASE = {
     "token_getTokensByAddress": {"address": SOME_ADDRESS},
 }
 
-# Every documented filter field, so a rename or a dropped field fails here rather than
-# silently returning unfiltered results once a backend implements them.
+# Every documented filter field, so a renamed or dropped one fails here instead of silently not filtering.
 FILTERS = {
     "eth_getTransactions": {"from": SOME_ADDRESS, "to": SOME_ADDRESS, "type": "0x76"},
     "token_getTokens": {
@@ -123,17 +95,12 @@ FILTERS = {
     "token_getTokensByAddress": {"symbol": "S"},
 }
 
-# The pagination envelope, which every endpoint flattens beside its own fields rather
-# than nesting -- an easy detail to get wrong when reimplementing.
+# The pagination envelope, flattened beside each endpoint's own fields rather than nested.
 PAGINATION = {"cursor": "cursor-from-a-previous-page", "limit": 10, "sort": {"on": "id", "order": "asc"}}
 
 
 def _case(method, params, case):
-    """One wire case, gated so it only runs where the namespace exists.
-
-    ``eth_getTransactions`` is chain-generic; ``token_`` needs TIP-20. Marking
-    per-parameter rather than per-test keeps one table covering both backends.
-    """
+    """One wire case; a ``token_`` case needs TIP-20, so it is marked per parameter."""
     marks = [] if method.startswith("eth_") else [pytest.mark.requires(CAP_TEMPO_NATIVE)]
     return pytest.param(method, params, case, marks=marks, id=f"{method}-{case}")
 
@@ -142,47 +109,39 @@ ACCEPTED = [
     *(_case(m, p, "bare") for m, p in BASE.items()),
     *(_case(m, {**p, **PAGINATION}, "pagination") for m, p in BASE.items()),
     *(_case(m, {**BASE[m], "filters": f}, "filters") for m, f in FILTERS.items()),
-    # Unknown keys are accepted deliberately: rejecting them would break a client
-    # built against a newer schema, and with it rolling upgrades.
+    # Unknown keys are accepted: rejecting them would break newer clients during rolling upgrades.
     *(_case(m, {**p, "filters": {"fieldFromAFutureRelease": 1}}, "unknown-filter") for m, p in BASE.items()),
 ]
 
-# Params the node must *reject* -- these guard the schema from the other side, so a
-# permissive rewrite that accepts anything fails too.
+# Params the node must reject, so a rewrite that accepts anything fails too.
 REJECTED = [
     _case("eth_getTransactions", [], "no params at all"),
     _case("eth_getTransactions", [{"limit": "ten"}], "limit must be a number"),
     _case("eth_getTransactions", [{"filters": {"from": "notanaddress"}}], "from must be an address"),
     _case("eth_getTransactions", [{"sort": {"on": "blockNumber", "order": "sideways"}}], "order is asc|desc"),
-    # `Sort::order` carries no serde default, so a sort missing it is malformed --
-    # a backend that defaults it accepts requests the others reject.
+    # `Sort::order` has no serde default, so a sort without it is malformed.
     _case("eth_getTransactions", [{"sort": {"on": "blockNumber"}}], "sort needs an order"),
     _case("token_getTokensByAddress", [{}], "address is required"),
 ]
 
 
 class TestWireContract:
-    """The methods are registered and their params deserialize.
-
-    Passes against tempo's stubs on purpose -- it pins the contract before any backend
-    implements it, so ``-32603 unimplemented`` counts. ``-32601`` means a method went
-    missing, ``-32602`` that a param shape drifted.
-    """
+    """The methods are registered and their params deserialize; tempo's ``-32603 unimplemented`` passes."""
 
     @pytest.mark.parametrize("method, params, case", ACCEPTED)
     async def test_params_are_accepted(self, w3, method, params, case):
-        assert _code(await _raw(w3, method, [params])) not in (METHOD_NOT_FOUND, INVALID_PARAMS), (
+        assert _code(await w3.provider.make_request(method, [params])) not in (METHOD_NOT_FOUND, INVALID_PARAMS), (
             f"{method} did not accept its {case} params"
         )
 
     @pytest.mark.parametrize("method, params, why", REJECTED)
     async def test_malformed_params_are_rejected(self, w3, method, params, why):
-        assert _code(await _raw(w3, method, params)) == INVALID_PARAMS, why
+        assert _code(await w3.provider.make_request(method, params)) == INVALID_PARAMS, why
 
 
 async def _page(w3, filters: dict, **params) -> dict:
     """One page of ``eth_getTransactions``, as the full response envelope."""
-    return await _call(w3, "eth_getTransactions", [{"filters": filters, "limit": 100, **params}])
+    return await rpc_result(w3, "eth_getTransactions", [{"filters": filters, "limit": 100, **params}])
 
 
 async def _rows(w3, filters: dict, **params) -> list[dict]:
@@ -212,11 +171,7 @@ async def _covered(w3, sender, want: set[str]) -> set[str] | None:
 
 
 def _recipient(tx) -> str | None:
-    """A transaction's recipient, checksummed, or None for a creation.
-
-    A tempo native transaction is a batch of calls with no top-level ``to``; its
-    recipient is the first call's.
-    """
+    """A transaction's checksummed recipient (a tempo tx's first call's), or None for a creation."""
     to = tx.get("to") or next((c.get("to") for c in tx.get("calls") or [] if c.get("to")), None)
     return AsyncWeb3.to_checksum_address(to) if to else None
 
@@ -230,11 +185,7 @@ def _recipient_of(receipt, driver) -> str:
 
 
 async def _walk_txs(w3: AsyncWeb3, *, from_block: int) -> list[dict]:
-    """Every transaction from ``from_block`` to the tip, in chain order.
-
-    The shared oracle: the same predicate applied here and to the index must select the
-    same set, whichever field it is on.
-    """
+    """Every transaction from ``from_block`` to the tip, in chain order: the oracle the index must match."""
     txs = []
     for number in range(from_block, await w3.eth.block_number + 1):
         block = await w3.eth.get_block(number, full_transactions=True)
@@ -248,16 +199,12 @@ def _hashes(txs, predicate=lambda _tx: True) -> set[str]:
 
 
 class TestTransactions:
-    """``eth_getTransactions`` against an oracle built from plain ``eth_`` RPC.
-
-    Every backend already serves that oracle, so these run wherever a live index does.
-    """
+    """``eth_getTransactions`` against an oracle built from plain ``eth_`` RPC."""
 
     pytestmark = backed
 
     async def test_get_transactions_matches_a_block_walk(self, driver, w3, chain_id, funded_account):
-        """The ``from`` filter is exactly what walking every block finds -- no extras, no
-        gaps -- and each row lands in the block its receipt reported."""
+        """No extras, no gaps, and each row lands in the block its receipt reported."""
         start = await w3.eth.block_number
         sender = AsyncWeb3.to_checksum_address(funded_account.address)
         receipts = [await driver.send_tx(w3, chain_id, funded_account) for _ in range(3)]
@@ -273,8 +220,7 @@ class TestTransactions:
             assert int(tx["blockNumber"], 16) == blocks[_hex(tx["hash"])]
 
     async def test_cursor_pagination_covers_every_transaction_once(self, driver, w3, chain_id, funded_account):
-        """Walking pages of one must reproduce the single-page result exactly: cursors that
-        skip or repeat rows are the classic indexer bug, and only show up under paging."""
+        """Pages of one reproduce the single-page result: skipped or repeated rows show only under paging."""
         sent = {_hex((await driver.send_tx(w3, chain_id, funded_account))["transactionHash"]) for _ in range(3)}
         unpaged = await _eventually(lambda: _indexed(w3, funded_account.address, sent), what="three txs to be indexed")
         want = [_hex(tx["hash"]) for tx in unpaged["transactions"]]
@@ -308,28 +254,20 @@ class TestTransactions:
         sent = {_hex((await driver.send_tx(w3, chain_id, funded_account))["transactionHash"]) for _ in range(11)}
         await _eventually(lambda: _indexed(w3, funded_account.address, sent), what="11 txs to be indexed")
 
-        page = await _call(w3, "eth_getTransactions", [{"filters": {"from": funded_account.address}}])
+        page = await rpc_result(w3, "eth_getTransactions", [{"filters": {"from": funded_account.address}}])
         assert len(page["transactions"]) == 10, "the default page size is not the documented 10"
         assert page["nextCursor"], "a defaulted page that left rows behind reported no cursor"
 
     async def test_limit_is_capped_at_one_hundred(self, w3):
-        """The documented ceiling: an over-large limit must clamp or fail, no stream whole table.
-
-        Bounds rather than proves -- nothing here builds the 100+ transactions that
-        would tell a cap from a small chain.
-        """
-        resp = await _raw(w3, "eth_getTransactions", [{"limit": 10_000}])
+        """An over-large limit must clamp or fail; on a chain under 100 txs this bounds rather than proves."""
+        resp = await w3.provider.make_request("eth_getTransactions", [{"limit": 10_000}])
         if "error" in resp:
             assert _code(resp) == INVALID_PARAMS
         else:
             assert len(resp["result"]["transactions"]) <= 100
 
     async def test_to_filter_matches_a_block_walk(self, driver, w3, chain_id, funded_account):
-        """``to`` selects exactly what a block walk with the same predicate finds.
-
-        Nothing above catches a wrong ``to`` -- or one swapped with ``from`` -- since every
-        row those tests inspect was selected by ``from`` to begin with.
-        """
+        """The other tests select by ``from``, so only this catches a wrong or swapped ``to``."""
         start = await w3.eth.block_number
         receipts = [await driver.send_tx(w3, chain_id, funded_account) for _ in range(3)]
         sent = {_hex(r["transactionHash"]) for r in receipts}
@@ -347,11 +285,7 @@ class TestTransactions:
         assert _hashes(got) == want, "the to filter and the block walk disagree"
 
     async def test_type_filter_selects_only_that_type(self, driver, w3, chain_id, funded_account):
-        """``type`` selects that type and excludes the others.
-
-        Read off the chain rather than named: tempo's ordinary transaction is ``0x76`` and
-        allegro's ``0x2``, so a hard-coded type would only ever run on one backend.
-        """
+        """The type is read off the chain: tempo's ordinary tx is ``0x76``, allegro's ``0x2``."""
         start = await w3.eth.block_number
         receipts = [await driver.send_tx(w3, chain_id, funded_account) for _ in range(2)]
         sent = {_hex(r["transactionHash"]) for r in receipts}
@@ -374,11 +308,7 @@ class TestTransactions:
         assert sent.isdisjoint(_hashes(excluded)), f"type {hex(other)} returned type {hex(tx_type)} txs"
 
     async def test_filters_intersect_rather_than_union(self, driver, w3, chain_id, funded_account):
-        """``from`` and ``to`` together select their intersection.
-
-        A handler that ORs its filters, or keeps only the last, passes every single-filter
-        test above -- it just returns too much.
-        """
+        """A handler that ORs its filters, or keeps only the last, passes every single-filter test."""
         receipts = [await driver.send_tx(w3, chain_id, funded_account) for _ in range(2)]
         sent = {_hex(r["transactionHash"]) for r in receipts}
         sender = AsyncWeb3.to_checksum_address(funded_account.address)
@@ -397,14 +327,7 @@ class TestTransactions:
         assert not _hashes(stranger) & sent, "the from filter was ignored when to was also set"
 
     async def test_every_sender_in_recent_blocks_is_fully_indexed(self, driver, w3, chain_id, funded_account):
-        """Every sender the chain has, the index has -- with all of their transactions.
-
-        The tests above only inspect transactions they sent themselves, so an indexer
-        that dropped a notified block passes all of them. This is the tidx
-        differential's completeness half on a block walk, so it reaches backends tidx
-        cannot ingest. Bounded to ``WALK_BLOCKS`` and asserted non-empty, so an empty
-        chain fails rather than passes.
-        """
+        """The tests above inspect only their own txs, so this is what catches a dropped block."""
         receipts = [await driver.send_tx(w3, chain_id, funded_account) for _ in range(2)]
         sent = {_hex(r["transactionHash"]) for r in receipts}
         await _eventually(lambda: _indexed(w3, funded_account.address, sent), what="the sent txs to be indexed")
@@ -425,10 +348,7 @@ class TestTransactions:
 
 
 class TestTokenNamespace:
-    """The ``token_`` namespace, which projects TIP-20 events.
-
-    tempo-only: allegro has no TIP-20 equivalent and never registers these.
-    """
+    """The ``token_`` namespace, which projects TIP-20 events."""
 
     pytestmark = [backed, pytest.mark.requires(CAP_TEMPO_NATIVE)]
 
@@ -439,7 +359,7 @@ class TestTokenNamespace:
         )
 
         async def indexed():
-            page = await _call(w3, "token_getTokens", [{"filters": {"symbol": "IDX"}, "limit": 100}])
+            page = await rpc_result(w3, "token_getTokens", [{"filters": {"symbol": "IDX"}, "limit": 100}])
             return next((t for t in page["tokens"] if AsyncWeb3.to_checksum_address(t["address"]) == token), None)
 
         row = await _eventually(indexed, what=f"token {token} to be indexed")
@@ -459,7 +379,7 @@ class TestTokenNamespace:
         )
 
         async def indexed():
-            page = await _call(w3, "token_getTokensByAddress", [{"address": holder.address, "limit": 100}])
+            page = await rpc_result(w3, "token_getTokensByAddress", [{"address": holder.address, "limit": 100}])
             return next(
                 (t for t in page["tokens"] if AsyncWeb3.to_checksum_address(t["token"]["address"]) == token), None
             )
@@ -480,7 +400,7 @@ class TestTokenNamespace:
         assert grants, "create_token(mint=…) should have granted ISSUER_ROLE"
 
         async def indexed():
-            page = await _call(w3, "token_getRoleHistory", [{"filters": {"token": token}, "limit": 100}])
+            page = await rpc_result(w3, "token_getRoleHistory", [{"filters": {"token": token}, "limit": 100}])
             return page["roleChanges"] or None
 
         changes = await _eventually(indexed, what=f"role changes for {token} to be indexed")
@@ -506,20 +426,12 @@ def _sql_literal(value) -> str:
 
 
 class TestTidxDifferential:
-    """The node's answers also match tidx indexing the same chain.
-
-    Two implementations concurring rather than a node confirming itself. tempo-only:
-    tidx needs the ``timestampMillis`` header and cannot decode a plain Ethereum
-    block, so this tier never covers allegro. See ``tidx.py``.
-    """
+    """The node's answers match tidx indexing the same chain; tidx decodes only tempo blocks."""
 
     pytestmark = backed
 
     async def test_get_transactions_agrees_with_tidx(self, driver, w3, chain_id, funded_account, tidx):
-        """The node's answer equals tidx's -- same rows, same fields on each, since a
-        filter can select correctly and still project wrongly. Stronger than the block
-        walk, and O(1) queries instead of O(blocks).
-        """
+        """Same rows and same fields: a filter can select correctly and still project wrongly."""
         receipts = [await driver.send_tx(w3, chain_id, funded_account) for _ in range(3)]
         tidx.wait_for_block(max(r["blockNumber"] for r in receipts))
 
@@ -544,8 +456,7 @@ class TestTidxDifferential:
             ), f"node and tidx disagree on {hash_}"
 
     async def test_no_transaction_is_missing_from_the_node(self, w3, tidx):
-        """Every tx tidx has, the node's indexer has too. Catches what a single-sender test
-        cannot: an indexer that silently drops blocks it was notified about."""
+        """Catches an indexer that silently drops blocks it was notified about."""
         head = tidx.synced_block()
         senders = tidx.sql(f'SELECT DISTINCT "from" FROM txs WHERE block_num <= {head} LIMIT 5')
         assert senders, "tidx has indexed no transactions yet"

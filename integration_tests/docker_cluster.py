@@ -46,15 +46,8 @@ class DockerCluster:
         return self.data_dir / moniker
 
     def _follow(self, moniker: str) -> None:
-        """(Re)attach a log follower for one service.
-
-        ``docker compose logs -f`` exits when its container stops, so a node
-        that is stopped and restarted loses every line it emits afterwards
-        unless the follower is respawned.  A container keeps its full history
-        across a stop/start, so replaying from the beginning into a truncated
-        file both recovers the missed window and keeps the byte offsets stable
-        for callers that remember a position (see the consensus storage tests).
-        """
+        """(Re)attach a service's log follower, replaying its history into a truncated ``node.log``:
+        ``logs -f`` exits with its container, and a replay keeps byte offsets stable across a restart."""
         self._unfollow(moniker)
         node_dir = self._node_dir(moniker)
         if not node_dir.is_dir():

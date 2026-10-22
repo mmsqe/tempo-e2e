@@ -10,7 +10,7 @@ from pathlib import Path
 from web3 import AsyncWeb3
 
 from .. import network
-from ..utils import fund
+from ..utils import fund, new_account, send_calls, transfer_call
 from .base import CAP_CONSENSUS_NET, CAP_FAUCET, CAP_INDEXER_RPC, CAP_TEMPO_NATIVE
 
 
@@ -27,8 +27,6 @@ class TempoDriver:
 
     async def send_tx(self, w3: AsyncWeb3, chain_id: int, sender) -> dict:
         """A PATH_USD transfer as tempo's native AA transaction (type 0x76)."""
-        from ..utils import new_account, send_calls, transfer_call
-
         return await send_calls(
             w3,
             chain_id=chain_id,

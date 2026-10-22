@@ -37,10 +37,7 @@ _VALIDATOR_COUNT = bytes(VALIDATOR_CONFIG.fns.validatorCount().data)
 _IS_VIRTUAL = bytes(ADDRESS_REGISTRY.fns.isVirtualAddress(PATH_USD).data)
 _DOMAIN_SEPARATOR = bytes(TIP20_CHANNEL_RESERVE.fns.domainSeparator().data)
 
-# One deterministic (pure/view) getter per enshrined precompile, each returning a
-# single 32-byte word: (label, address, calldata). The identity precompile is an
-# EVM baseline. The dev genesis activates all hardforks, so T3+/T7 precompiles
-# (AddressRegistry, StorageCredits) are live.
+# (label, address, calldata): a one-word pure/view getter per enshrined precompile; identity is the EVM baseline.
 _PRECOMPILE_CASES = [
     ("identity", IDENTITY_PRECOMPILE, bytes(range(32))),
     ("FeeManager.getPoolId", FEE_MANAGER_ADDRESS, bytes(FEE.fns.getPoolId(ALPHA_USD, PATH_USD).data)),
@@ -57,9 +54,7 @@ _PRECOMPILE_CASES = [
 
 
 def _staticcall_forwarder(precompile: str) -> bytes:
-    """EVM init code for a contract that STATICCALLs ``precompile`` with the
-    call's data and returns the first 32 bytes of its output (every precompile
-    probed here returns a single 32-byte word)."""
+    """Init code for a contract that STATICCALLs ``precompile`` with its calldata and returns 32 bytes."""
     addr = bytes.fromhex(precompile.removeprefix("0x"))
     assert len(addr) == 20, "precompile must be a 20-byte address"
     runtime = bytes(
@@ -95,19 +90,12 @@ def _staticcall_forwarder(precompile: str) -> bytes:
     return init + runtime
 
 
-async def _deploy_forwarder(w3, chain_id, acct, precompile: str) -> str:
-    _, address = await deploy_contract(
-        w3, chain_id=chain_id, private_key=acct.key.hex(), bytecode=_staticcall_forwarder(precompile)
-    )
-    return address
-
-
 @pytest.mark.parametrize("label,address,calldata", _PRECOMPILE_CASES, ids=[c[0] for c in _PRECOMPILE_CASES])
 async def test_precompile_callable_from_contract(w3, chain_id, funded_account, label, address, calldata):
-    """A deployed contract STATICCALLs an enshrined tempo precompile and returns
-    its output -- the E5 'contract -> precompile, deterministic result' path. The
-    contract-forwarded result must match a direct call and be non-empty."""
-    fwd = await _deploy_forwarder(w3, chain_id, funded_account, address)
+    """A contract's STATICCALL to the precompile returns the direct call's non-empty result."""
+    _, fwd = await deploy_contract(
+        w3, chain_id=chain_id, private_key=funded_account.key.hex(), bytecode=_staticcall_forwarder(address)
+    )
     data = "0x" + calldata.hex()
     via_contract = bytes(await w3.eth.call({"to": fwd, "data": data}))
     direct = bytes(await w3.eth.call({"to": address, "data": data}))

@@ -1,7 +1,5 @@
-"""Stablecoin DEX precompile (IStablecoinDEX): ticks, limit orders, swaps, TIP-1030/1056
-flip orders, and the TIP-1087 book index. Books are quoted against PATH_USD; most tests
-use a fresh TIP-20 so the book starts empty and a swap only fills liquidity they seeded.
-"""
+"""Stablecoin DEX precompile: ticks, limit orders, swaps, TIP-1030/1056 flip orders, the TIP-1087 book
+index. Most tests use a fresh TIP-20, so its PATH_USD book starts empty and swaps fill only their own orders."""
 
 import pytest
 from eth_contract.erc20 import ERC20
@@ -16,10 +14,9 @@ from .utils import (
     approve_call,
     call_revert,
     create_token,
-    fund,
     fund_token,
+    funded,
     gas_cost_in_token,
-    new_account,
     send_call,
     send_calls,
 )
@@ -38,18 +35,16 @@ UNUSED_INDEX = 2**32 - 1
 
 async def _trader(w3, chain_id, *, token=None, amount=0):
     """A fresh PATH-funded account (PATH pays gas), optionally holding ``amount`` of ``token``."""
-    acct = new_account()
-    await fund(w3, acct.address)
+    acct = await funded(w3)
     if token:
         await fund_token(w3, chain_id=chain_id, to=acct.address, token=token, amount=amount)
     return acct
 
 
-async def _maker_with_token(w3, chain_id, admin, *, mint=AMOUNT, salt=bytes(32)):
+async def _maker_with_token(w3, chain_id, admin, *, mint=AMOUNT):
     """A fresh PATH-funded account holding ``mint`` of a brand-new TIP-20 (empty book)."""
-    maker = new_account()
-    await fund(w3, maker.address)
-    token = await create_token(w3, chain_id=chain_id, admin=admin, mint=(maker.address, mint), salt=salt)
+    maker = await funded(w3)
+    token = await create_token(w3, chain_id=chain_id, admin=admin, mint=(maker.address, mint))
     return maker, token
 
 
@@ -75,10 +70,10 @@ async def _approve_and(w3, chain_id, signer, tokens, *dex_calls):
 
 
 async def test_tick_price_round_trip(w3):
-    price = await DEX.fns.tickToPrice(0).call(w3, to=DEX_ADDR)
+    price = await DEX.fns.tickToPrice(0).call(w3)
     assert price > 0  # tick 0 == 1:1
-    assert await DEX.fns.priceToTick(price).call(w3, to=DEX_ADDR) == 0
-    assert await DEX.fns.MIN_ORDER_AMOUNT().call(w3, to=DEX_ADDR) > 0
+    assert await DEX.fns.priceToTick(price).call(w3) == 0
+    assert await DEX.fns.MIN_ORDER_AMOUNT().call(w3) > 0
 
 
 # ---- limit orders: place / get / cancel ----
@@ -86,10 +81,10 @@ async def test_tick_price_round_trip(w3):
 
 async def test_place_get_and_cancel_order(w3, chain_id):
     maker = await _trader(w3, chain_id, token=ALPHA_USD, amount=10_000_000_000)
-    order_id = await DEX.fns.nextOrderId().call(w3, to=DEX_ADDR)
+    order_id = await DEX.fns.nextOrderId().call(w3)
     await _approve_and(w3, chain_id, maker, ALPHA_USD, DEX.fns.place(ALPHA_USD, 2_000_000_000, False, 0))
 
-    order = await DEX.fns.getOrder(order_id).call(w3, to=DEX_ADDR)
+    order = await DEX.fns.getOrder(order_id).call(w3)
     assert HexBytes(order[1]) == HexBytes(maker.address)  # maker
     assert order[5] == 2_000_000_000  # amount
 
@@ -108,7 +103,7 @@ async def test_swap_fills_resting_order(w3, chain_id):
     # Taker swaps PATH -> ALPHA against the resting ask.
     taker = await _trader(w3, chain_id, token=PATH_USD, amount=5_000_000_000)
     amount_in = 1_000_000_000
-    quote = await DEX.fns.quoteSwapExactAmountIn(PATH_USD, ALPHA_USD, amount_in).call(w3, to=DEX_ADDR)
+    quote = await DEX.fns.quoteSwapExactAmountIn(PATH_USD, ALPHA_USD, amount_in).call(w3)
     before = await ERC20.fns.balanceOf(taker.address).call(w3, to=ALPHA_USD)
     await _approve_and(w3, chain_id, taker, PATH_USD, DEX.fns.swapExactAmountIn(PATH_USD, ALPHA_USD, amount_in, 0))
     after = await ERC20.fns.balanceOf(taker.address).call(w3, to=ALPHA_USD)
@@ -116,12 +111,11 @@ async def test_swap_fills_resting_order(w3, chain_id):
 
 
 async def test_swap_round_trip_against_self_placed_walls(w3, chain_id, funded_account):
-    """Seed a bid and an ask wall on a fresh pair, then round-trip swapExactAmountIn both
-    ways against the account's own book."""
+    """Seed a bid and an ask wall on a fresh pair, then swap both ways against the account's own book."""
     trader, token = await _maker_with_token(w3, chain_id, funded_account, mint=100 * AMOUNT)
     await fund_token(w3, chain_id=chain_id, to=trader.address, token=PATH_USD, amount=100 * AMOUNT)
 
-    first_order = await DEX.fns.nextOrderId().call(w3, to=DEX_ADDR)
+    first_order = await DEX.fns.nextOrderId().call(w3)
     await _approve_and(  # approve both sides, then seed a bid wall and an ask wall
         w3,
         chain_id,
@@ -130,26 +124,21 @@ async def test_swap_round_trip_against_self_placed_walls(w3, chain_id, funded_ac
         DEX.fns.placeFlip(token, AMOUNT, True, -100, 100),
         DEX.fns.placeFlip(token, AMOUNT, False, 100, -100),
     )
-    assert await DEX.fns.nextOrderId().call(w3, to=DEX_ADDR) == first_order + 2  # both walls rest
+    assert await DEX.fns.nextOrderId().call(w3) == first_order + 2  # both walls rest
 
-    sell = await send_call(w3, chain_id, trader, DEX_ADDR, DEX.fns.swapExactAmountIn(token, PATH_USD, SWAP, 0).data)
-    assert sell["status"] == 1  # filled against the bid wall
-    buy = await send_call(w3, chain_id, trader, DEX_ADDR, DEX.fns.swapExactAmountIn(PATH_USD, token, SWAP, 0).data)
-    assert buy["status"] == 1  # filled against the ask wall
+    # Filled against the bid wall, then the ask wall.
+    await send_call(w3, chain_id, trader, DEX_ADDR, DEX.fns.swapExactAmountIn(token, PATH_USD, SWAP, 0).data)
+    await send_call(w3, chain_id, trader, DEX_ADDR, DEX.fns.swapExactAmountIn(PATH_USD, token, SWAP, 0).data)
 
 
 # ---- TIP-1030 / TIP-1056 same-tick flip orders ----
-#
-# A flip order, once fully filled, re-rests on the opposite side under the SAME orderId
-# (emitting OrderFlipped, not OrderPlaced).
+# A fully filled flip order re-rests on the other side under the same orderId (OrderFlipped, not OrderPlaced).
 
 
 async def _flipped_ask(w3, chain_id, admin):
-    """A same-tick ask flip on a fresh token's book, fully filled so it now rests as a bid.
-
-    Returns (maker, token, order_id, fill_receipt)."""
+    """A same-tick ask flip on a fresh book, filled so it rests as a bid: (maker, token, order_id, fill)."""
     maker, token = await _maker_with_token(w3, chain_id, admin, mint=20 * AMOUNT)
-    order_id = await DEX.fns.nextOrderId().call(w3, to=DEX_ADDR)
+    order_id = await DEX.fns.nextOrderId().call(w3)
     await _approve_and(w3, chain_id, maker, token, DEX.fns.placeFlip(token, AMOUNT, False, 0, 0))
 
     taker = await _trader(w3, chain_id, token=PATH_USD, amount=5 * AMOUNT)
@@ -166,22 +155,21 @@ async def test_flip_order_flips_in_place_on_full_fill(w3, chain_id, funded_accou
     assert int.from_bytes(bytes(flipped[0]["topics"][1]), "big") == order_id  # same orderId
     assert not any(HexBytes(lg["topics"][0]) == HexBytes(ORDER_PLACED) for lg in logs)  # not re-placed
 
-    order = await DEX.fns.getOrder(order_id).call(w3, to=DEX_ADDR)
+    order = await DEX.fns.getOrder(order_id).call(w3)
     assert order[3]  # isBid flipped from ask to bid
     assert order[5] == AMOUNT and order[6] == AMOUNT  # amount kept, remaining reset to full
     assert order[9] and order[10] == 0  # isFlip stays true; flipTick == tick == 0
 
     # TIP-1056: the flip re-rested under the SAME id -- only the initial place consumed an order id
-    assert await DEX.fns.nextOrderId().call(w3, to=DEX_ADDR) == order_id + 1
+    assert await DEX.fns.nextOrderId().call(w3) == order_id + 1
 
 
 async def test_cancel_after_flip_refunds_flipped_side(w3, chain_id, funded_account):
-    """TIP-1056 motivating case: after an ask flips to a bid, cancel(orderId) targets the
-    flipped order -- the maker gets the bid's QUOTE escrow back, not the original base."""
+    """TIP-1056: cancelling an ask that flipped to a bid refunds the bid's quote escrow, not the base."""
     maker, _token, order_id, _fill = await _flipped_ask(w3, chain_id, funded_account)
 
     path_before = await ERC20.fns.balanceOf(maker.address).call(w3, to=PATH_USD)
-    assert await DEX.fns.balanceOf(maker.address, PATH_USD).call(w3, to=DEX_ADDR) == 0
+    assert await DEX.fns.balanceOf(maker.address, PATH_USD).call(w3) == 0
     cancelled = await send_calls(
         w3,
         chain_id=chain_id,
@@ -204,9 +192,9 @@ async def test_bid_same_tick_flip_accepted_and_wrong_side_rejected(w3, chain_id,
     maker = await _trader(w3, chain_id)  # PATH-funded; a bid escrows the quote token
     token = await create_token(w3, chain_id=chain_id, admin=funded_account)
 
-    order_id = await DEX.fns.nextOrderId().call(w3, to=DEX_ADDR)
+    order_id = await DEX.fns.nextOrderId().call(w3)
     await _approve_and(w3, chain_id, maker, PATH_USD, DEX.fns.placeFlip(token, AMOUNT, True, 0, 0))
-    order = await DEX.fns.getOrder(order_id).call(w3, to=DEX_ADDR)
+    order = await DEX.fns.getOrder(order_id).call(w3)
     assert order[3] and order[9] and order[10] == 0  # a resting same-tick bid flip
 
     # a bid must flip to an equal-or-higher tick: flipTick -10 < tick 0 -> InvalidBidFlipTick
@@ -226,66 +214,53 @@ async def test_ask_fliptick_above_tick_reverts(w3, chain_id):
 
 
 # ---- TIP-1087 book index (T8+) ----
-#
-# Every orderbook carries a compact index into the DEX's append-only key vector, so an
-# order can store a 4-byte index instead of a 32-byte book key (the V2 order layout).
-# ``createPair`` persists the index for new books; ``setBookIndex`` backfills pre-T8 books.
-
-
-async def _book_index(w3, key) -> tuple[bool, int]:
-    return await DEX.fns.bookIndexForKey(key).call(w3, to=DEX_ADDR)
-
-
-async def _key_at(w3, index: int) -> HexBytes:
-    return HexBytes(await DEX.fns.bookKeyForIndex(index).call(w3, to=DEX_ADDR))
+# An order stores its book's 4-byte index into the append-only key vector, not the 32-byte key;
+# ``createPair`` sets it for new books and ``setBookIndex`` backfills pre-T8 ones.
 
 
 async def _new_token(w3, chain_id, admin, salt: bytes = bytes(32)) -> tuple[str, HexBytes]:
     """A fresh TIP-20 quoted in PATH_USD, plus the key its book will get."""
     token = await create_token(w3, chain_id=chain_id, admin=admin, mint=(admin.address, 10_000_000_000), salt=salt)
-    return token, HexBytes(await DEX.fns.pairKey(token, PATH_USD).call(w3, to=DEX_ADDR))
+    return token, HexBytes(await DEX.fns.pairKey(token, PATH_USD).call(w3))
 
 
 async def _create_pair(w3, chain_id, admin, salt: bytes = bytes(32)) -> tuple[HexBytes, int]:
     token, key = await _new_token(w3, chain_id, admin, salt)
     await send_call(w3, chain_id, admin, DEX_ADDR, DEX.fns.createPair(token).data)
-    is_set, index = await _book_index(w3, key)
+    is_set, index = await DEX.fns.bookIndexForKey(key).call(w3)
     assert is_set, "createPair did not persist a book index"
     return key, index
 
 
 async def test_create_pair_persists_a_round_tripping_index(w3, chain_id, funded_account):
-    """A book's index is its slot in the append-only key vector: bookKeyForIndex inverts
-    bookIndexForKey, consecutive pairs get consecutive slots, and re-backfilling an
-    already-indexed book is a no-op success (safe to call blindly)."""
+    """bookKeyForIndex inverts bookIndexForKey, consecutive pairs take consecutive slots, and
+    re-backfilling an indexed book is a no-op success."""
     first_key, first = await _create_pair(w3, chain_id, funded_account, salt=bytes(31) + b"\x01")
     second_key, second = await _create_pair(w3, chain_id, funded_account, salt=bytes(31) + b"\x02")
 
     assert second == first + 1
-    assert await _key_at(w3, first) == first_key
-    assert await _key_at(w3, second) == second_key
+    assert await DEX.fns.bookKeyForIndex(first).call(w3) == first_key
+    assert await DEX.fns.bookKeyForIndex(second).call(w3) == second_key
 
     await send_call(w3, chain_id, funded_account, DEX_ADDR, DEX.fns.setBookIndex(second).data)
-    assert await _book_index(w3, second_key) == (True, second)
+    assert await DEX.fns.bookIndexForKey(second_key).call(w3) == (True, second)
 
 
 async def test_placing_an_order_auto_creates_an_indexed_book(w3, chain_id, funded_account):
-    """`place` auto-creates a missing pair, and that book is indexed too -- otherwise its
-    orders would silently fall back to the wider V1 layout."""
+    """`place` auto-creates a missing pair with an index too, or its orders would fall back to V1 layout."""
     admin = funded_account
     token, key = await _new_token(w3, chain_id, admin)
     assert "PairDoesNotExist" in await call_revert(w3, DEX_ADDR, DEX.fns.bookIndexForKey(key).data)
 
     await _approve_and(w3, chain_id, admin, token, DEX.fns.place(token, 2_000_000_000, False, 0))
 
-    is_set, index = await _book_index(w3, key)
+    is_set, index = await DEX.fns.bookIndexForKey(key).call(w3)
     assert is_set
-    assert await _key_at(w3, index) == key
+    assert await DEX.fns.bookKeyForIndex(index).call(w3) == key
 
 
 async def test_book_index_rejects_unknown_books(w3):
-    """An uninitialized key, and an index past the end of the key vector, both surface
-    PairDoesNotExist rather than a zero index."""
+    """An unknown key or an index past the end surfaces PairDoesNotExist, not a zero index."""
     for data in (
         DEX.fns.bookIndexForKey(HexBytes(b"\xab" * 32)).data,
         DEX.fns.bookKeyForIndex(UNUSED_INDEX).data,

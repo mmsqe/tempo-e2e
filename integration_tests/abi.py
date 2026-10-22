@@ -1,10 +1,27 @@
-"""ABIs for tempo precompiles. Standard token ops reuse ``eth_contract.erc20.ERC20``."""
+"""ABIs for tempo precompiles, each bound to its address; token ops reuse ``eth_contract.erc20.ERC20``."""
 
 from eth_contract import Contract
 from eth_utils import to_checksum_address
+from tempo.constants import (
+    ACCOUNT_KEYCHAIN_ADDRESS,
+    ADDRESS_REGISTRY_ADDRESS,
+    FEE_MANAGER_ADDRESS,
+    NONCE_ADDRESS,
+    RECEIVE_POLICY_GUARD_ADDRESS,
+    SIGNATURE_VERIFIER_ADDRESS,
+    STABLECOIN_DEX_ADDRESS,
+    STORAGE_CREDITS_ADDRESS,
+    TIP20_CHANNEL_RESERVE_ADDRESS,
+    TIP20_FACTORY_ADDRESS,
+    TIP403_REGISTRY_ADDRESS,
+    VALIDATOR_CONFIG_V2_ADDRESS,
+)
+from tempo.contracts import ACCOUNT_KEYCHAIN as _ACCOUNT_KEYCHAIN
 
 # 2D nonce precompile (INonce). Nonce key 0 is the protocol nonce and reverts here.
-NONCE = Contract.from_abi(["function getNonce(address account, uint256 nonceKey) view returns (uint64)"])
+NONCE = Contract.from_abi(
+    ["function getNonce(address account, uint256 nonceKey) view returns (uint64)"], to=NONCE_ADDRESS
+)
 
 # Stablecoin DEX precompile (IStablecoinDEX): order book keyed against PATH_USD.
 DEX = Contract.from_abi(
@@ -29,7 +46,8 @@ DEX = Contract.from_abi(
         "function bookIndexForKey(bytes32 bookKey) view returns (bool set, uint32 index)",
         "function bookKeyForIndex(uint32 index) view returns (bytes32 bookKey)",
         "function setBookIndex(uint32 index)",
-    ]
+    ],
+    to=STABLECOIN_DEX_ADDRESS,
 )
 
 # Fee manager / fee AMM precompile (IFeeManager + IFeeAMM).
@@ -44,7 +62,8 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
-    ]
+    ],
+    to=FEE_MANAGER_ADDRESS,
 )
 
 # TIP-20 token factory (ITIP20Factory) and AccessControl on the created tokens.
@@ -53,18 +72,25 @@ TIP20_FACTORY = Contract.from_abi(
         "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt) returns (address)",
         "function createToken(string name, string symbol, string currency, address quoteToken, address admin, bytes32 salt, string logoURI) returns (address)",
         "function isTIP20(address token) view returns (bool)",
-    ]
+    ],
+    to=TIP20_FACTORY_ADDRESS,
 )
 TIP20_ROLES = Contract.from_abi(["function grantRole(bytes32 role, address account)"])
 
-# AccountKeychain views used only by tests (not part of the tempo-py bindings).
-KEYCHAIN_VIEWS = Contract.from_abi(
+# AccountKeychain: tempo-py's bindings plus the views only tests read.
+ACCOUNT_KEYCHAIN = Contract(
     [
-        "function getRemainingLimitWithPeriod(address account, address keyId, address token)"
-        " view returns (uint256 remaining, uint64 periodEnd)",
-        "function getKey(address account, address keyId)"
-        " view returns ((uint8 signatureType, address keyId, uint64 expiry, bool enforceLimits, bool isRevoked))",
-    ]
+        *_ACCOUNT_KEYCHAIN.abi,
+        *Contract.from_abi(
+            [
+                "function getRemainingLimitWithPeriod(address account, address keyId, address token)"
+                " view returns (uint256 remaining, uint64 periodEnd)",
+                "function getKey(address account, address keyId)"
+                " view returns ((uint8 signatureType, address keyId, uint64 expiry, bool enforceLimits, bool isRevoked))",
+            ]
+        ).abi,
+    ],
+    tx={"to": ACCOUNT_KEYCHAIN_ADDRESS},
 )
 
 # Tempo TIP-20 extensions beyond ERC-20 (standard ops use eth_contract.erc20.ERC20).
@@ -127,7 +153,8 @@ TIP403 = Contract.from_abi(
         # Receive policies (TIP-1028, T6+): a receiver sets which senders/tokens it accepts.
         "function setReceivePolicy(uint64 senderPolicyId, uint64 tokenFilterId, address recoveryAuthority)",
         "function validateReceivePolicy(address token, address sender, address receiver) view returns (bool authorized, uint8 blockedReason)",
-    ]
+    ],
+    to=TIP403_REGISTRY_ADDRESS,
 )
 
 # Receive policy guard precompile (IReceivePolicyGuard, TIP-1028, T6+): a transfer blocked
@@ -138,7 +165,8 @@ RECEIVE_POLICY_GUARD = Contract.from_abi(
         "function balanceOf(bytes receipt) view returns (uint256 amount)",
         "function claim(address to, bytes receipt)",
         "function burnBlockedReceipt(bytes receipt)",
-    ]
+    ],
+    to=RECEIVE_POLICY_GUARD_ADDRESS,
 )
 
 # Validator config precompiles (IValidatorConfig / IValidatorConfigV2); validatorCount is common.
@@ -164,7 +192,8 @@ VALIDATOR_CONFIG_V2 = Contract.from_abi(
         f"function validatorByAddress(address validatorAddress) view returns ({_VALIDATOR_TUPLE})",
         f"function validatorByPublicKey(bytes32 publicKey) view returns ({_VALIDATOR_TUPLE})",
         "function transferOwnership(address newOwner)",
-    ]
+    ],
+    to=VALIDATOR_CONFIG_V2_ADDRESS,
 )
 
 # Zone factory precompile (TIP-1091, T10+): slot 0 packs the owner above a 32-bit nextZoneId.
@@ -188,7 +217,8 @@ ZONE_FACTORY = Contract.from_abi(
         "event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)",
         "event ZoneCreated(uint32 indexed zoneId, address indexed portal, address initialToken, bool accessMode,"
         " bool gatewayMode, address admin, address[] sequencers, uint8 threshold, address verifier)",
-    ]
+    ],
+    to=ZONE_FACTORY_ADDRESS,
 )
 UPSTREAM_ZONE_OWNER = to_checksum_address("0xaF571FD4B3AD43a5807A5E58bFb25ea1aB327A14")  # INITIAL_FACTORY_OWNER
 
@@ -216,7 +246,8 @@ CURRENT_COMMITTEE = Contract.from_abi(
     [
         "function getCommitteeMembers() view returns (uint64 epoch, bytes32[] publicKeys)",
         "function setCommitteeMembers(uint64 epoch, bytes32[] publicKeys)",  # system-only: msg.sender must be 0x0
-    ]
+    ],
+    to=CURRENT_COMMITTEE_ADDRESS,
 )
 
 # Address registry precompile (IAddressRegistry, TIP-1022, T3+): virtual-address forwarding.
@@ -231,7 +262,8 @@ ADDRESS_REGISTRY = Contract.from_abi(
         "function isVirtualAddress(address addr) pure returns (bool)",
         "function decodeVirtualAddress(address addr) pure returns (bool isVirtual, bytes4 masterId, bytes6 userTag)",
         "function isImplicitlyApproved(address addr) view returns (bool)",  # TIP-1035 implicit-approval list
-    ]
+    ],
+    to=ADDRESS_REGISTRY_ADDRESS,
 )
 
 # Signature verifier precompile (ISignatureVerifier, TIP-1020, T3+; verifyKeychain* are T6+).
@@ -242,7 +274,8 @@ SIGNATURE_VERIFIER = Contract.from_abi(
         "function verify(address signer, bytes32 hash, bytes signature) view returns (bool)",
         "function verifyKeychain(address account, bytes32 hash, bytes signature) view returns (bool)",
         "function verifyKeychainAdmin(address account, bytes32 hash, bytes signature) view returns (bool)",
-    ]
+    ],
+    to=SIGNATURE_VERIFIER_ADDRESS,
 )
 
 # Storage credits precompile (IStorageCredits, TIP-1060, T7+): deleting a storage slot
@@ -255,7 +288,8 @@ STORAGE_CREDITS = Contract.from_abi(
         "function budgetOf(address account) view returns (uint64)",
         "function setMode(uint8 newMode)",
         "function setBudget(uint64 credits)",
-    ]
+    ],
+    to=STORAGE_CREDITS_ADDRESS,
 )
 
 # TIP-20 payment-channel reserve precompile (TIP-1034, T5+). `descriptor` is the
@@ -279,11 +313,11 @@ TIP20_CHANNEL_RESERVE = Contract.from_abi(
         f"function withdraw({_CR_DESC} descriptor)",
         f"function getChannelState(bytes32 channelId) view returns ({_CR_STATE})",
         "function getVoucherDigest(bytes32 channelId, uint96 cumulativeAmount) view returns (bytes32)",
-    ]
+    ],
+    to=TIP20_CHANNEL_RESERVE_ADDRESS,
 )
 
 # Anchoring (0x…0a00): the precompile's methods and events, as a contract placed in genesis.
-# Bound to the address, so `.call(w3)` needs no `to`.
 _ANCHORING_PAGE = "(bytes key, uint64 offset, uint64 limit, bool countTotal, bool reverse)"
 _ANCHORING_PAGE_OUT = "(bytes nextKey, uint64 total)"
 _ANCHORING_RECORD = (

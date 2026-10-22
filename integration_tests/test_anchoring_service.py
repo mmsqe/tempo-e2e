@@ -9,7 +9,7 @@ import pytest
 import requests
 
 from .anchoring import anchoring_node, bech32
-from .network import _resolve_bin, free_port, terminate_process_group
+from .network import free_port, resolve_bin, terminate_process_group
 
 pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
 
@@ -28,7 +28,7 @@ def tempo(tmp_path_factory):
 def name_search(tempo, tmp_path_factory):
     """The service over that node, which it asks for the index once before it listens."""
     try:
-        exe = _resolve_bin("nvnmchain-anchoring", "ANCHORING_BIN")
+        exe = resolve_bin("nvnmchain-anchoring", "ANCHORING_BIN")
     except RuntimeError as missing:
         pytest.skip(str(missing))
     base, bind = tmp_path_factory.mktemp("name-search"), f"127.0.0.1:{free_port()}"

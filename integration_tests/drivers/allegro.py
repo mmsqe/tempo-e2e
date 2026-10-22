@@ -11,13 +11,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from eth_account import Account
 from tempo.devnet.backends import generate_localnet, get_backend
 from tempo.devnet.config import DevnetConfig
 from tempo.devnet.ports import http_rpc_port, ws_rpc_port
 from web3 import AsyncWeb3
 
-from ..network import TempoNode, _resolve_bin
-from ..utils import fund_via_transfer, new_account
+from ..network import TempoNode, resolve_bin
+from ..utils import new_account, send_type_2
 from .base import CAP_EMBEDDED_VALIDATORS, CAP_INDEXER, CAP_INDEXER_RPC
 
 # Anvil account 0 — prefunded with 10_000 ETH in allegro's xtask genesis.
@@ -46,34 +47,10 @@ class AllegroNode(TempoNode):
 class AllegroDriver:
     name = "allegro"
 
-    def __init__(self):
-        self._bin: str | None = None
-        self._xtask: str | None = None
-
     def capabilities(self) -> set[str]:
-        # allegro serves eth_getTransactions from its own ExEx-backed index, so unlike
-        # tempo the handler is real -- but the token_ namespace needs TIP-20, which
-        # allegro has no equivalent of, so those tests stay skipped.
-        #
-        # CAP_INDEXER too, which base.py otherwise leaves to `--indexer` on the grounds
-        # that a live index is a deployment property rather than a binary one. That
-        # holds for a tidx sidecar; it does not hold here, because the index is the
-        # node. Left flag-gated the semantic tier would run only when someone
-        # remembered the flag, which in CI means never. If the indexer ever becomes
-        # opt-in at the node (a `--indexer.*` flag), this must move behind whatever
-        # `make_cluster` passes to enable it, or the claim goes stale in the one
-        # direction that fails tests rather than skipping them.
+        # Its ExEx index is the node, so CAP_INDEXER needs no --indexer; the token_ namespace needs
+        # TIP-20, which allegro lacks, so those tests stay skipped.
         return {CAP_EMBEDDED_VALIDATORS, CAP_INDEXER_RPC, CAP_INDEXER}
-
-    def resolve_bin(self) -> str:
-        if self._bin is None:
-            self._bin = _resolve_bin("allegro", "ALLEGRO_BIN")
-        return self._bin
-
-    def resolve_xtask(self) -> str:
-        if self._xtask is None:
-            self._xtask = _resolve_bin("allegro-xtask", "ALLEGRO_XTASK_BIN")
-        return self._xtask
 
     def make_cluster(self, base: Path, n: int, *, chain_id: int = 1337) -> list[AllegroNode]:
         """An ``n``-validator devnet sharing one embedded-validator genesis;
@@ -83,8 +60,8 @@ class AllegroDriver:
             n,
             backend="allegro",
             chain_id=chain_id,
-            node_bin=self.resolve_bin(),
-            xtask_bin=self.resolve_xtask(),
+            node_bin=resolve_bin("allegro", "ALLEGRO_BIN"),
+            xtask_bin=resolve_bin("allegro-xtask", "ALLEGRO_XTASK_BIN"),
         )
         genesis = generate_localnet(cfg, devnet)
         backend = get_backend(cfg)
@@ -120,11 +97,10 @@ class AllegroDriver:
         node.log_path = Path(base) / "devnet" / log_name
         return node
 
-    async def fund(self, w3: AsyncWeb3, address: str, amount: int) -> str:
+    async def fund(self, w3: AsyncWeb3, address: str, amount: int) -> dict:
         """Plain EIP-1559 transfer from the prefunded anvil account."""
-        return await fund_via_transfer(w3, FUNDER_KEY, address, amount)
+        return await send_type_2(w3, Account.from_key(FUNDER_KEY), address, b"", value=amount)
 
     async def send_tx(self, w3: AsyncWeb3, chain_id: int, sender) -> dict:
         """A plain EIP-1559 value transfer -- allegro has no native AA tx type."""
-        tx_hash = await fund_via_transfer(w3, sender.key.hex(), new_account().address, 1)
-        return await w3.eth.get_transaction_receipt(tx_hash)
+        return await send_type_2(w3, sender, new_account().address, b"", value=1)

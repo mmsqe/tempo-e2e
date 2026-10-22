@@ -2,24 +2,21 @@
 
 import pytest
 
-# tempo exposes the txpool namespace and the tempo-only `operator_*` methods;
-# a bare reth fork (allegro) enables neither, so gate the whole file.
+from .utils import rpc_result
+
+# allegro, a bare reth fork, serves neither the txpool namespace nor `operator_*`.
 pytestmark = pytest.mark.requires("tempo-native")
 
 
 async def test_txpool_status_has_pending_and_queued(w3):
-    resp = await w3.provider.make_request("txpool_status", [])
-    assert "error" not in resp, resp.get("error")
-    assert "pending" in resp["result"] and "queued" in resp["result"]
+    result = await rpc_result(w3, "txpool_status")
+    assert "pending" in result and "queued" in result
 
 
 async def test_txpool_content_has_pending_and_queued(w3):
-    resp = await w3.provider.make_request("txpool_content", [])
-    assert "error" not in resp, resp.get("error")
-    assert "pending" in resp["result"] and "queued" in resp["result"]
+    result = await rpc_result(w3, "txpool_content")
+    assert "pending" in result and "queued" in result
 
 
 async def test_operator_peers_returns_a_list(w3):
-    resp = await w3.provider.make_request("operator_peers", [])
-    assert "error" not in resp, resp.get("error")
-    assert isinstance(resp["result"], list)  # empty on a single dev node
+    assert isinstance(await rpc_result(w3, "operator_peers"), list)  # empty on a single dev node

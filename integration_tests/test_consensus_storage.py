@@ -22,26 +22,18 @@ def _require_fault_tolerance(num_validators: int) -> None:
         pytest.skip(f"need >=4 validators to tolerate a fault (have {num_validators})")
 
 
-def _node_dir(net, moniker: str):
-    return net.data_dir / moniker
-
-
 def _log_size(net, moniker: str) -> int:
-    log = _node_dir(net, moniker) / "node.log"
+    log = net.data_dir / moniker / "node.log"
     return log.stat().st_size if log.exists() else 0
 
 
 def _log_since(net, moniker: str, since: int) -> str:
-    log = _node_dir(net, moniker) / "node.log"
+    log = net.data_dir / moniker / "node.log"
     if not log.exists():
         return ""
     with open(log, "rb") as fp:
         fp.seek(since)
         return fp.read().decode(errors="replace")
-
-
-def _assert_no_panic(net, moniker: str, since: int) -> None:
-    assert "panicked at" not in _log_since(net, moniker, since), f"{moniker} panicked; see its node.log"
 
 
 def _kill_node(net, moniker: str) -> None:
@@ -62,16 +54,11 @@ def _ensure_started(net, moniker: str) -> None:
 
 
 def _stop_and_take_consensus_storage(net, moniker: str):
-    """Stop the node and move its consensus storage aside, leaving only EL state.
-
-    Moved, not deleted: the cluster is shared, and a validator that cannot start is one short
-    of quorum for every test after this one. The returned node.log offset starts after the
-    stop, so panic assertions skip the deliberate SIGTERM, which panics in marshal when it
-    catches an in-flight block dispatch.
-    """
+    """Stop the node and move (not delete: the cluster is shared) its consensus storage aside. The
+    returned log offset skips the stop, whose SIGTERM can panic marshal mid-dispatch."""
     net.stop_node(moniker)
     time.sleep(1)  # let the process exit before touching its storage
-    consensus_dir = _node_dir(net, moniker) / "consensus"
+    consensus_dir = net.data_dir / moniker / "consensus"
     assert consensus_dir.is_dir(), f"expected consensus storage at {consensus_dir}"
     saved = consensus_dir.with_name("consensus.saved")
     try:
@@ -81,13 +68,6 @@ def _stop_and_take_consensus_storage(net, moniker: str):
         _ensure_started(net, moniker)
         pytest.skip("consensus storage not writable from the host (docker-owned files)")
     return _log_size(net, moniker), saved
-
-
-def _restore_consensus_storage(net, moniker: str, saved) -> None:
-    """Put the saved consensus storage back, replacing whatever the refused start left."""
-    consensus_dir = _node_dir(net, moniker) / "consensus"
-    shutil.rmtree(consensus_dir, ignore_errors=True)
-    shutil.move(str(saved), str(consensus_dir))
 
 
 def _wait_for_log(net, moniker: str, since: int, needle: str, timeout: float = 60.0) -> bool:
@@ -100,11 +80,7 @@ def _wait_for_log(net, moniker: str, since: int, needle: str, timeout: float = 6
 
 
 def test_unclean_kill_recovers(consensus_net, num_validators):
-    """A SIGKILLed validator must reopen its journals and catch up, not panic.
-
-    Regression cover for the ``BlobCorrupt``/"unable to open journal" panic on
-    a torn journal write (need commonware bump in commonwarexyz/monorepo#4256).
-    """
+    """A SIGKILLed validator must reopen its journals after a torn write and catch up, not panic."""
     _require_fault_tolerance(num_validators)
     victim = "node1"  # node0 stays up as the observer
     primary = consensus_net.node_rpc_url("node0")
@@ -123,16 +99,11 @@ def test_unclean_kill_recovers(consensus_net, num_validators):
         target = poll_height(primary)
         assert wait_height(victim_rpc, target, timeout=120) >= target, "victim did not catch up after unclean kill"
 
-    _assert_no_panic(consensus_net, victim, log_mark)
+    assert "panicked at" not in _log_since(consensus_net, victim, log_mark), f"{victim} panicked; see its node.log"
 
 
 def test_certificate_less_restart_is_refused(consensus_net, num_validators):
-    """A validator that keeps its EL state but loses its finalization certificates must refuse
-    to start, and must rejoin once they are back.
-
-    Startup began requiring the certificates unconditionally with commonware 2026.7.0;
-    ``--consensus.strict-startup``, which used to select this, is now a no-op that only parses.
-    """
+    """A validator with its EL state but no finalization certificates refuses to start, then rejoins."""
     _require_fault_tolerance(num_validators)
     victim = f"node{num_validators - 1}"
     primary = consensus_net.node_rpc_url("node0")
@@ -147,7 +118,10 @@ def test_certificate_less_restart_is_refused(consensus_net, num_validators):
     finally:
         consensus_net.stop_node(victim)
         time.sleep(1)
-        _restore_consensus_storage(consensus_net, victim, saved)
+        # Put the saved storage back, replacing whatever the refused start left.
+        consensus_dir = consensus_net.data_dir / victim / "consensus"
+        shutil.rmtree(consensus_dir, ignore_errors=True)
+        shutil.move(str(saved), str(consensus_dir))
         _ensure_started(consensus_net, victim)
 
     # The cluster is shared, so this has to hand back every validator it was given.

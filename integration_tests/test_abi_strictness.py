@@ -1,9 +1,6 @@
 """TIP-1100 precompile calldata: strict decoding from T11, trailing bytes allowed again at T12.
 
-Strict decoding refuses what the lenient decoder waved through, and it refuses before the
-precompile runs, so the revert carries no error selector. Every precompile shares the decoder,
-so one TIP-20 getter stands in for all of them.
-"""
+Every precompile shares the decoder, so one TIP-20 getter stands in for all of them."""
 
 from __future__ import annotations
 
@@ -13,15 +10,11 @@ from pathlib import Path
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
-from web3 import AsyncWeb3
 
 from .network import dev_node, xtask_forks
-from .utils import active_forks, call_revert
+from .utils import FAR_FUTURE, active_forks, call_revert, rpc
 
 pytestmark = pytest.mark.tempo
-
-# A timestamp no run reaches, so a fork scheduled at it never activates.
-FAR_FUTURE = 4_000_000_000
 
 # TIP-1100 prices a word of calldata at 6 gas before T11 and 30 from it.
 T11_WORD_RISE = 24
@@ -35,24 +28,16 @@ def payload(data: bytes) -> dict:
     return {"to": PATH_USD, "data": "0x" + data.hex()}
 
 
-async def refuses(w3, data: bytes) -> bool:
-    """Whether the node rejects ``data``. `call_revert` asserts one, so it cannot ask."""
-    resp = await w3.provider.make_request("eth_call", [payload(data), "latest"])
-    return resp.get("error") is not None
-
-
 async def test_trailing_bytes_are_accepted_from_t12(w3):
-    """A suffix past the last argument decodes again at T12; T11 alone refuses it.
-
-    The relaxation landed after v1.14.0. From nvnm.4 that line leaves T12 off and refuses as T11
-    does; before it, it schedules a T12 without the relaxation and the test skips.
-    """
+    """A suffix past the last argument decodes again at T12; T11 alone refuses it."""
     forks = await active_forks(w3)
     if "T11" in forks and "T12" not in forks:
         for suffix in (1, 32, 33):
             assert await call_revert(w3, PATH_USD, BALANCE_OF + b"\xff" * suffix) == "execution reverted"
         return
-    if "T12" in forks and await refuses(w3, BALANCE_OF + b"\xff"):
+    # `call_revert` asserts a refusal, so it cannot ask whether there is one.
+    trailing = await w3.provider.make_request("eth_call", [payload(BALANCE_OF + b"\xff"), "latest"])
+    if "T12" in forks and "error" in trailing:
         pytest.skip("the node schedules T12 but its decoder refuses trailing bytes")
     for suffix in (1, 32, 33):
         data = BALANCE_OF + b"\xff" * suffix
@@ -90,12 +75,9 @@ async def test_t11_charges_more_per_input_word(w3, pre_t11_node):
     if "T11" not in await active_forks(w3):
         pytest.skip("the node under test is older than T11")
 
-    before = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(pre_t11_node.rpc_url))
-    try:
+    async with rpc(pre_t11_node) as before:
         assert "T11" not in await active_forks(before)
         rise = await w3.eth.estimate_gas(payload(BALANCE_OF)) - await before.eth.estimate_gas(payload(BALANCE_OF))
-    finally:
-        await before.provider.disconnect()
 
     # estimate_gas searches for the limit, so it can land a gas or two above the true cost.
     assert WORDS * T11_WORD_RISE <= rise < WORDS * (T11_WORD_RISE + 1)

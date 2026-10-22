@@ -5,7 +5,7 @@ import time
 
 import pytest
 from eth_utils import filter_abi_by_type, function_abi_to_4byte_selector, keccak, to_checksum_address
-from tempo import Signer, add_fee_payer_signature, serialize, sign_transaction
+from tempo import Signer
 from tempo.keychain import sign_tx_access_key
 
 from .abi import ANCHORING, ANCHORING_ADDRESS
@@ -29,7 +29,8 @@ from .network import ExternalNode
 from .utils import (
     RETURN_42_INIT,
     STATE_WRITE_GAS,
-    build_tempo_tx,
+    ZERO_ADDRESS,
+    active_forks,
     call_revert,
     deploy_contract,
     fund,
@@ -42,7 +43,7 @@ from .utils import (
     send_set_code_tx,
     send_signed,
     send_type_2,
-    suggested_max_fee,
+    sign_sponsored,
 )
 
 pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
@@ -57,8 +58,7 @@ def intrinsic(data: bytes) -> int:
 
 @pytest.fixture(scope="module")
 def tempo(request, tmp_path_factory):
-    """This module's node, in place of the session's, unless ``--tempo-rpc`` names one to attach
-    to: pointed at a node carrying the real dump, these cases read what was migrated."""
+    """This module's node, unless ``--tempo-rpc`` names one, such as a node carrying the real dump."""
     rpc_url = request.config.getoption("--tempo-rpc")
     if rpc_url:
         yield ExternalNode(rpc_url, request.config.getoption("--tempo-ws")).wait_for_rpc()
@@ -97,8 +97,7 @@ class TestBinding:
     async def test_the_code_answers_under_t10(self, w3):
         """T10 once put a precompile here, and a precompile answers before code."""
         assert bytes(await w3.eth.get_code(ANCHORING_ADDRESS)) == PROXY_CODE
-        schedule = (await w3.provider.make_request("tempo_forkSchedule", []))["result"]["schedule"]
-        assert next(fork for fork in schedule if fork["name"] == "T10")["active"]
+        assert "T10" in await active_forks(w3)
         assert [r.id for r in await registries(w3, 1)] == [1]
 
 
@@ -266,7 +265,7 @@ class TestGas:
             receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data)
             assert receipt["gasUsed"] > intrinsic(data), method
 
-    async def test_a_bigger_metadata_costs_more(self, w3, chain_id, funded_account):
+    async def test_a_bigger_metadata_costs_more(self, w3, funded_account):
         """Past the calldata it adds: the string lands in storage, a slot at a time."""
         costs = {}
         for size in (100, 1000):
@@ -285,7 +284,7 @@ class TestFieldLimits:
         registry_id = await new_registry(w3, chain_id, funded_account, name="limits")
 
         at_cap = add_record(registry_id, "sha:at-cap", algo="a" * 128)
-        assert (await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, at_cap))["status"] == 1
+        await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, at_cap)
 
         over = add_record(registry_id, "sha:over-cap", algo="a" * 129)
         refused = await call_revert(w3, ANCHORING_ADDRESS, over, sender=funded_account.address)
@@ -305,7 +304,7 @@ class TestCaller:
         assert registry.creator == bech32(account)
         assert await ANCHORING.fns.hasRole(keccak(text=f"registry:{registry_id}:admin"), account).call(w3)
 
-    async def test_type_2(self, w3, chain_id, funded_account):
+    async def test_type_2(self, w3, funded_account):
         """What the old chain's integrations send."""
         data = ANCHORING.fns.addRegistry("type-2", "", "").data
         receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data, gas=STATE_WRITE_GAS)
@@ -327,17 +326,9 @@ class TestCaller:
     async def test_a_fee_payer(self, w3, chain_id):
         """The sender holds nothing and is still the caller."""
         sender, payer = new_account(), await funded(w3)
-        tx = build_tempo_tx(
-            chain_id=chain_id,
-            nonce=await get_nonce(w3, sender.address),
-            gas_limit=STATE_WRITE_GAS,
-            max_fee_per_gas=await suggested_max_fee(w3),
-            calls=[{"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.addRegistry("sponsored", "", "").data}],
-            awaiting_fee_payer=True,
-        )
-        signed = add_fee_payer_signature(sign_transaction(tx, Signer(sender.key.hex())), Signer(payer.key.hex()))
-        receipt = await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(serialize(signed)))
-        await self.assert_created_by(w3, receipt, sender.address)
+        calls = [{"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.addRegistry("sponsored", "", "").data}]
+        signed = await sign_sponsored(w3, chain_id, sender, payer, calls)
+        await self.assert_created_by(w3, await send_signed(w3, signed), sender.address)
 
     async def test_an_access_key(self, w3, chain_id):
         root, key = await funded(w3), new_account()
@@ -374,10 +365,7 @@ class TestCaller:
     async def test_a_contract_anchors_as_itself(self, w3, chain_id, funded_account):
         relay = await deploy_relay(w3, chain_id, funded_account)
         data = ANCHORING.fns.addRegistry("relayed", "", "").data
-        calls = [{"to": relay, "data": data}]
-        receipt = await send_calls(
-            w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=calls, gas_limit=STATE_WRITE_GAS
-        )
+        receipt = await send_call(w3, chain_id, funded_account, relay, data)
         await self.assert_created_by(w3, receipt, relay)
         [(_, registry_id, _)] = emitted(receipt, "AddRegistry")
         assert not await ANCHORING.fns.hasRole(
@@ -412,7 +400,7 @@ class TestOwner:
 
     async def test_the_ownership_moves_to_a_contract(self, w3, chain_id, funded_account):
         relay = await deploy_relay(w3, chain_id, funded_account)
-        zero = ANCHORING.fns.transferOwnership("0x" + "00" * 20).data
+        zero = ANCHORING.fns.transferOwnership(ZERO_ADDRESS).data
         assert "new owner is the zero address" in await call_revert(w3, ANCHORING_ADDRESS, zero, sender=OWNER.address)
         handover = ANCHORING.fns.transferOwnership(relay).data
         receipt = await send_call(w3, chain_id, OWNER, ANCHORING_ADDRESS, handover)
@@ -421,11 +409,10 @@ class TestOwner:
 
         grant = ANCHORING.fns.grantRole(2, "", funded_account.address, "admin").data
         assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, grant, sender=OWNER.address)
-        through = dict(chain_id=chain_id, private_key=funded_account.key.hex(), gas_limit=STATE_WRITE_GAS)
-        receipt = await send_calls(w3, calls=[{"to": relay, "data": grant}], **through)
+        receipt = await send_call(w3, chain_id, funded_account, relay, grant)
         assert emitted(receipt, "GrantRole") == [(relay, 2, "", funded_account.address, "admin")]
 
         # And back, for the rest of the module.
         back = ANCHORING.fns.transferOwnership(OWNER.address).data
-        receipt = await send_calls(w3, calls=[{"to": relay, "data": back}], **through)
+        receipt = await send_call(w3, chain_id, funded_account, relay, back)
         assert emitted(receipt, "OwnershipTransferred") == [(relay, OWNER.address)]

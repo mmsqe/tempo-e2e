@@ -37,7 +37,7 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def _resolve_bin(name: str, env_var: str) -> str:
+def resolve_bin(name: str, env_var: str) -> str:
     """``$<env_var>``, else ``name`` on PATH, else raise."""
     path = os.environ.get(env_var) or shutil.which(name)
     if not path:
@@ -67,19 +67,16 @@ def terminate_process_group(proc: subprocess.Popen | None, *, timeout: float = 1
 
 
 def resolve_tempo_bin() -> str:
-    return _resolve_bin("tempo", "TEMPO_BIN")
+    return resolve_bin("tempo", "TEMPO_BIN")
 
 
 def resolve_xtask_bin() -> str:
-    return _resolve_bin("tempo-xtask", "TEMPO_XTASK_BIN")
+    return resolve_bin("tempo-xtask", "TEMPO_XTASK_BIN")
 
 
 def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None) -> int:
-    """Poll ``rpc_url`` until it reports ``block >= want_block``; return its chain id.
-
-    ``check_alive`` (if given) is called each tick and should raise if the node
-    process has died, so a crash surfaces at once instead of after ``timeout``.
-    """
+    """Poll ``rpc_url`` until ``block >= want_block`` and return its chain id; ``check_alive`` raises once the
+    node dies."""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     deadline = time.time() + timeout
     last_err: Exception | None = None
@@ -97,12 +94,8 @@ def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None
 
 @functools.lru_cache(maxsize=1)
 def xtask_forks() -> tuple[str, ...]:
-    """Hardforks the installed ``tempo-xtask`` can schedule, oldest first (``"t0_time", ...``).
-
-    Read off its ``--tN-time`` flags, so the binary is the authority on which forks exist.
-    One built before a fork was declared lacks its flag, letting a test that schedules it
-    skip with a clear reason instead of dying in clap.
-    """
+    """The ``tN_time`` forks the installed ``tempo-xtask`` can schedule, oldest first, read off its flags so a
+    test that schedules a newer fork can skip."""
     result = subprocess.run([resolve_xtask_bin(), "generate-genesis", "--help"], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"tempo-xtask generate-genesis --help failed (exit {result.returncode}):\n{result.stderr}")
@@ -124,29 +117,12 @@ def generate_dev_genesis(
     validator_address: str | None = None,
     dkg: bool = False,
 ) -> Path:
-    """The dev genesis: ``$TEMPO_GENESIS`` if set, else generated in ``output_dir`` via ``tempo-xtask``.
+    """The dev genesis: ``$TEMPO_GENESIS`` or the one already in ``output_dir`` when every option is
+    default, else generated there by ``tempo-xtask``.
 
-    An already-generated ``genesis.json`` is reused (deterministic ``--seed 0``), so a node
-    can restart on the same dir and CI can supply a prebuilt genesis without needing xtask.
-
-    ``fork_times`` schedules hardforks past genesis (``{"t10_time": <unix seconds>}``) for
-    tests that cross a boundary on a running chain. It has to go through xtask, which keys
-    parts of the *alloc* off the activation time, so a schedule bolted onto finished JSON
-    yields a chain already holding the fork's state at block 0.
-
-    ``chain_id`` overrides xtask's default. ``epoch_length`` raises the epoch boundary a
-    single-validator chain cannot cross: past it the chain stops producing blocks for good,
-    so a run long enough to reach the default 302,400 has to say so up front.
-
-    ``anchoring`` places the anchoring contract, as the launch genesis carries it; without it the
-    alloc has none.
-
-    ``gas_token_admin`` issues xtask's temporary deployment gas token: the genesis accounts and the
-    validator pay fees in it, the coinbase and validator take it.
-
-    ``validator_address`` is the validator's onchain address; unset, the mnemonic's second account.
-
-    ``dkg`` keeps the DKG outcome in the header, which a follower needs.
+    ``fork_times`` (``{"t10_time": <unix seconds>}``) goes through xtask, which keys parts of the alloc off
+    each activation; ``epoch_length`` lets a long run pass the boundary a single validator halts at; ``dkg``
+    keeps the DKG outcome in the header, which a follower needs.
     """
     genesis = output_dir / "genesis.json"
     if fork_times:
@@ -236,7 +212,7 @@ class TempoNode:
         self.proc: subprocess.Popen | None = None
         self.chain_id: int | None = None
 
-    def command(self) -> list[str]:
+    def _common_args(self, *, http_addr: str = "127.0.0.1", http_api: str = "all") -> list[str]:
         return [
             self.binary,
             "node",
@@ -244,16 +220,25 @@ class TempoNode:
             str(self.genesis),
             "--datadir",
             str(self.datadir),
-            "--dev",
-            "--dev.block-time",
-            self.block_time,
             "--http",
             "--http.addr",
-            self.http_addr,
+            http_addr,
             "--http.port",
             str(self.http_port),
             "--http.api",
-            "all",
+            http_api,
+            "--port",
+            str(self.p2p_port),
+            "--authrpc.port",
+            str(self.auth_port),
+        ]
+
+    def command(self) -> list[str]:
+        return [
+            *self._common_args(http_addr=self.http_addr),
+            "--dev",
+            "--dev.block-time",
+            self.block_time,
             "--ws",
             "--ws.addr",
             "127.0.0.1",
@@ -261,10 +246,6 @@ class TempoNode:
             str(self.ws_port),
             "--ws.api",
             "all",
-            "--port",
-            str(self.p2p_port),
-            "--authrpc.port",
-            str(self.auth_port),
             "--disable-discovery",
             "--engine.disable-precompile-cache",
             "--builder.gaslimit",
@@ -336,27 +317,11 @@ class FollowerNode(TempoNode):
 
     def command(self) -> list[str]:
         return [
-            self.binary,
-            "node",
+            *self._common_args(http_api="eth,net,web3"),
             "--follow",
             self.upstream,
-            "--chain",
-            str(self.genesis),
-            "--datadir",
-            str(self.datadir),
-            "--http",
-            "--http.addr",
-            "127.0.0.1",
-            "--http.port",
-            str(self.http_port),
-            "--http.api",
-            "eth,net,web3",
-            "--port",
-            str(self.p2p_port),
             *(("--trusted-peers", ",".join(self.trusted_peers)) if self.trusted_peers else ()),
             *(("--discovery.port", str(self.p2p_port)) if self.discovery else ("--disable-discovery",)),
-            "--authrpc.port",
-            str(self.auth_port),
             "--ipcdisable",
             *self.extra_args,
         ]
@@ -374,12 +339,7 @@ class ValidatorNode(TempoNode):
 
     def command(self) -> list[str]:
         return [
-            self.binary,
-            "node",
-            "--chain",
-            str(self.genesis),
-            "--datadir",
-            str(self.datadir),
+            *self._common_args(),
             "--consensus.signing-key",
             str(self.signing_key),
             "--consensus.listen-address",
@@ -387,20 +347,9 @@ class ValidatorNode(TempoNode):
             "--consensus.metrics-address",
             f"127.0.0.1:{self.metrics_port}",
             "--consensus.use-local-defaults",  # or it never dials loopback, a private address
-            "--http",
-            "--http.addr",
-            "127.0.0.1",
-            "--http.port",
-            str(self.http_port),
-            "--http.api",
-            "all",
-            "--port",
-            str(self.p2p_port),
             "--trusted-peers",
             ",".join(self.trusted_peers),
             "--disable-discovery",
-            "--authrpc.port",
-            str(self.auth_port),
             "--ipcdisable",
             *self.extra_args,
         ]
@@ -424,14 +373,7 @@ def dev_node(
     gas_token_admin: str | None = None,
     **kwargs,
 ) -> TempoNode:
-    """A ``--dev`` node with a fresh ``genesis.json`` beside its datadir.
-
-    Lays out ``base/devnet/{genesis.json, node0}`` — the self-contained shape the
-    session fixture uses. ``http_port`` defaults to a free port; extra keyword args
-    (``block_time``, ...) pass through to ``TempoNode``. ``fork_times`` schedules
-    hardforks past genesis and ``chain_id`` overrides the default one (see
-    :func:`generate_dev_genesis`).
-    """
+    """A ``--dev`` node in ``base/devnet/node0`` beside a fresh ``genesis.json``, on a free HTTP port unless given."""
     devnet = base / "devnet"
     genesis = generate_dev_genesis(devnet, fork_times=fork_times, chain_id=chain_id, gas_token_admin=gas_token_admin)
     kwargs.setdefault("http_port", free_port())
@@ -439,12 +381,7 @@ def dev_node(
 
 
 class ExternalNode:
-    """A handle to an already-running node (``--tempo-rpc`` / ``$TEMPO_RPC``).
-
-    Lets the suite attach to a node it does not own and leave it running:
-    ``stop()`` is a no-op. ``ws_url`` is None unless supplied (only the
-    eth_subscribe tests need it).
-    """
+    """An already-running node (``--tempo-rpc``), left running: ``stop()`` does nothing."""
 
     def __init__(self, rpc_url: str, ws_url: str | None = None):
         self.rpc_url = rpc_url

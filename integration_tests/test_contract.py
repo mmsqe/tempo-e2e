@@ -2,7 +2,7 @@
 
 import pytest
 
-from .utils import RETURN_42_INIT, RETURN_42_RUNTIME, deploy_contract, get_nonce
+from .utils import RETURN_42_INIT, RETURN_42_RUNTIME, deploy_contract
 
 pytestmark = pytest.mark.requires("tempo-native")
 
@@ -25,7 +25,6 @@ async def test_deployed_contract_is_callable(w3, chain_id, funded_account):
 
 async def test_sequential_deploys_get_distinct_addresses(w3, chain_id, funded_account):
     pk = funded_account.key.hex()
-    nonce = await get_nonce(w3, funded_account.address)
-    _, addr1 = await deploy_contract(w3, chain_id=chain_id, private_key=pk, bytecode=RETURN_42_INIT, nonce=nonce)
-    _, addr2 = await deploy_contract(w3, chain_id=chain_id, private_key=pk, bytecode=RETURN_42_INIT, nonce=nonce + 1)
+    _, addr1 = await deploy_contract(w3, chain_id=chain_id, private_key=pk, bytecode=RETURN_42_INIT)
+    _, addr2 = await deploy_contract(w3, chain_id=chain_id, private_key=pk, bytecode=RETURN_42_INIT)
     assert addr1 != addr2

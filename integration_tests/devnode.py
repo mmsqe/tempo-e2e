@@ -1,10 +1,5 @@
-"""Standalone dev-node control: ``python -m integration_tests.devnode up|down``.
-
-``up`` launches a tempo dev node in the foreground (Ctrl-C to stop); ``down``
-terminates any running ``tempo node`` process. ``up --datadir PATH`` resumes an
-existing single-node datadir (e.g. a kept pytest node) so an explorer can index
-its state.
-"""
+"""Standalone dev node: ``python -m integration_tests.devnode up [--datadir PATH]`` resumes a kept
+datadir or starts a chain; ``down`` stops every ``tempo node``."""
 
 from __future__ import annotations
 

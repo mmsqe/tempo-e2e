@@ -1,5 +1,4 @@
-"""The zone factory (TIP-1091). Upstream installs it under its own key; this fork gives it to the
-validator registry's owner, at genesis or at T12."""
+"""The zone factory (TIP-1091), which this fork gives to the validator registry's owner at genesis or T12."""
 
 import functools
 import json
@@ -11,7 +10,7 @@ import pytest
 from eth_account import Account
 from eth_utils import to_checksum_address
 from tempo.constants import PATH_USD, VALIDATOR_CONFIG_V2_ADDRESS
-from web3 import AsyncWeb3, Web3
+from web3 import Web3
 
 from .abi import (
     UPSTREAM_ZONE_OWNER,
@@ -25,13 +24,23 @@ from .abi import (
 from .abi import VALIDATOR_CONFIG_V2 as V2
 from .anchoring import emitted
 from .network import FAUCET_PRIVATE_KEY, TempoNode, free_port, generate_dev_genesis, xtask_forks
-from .utils import call_revert, create_token, new_account, send_call, wait_for_block
+from .utils import (
+    FAR_FUTURE,
+    ZERO_ADDRESS,
+    active_forks,
+    call_revert,
+    create_token,
+    new_account,
+    rpc,
+    send_call,
+    wait_for_block,
+)
 
 pytestmark = [pytest.mark.tempo]
 
 ADMIN = Account.from_key(FAUCET_PRIVATE_KEY)  # the generated genesis's validator admin
 NAMED = to_checksum_address("0x" + "b0" * 20)  # a --zone-owner
-T12_LATER = {"t12_time": 4_000_000_000}
+T12_LATER = {"t12_time": FAR_FUTURE}
 ZONE_GAS = 25_000_000  # creation charges 15M before it starts
 ZONES_BEFORE = 3  # nextZoneId the testnet-like chain launches with, for the fork to keep
 ACTIVATION_LEAD = 30  # seconds from launch to T12: node startup, then pre-fork blocks
@@ -44,8 +53,7 @@ def genesis_owner(genesis: Path) -> str:
 
 @contextmanager
 def past_t12(base: Path, *, zone_owner: str = UPSTREAM_ZONE_OWNER, next_zone_id: int = 1, **options):
-    """A node launched like the testnet, its factory on ``zone_owner`` with ``next_zone_id`` before
-    T12, yielded once T12 is live."""
+    """A testnet-like node, its factory on ``zone_owner`` with ``next_zone_id`` before T12, yielded at T12."""
     activation = int(time.time()) + ACTIVATION_LEAD
     forks = xtask_forks()
     schedule = dict.fromkeys(forks[forks.index("t12_time") :], activation)
@@ -98,7 +106,7 @@ class TestGenesis:
             pytest.param({"fork_times": T12_LATER}, ADMIN.address, id="t12-later"),
             pytest.param({"anchoring": True, "anchoring_owner": "0x" + "a0" * 20}, ADMIN.address, id="anchoring-owner"),
             pytest.param({"zone_owner": NAMED}, NAMED, id="zone-owner"),
-            pytest.param({"zone_owner": "0x" + "00" * 20}, "0x" + "00" * 20, id="nobody"),
+            pytest.param({"zone_owner": ZERO_ADDRESS}, ZERO_ADDRESS, id="nobody"),
         ],
     )
     def test_the_flags_pick_its_owner(self, tmp_path, options, owner):
@@ -109,19 +117,14 @@ class TestGenesis:
 async def test_t12_leaves_a_named_owner_alone(tmp_path):
     """Only a factory still on upstream's key moves: one launched under any other owner stays."""
     with past_t12(tmp_path, zone_owner=NAMED) as node:
-        w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(node.rpc_url))
-        try:
+        async with rpc(node) as w3:
             assert await view(w3, ZONE_FACTORY.fns.owner()) == NAMED
-            schedule = (await w3.provider.make_request("tempo_forkSchedule", []))["result"]["schedule"]
-            assert next(fork for fork in schedule if fork["name"] == "T12")["active"], "the fork did run here"
-        finally:
-            await w3.provider.disconnect()
+            assert "T12" in await active_forks(w3), "the fork did run here"
 
 
 @pytest.fixture(scope="module")
 def tempo(request, tmp_path_factory):
-    """The chain ``TestOwner`` and ``TestPortal`` share, launched like the testnet: zones made under
-    upstream's key, T12 still to come, and no anchoring contract, which the hand-over never needed."""
+    """The chain ``TestOwner`` and ``TestPortal`` share: zones made under upstream's key, T12 to come."""
     if request.config.getoption("--tempo-rpc"):
         pytest.skip("needs a chain this module launches")
     base = tmp_path_factory.mktemp("zones")

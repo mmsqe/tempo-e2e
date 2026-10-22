@@ -1,16 +1,14 @@
-"""TIP-1045 payment-lane classification (T5): the general (non-payment) lane is
-capped at mainBlockGeneralGasLimit (30M)/block while payment transfers use the
-full ~500M block. The lane bit isn't surfaced over RPC, so we assert the
-consequence: under load, general txs defer ~1/block while payments cluster.
+"""TIP-1045 payment lane (T5): general txs share a 30M cap per block, payments use the whole block.
+
+The lane isn't exposed over RPC, so the test checks the effect: general txs defer, payments cluster.
 """
 
 import asyncio
 
 import pytest
 from tempo import Signer, serialize, sign_transaction
-from tempo.constants import PATH_USD
 
-from .utils import DEFAULT_GAS_LIMIT, build_tempo_tx, fund, new_account, suggested_max_fee, transfer_call
+from .utils import build_tempo_tx, funded, new_account, suggested_max_fee, transfer_call
 
 pytestmark = pytest.mark.tempo
 
@@ -27,9 +25,7 @@ async def test_general_lane_is_capped_while_payments_are_not(w3, chain_id):
     assert int(blk["mainBlockGeneralGasLimit"], 16) == GENERAL_GAS_LIMIT  # lane cap exposed in the header
     assert int(blk["gasLimit"], 16) > GENERAL_GAS_LIMIT  # block is far larger; payments can use it
 
-    spammer, payer = new_account(), new_account()
-    await fund(w3, spammer.address)
-    await fund(w3, payer.address)
+    spammer, payer = await funded(w3), await funded(w3)
     max_fee = await suggested_max_fee(w3)
 
     # each general tx reserves the 30M cap, so at most one fits per block -> they defer across blocks
@@ -37,7 +33,6 @@ async def test_general_lane_is_capped_while_payments_are_not(w3, chain_id):
         build_tempo_tx(
             chain_id=chain_id,
             nonce=i,
-            fee_token=PATH_USD,
             gas_limit=GENERAL_GAS_LIMIT,
             max_fee_per_gas=max_fee,
             calls=[{"to": DEAD, "data": b""}],
@@ -49,8 +44,6 @@ async def test_general_lane_is_capped_while_payments_are_not(w3, chain_id):
         build_tempo_tx(
             chain_id=chain_id,
             nonce=i,
-            fee_token=PATH_USD,
-            gas_limit=DEFAULT_GAS_LIMIT,
             max_fee_per_gas=max_fee,
             calls=[transfer_call(new_account().address, 1)],
         )

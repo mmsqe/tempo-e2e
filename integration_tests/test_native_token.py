@@ -11,8 +11,7 @@ pytestmark = pytest.mark.requires("tempo-native")
 # Runtime returns CALLER.balance (BALANCE opcode); init copies the 10-byte runtime out.
 CALLER_BALANCE_INIT = "600a600c600039600a6000f3" + "333160005260206000f3"
 
-# What `eth_getBalance` answers instead of a balance, for every address. Mirrors
-# NATIVE_BALANCE_PLACEHOLDER in tempo's crates/node/src/rpc/mod.rs.
+# `eth_getBalance`'s answer for every address: NATIVE_BALANCE_PLACEHOLDER in tempo's crates/node/src/rpc/mod.rs.
 NATIVE_BALANCE_PLACEHOLDER = int("42" * 38)
 
 

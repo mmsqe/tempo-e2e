@@ -12,7 +12,7 @@ from web3 import AsyncWeb3
 from web3.exceptions import Web3RPCError
 
 from .network import DEAD_UPSTREAM, FollowerNode, dev_node, free_port, generate_dev_genesis, node_log
-from .utils import fund, new_account, send_call, transfer_call
+from .utils import funded, new_account, send_call, transfer_call
 
 # An id no binary claims -- upstream keys chains off 4217/42431.
 UNCLAIMED_CHAIN_ID = 424242
@@ -60,16 +60,15 @@ class TestUnclaimedChainId:
             assert await w3.eth.chain_id == UNCLAIMED_CHAIN_ID
             assert int(await w3.net.version) == UNCLAIMED_CHAIN_ID
 
-            signer = new_account()
-            await fund(w3, signer.address)
+            signer = await funded(w3)
             recipient = new_account().address
             transfer = transfer_call(recipient, 1)
-            await send_call(w3, UNCLAIMED_CHAIN_ID, signer, transfer["to"], transfer["data"])
+            await send_call(w3, UNCLAIMED_CHAIN_ID, signer, **transfer)
             assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 1
 
             # Signed one id over, the same write has to bounce.
             with pytest.raises(Web3RPCError, match="chain ID"):
-                await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, transfer["to"], transfer["data"])
+                await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, **transfer)
         finally:
             node.stop()
 

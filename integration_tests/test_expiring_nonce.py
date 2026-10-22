@@ -1,16 +1,14 @@
-"""TIP-1009 expiring nonces: nonce_key = uint256 max with a required valid_before;
-replay protection is hash-based and the protocol (key 0) nonce is untouched.
-"""
+"""TIP-1009 expiring nonces: nonce_key = uint256 max with a required valid_before; replay protection
+is hash-based and the protocol (key 0) nonce is untouched."""
 
 import pytest
 from tempo import Signer, serialize, sign_transaction
-from tempo.constants import PATH_USD
 
 from .utils import (
     EXPIRING_NONCE_KEY,
     active_forks,
     build_tempo_tx,
-    fund,
+    funded,
     latest_timestamp,
     new_account,
     send_tempo_tx,
@@ -35,7 +33,6 @@ def _expiring_tx(chain_id, *, valid_before, max_fee, nonce=0):
         nonce=nonce,
         nonce_key=EXPIRING_NONCE_KEY,
         valid_before=valid_before,
-        fee_token=PATH_USD,
         max_fee_per_gas=max_fee,
         calls=[transfer_call(new_account().address, 1)],
     )
@@ -46,27 +43,24 @@ def _raw(tx, acct):
 
 
 async def test_expiring_nonce_tx_succeeds(w3, chain_id):
-    acct = new_account()
-    await fund(w3, acct.address)
+    acct = await funded(w3)
     tx = _expiring_tx(chain_id, valid_before=await latest_timestamp(w3) + 15, max_fee=await suggested_max_fee(w3))
 
     receipt = await send_tempo_tx(w3, tx, acct.key.hex())
     assert receipt["status"] == 1
-    # E6: an expiring-nonce tx does not advance the protocol (2D key 0) nonce.
+    # An expiring-nonce tx does not advance the protocol (2D key 0) nonce.
     assert await w3.eth.get_transaction_count(acct.address) == 0
 
 
 async def test_expired_valid_before_is_rejected(w3, chain_id):
-    acct = new_account()
-    await fund(w3, acct.address)
+    acct = await funded(w3)
     tx = _expiring_tx(chain_id, valid_before=await latest_timestamp(w3) - 1, max_fee=await suggested_max_fee(w3))
     with pytest.raises(Exception):  # below the pool floor (tip + 3s)
         await w3.eth.send_raw_transaction(_raw(tx, acct))
 
 
 async def test_replayed_expiring_nonce_is_rejected(w3, chain_id):
-    acct = new_account()
-    await fund(w3, acct.address)
+    acct = await funded(w3)
     tx = _expiring_tx(chain_id, valid_before=await latest_timestamp(w3) + 15, max_fee=await suggested_max_fee(w3))
     raw = _raw(tx, acct)
 
@@ -77,9 +71,8 @@ async def test_replayed_expiring_nonce_is_rejected(w3, chain_id):
 
 
 async def test_window_beyond_max_expiry_is_rejected(w3, chain_id):
-    """E3: valid_before past the window -> InvalidExpiringNonceExpiry."""
-    acct = new_account()
-    await fund(w3, acct.address)
+    """valid_before past the window -> InvalidExpiringNonceExpiry."""
+    acct = await funded(w3)
     far = await latest_timestamp(w3) + await max_expiry_secs(w3) + 90
     tx = _expiring_tx(chain_id, valid_before=far, max_fee=await suggested_max_fee(w3))
     with pytest.raises(Exception):
@@ -90,8 +83,7 @@ async def test_t11_widens_the_window(w3, chain_id):
     """A valid_before the pre-T11 window refused is accepted once T11 is active."""
     if "T11" not in await active_forks(w3):
         pytest.skip("the node under test is older than T11")
-    acct = new_account()
-    await fund(w3, acct.address)
+    acct = await funded(w3)
     beyond_old = await latest_timestamp(w3) + PRE_T11_MAX_EXPIRY_SECS + 90
     assert beyond_old <= await latest_timestamp(w3) + T11_MAX_EXPIRY_SECS
     tx = _expiring_tx(chain_id, valid_before=beyond_old, max_fee=await suggested_max_fee(w3))
@@ -101,10 +93,8 @@ async def test_t11_widens_the_window(w3, chain_id):
 
 
 async def test_nonzero_nonce_is_a_discriminator_from_t12(w3, chain_id):
-    """E4: before T12 an expiring-nonce tx must carry nonce == 0; TIP-1106 makes it an opaque
-    discriminator at T12, and the protocol nonce stays untouched."""
-    acct = new_account()
-    await fund(w3, acct.address)
+    """Before T12 an expiring-nonce tx must carry nonce 0; at T12, TIP-1106 makes it an opaque discriminator."""
+    acct = await funded(w3)
     soon = await latest_timestamp(w3) + 15
     tx = _expiring_tx(chain_id, valid_before=soon, max_fee=await suggested_max_fee(w3), nonce=1)
     if "T12" not in await active_forks(w3):
@@ -117,9 +107,8 @@ async def test_nonzero_nonce_is_a_discriminator_from_t12(w3, chain_id):
 
 
 async def test_missing_valid_before_is_rejected(w3, chain_id):
-    """E5: the expiring key without a valid_before has no expiry to record -> rejected."""
-    acct = new_account()
-    await fund(w3, acct.address)
+    """The expiring key without a valid_before has no expiry to record -> rejected."""
+    acct = await funded(w3)
     tx = _expiring_tx(chain_id, valid_before=None, max_fee=await suggested_max_fee(w3))
     with pytest.raises(Exception):
         await w3.eth.send_raw_transaction(_raw(tx, acct))
