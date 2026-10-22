@@ -165,12 +165,30 @@ class TestQueries:
         assert [r["id"] for r in await search(w3, "us-ca", "prefix", offset=1, limit=2)] == whole[1:3]
         assert await search(w3, "us-ca", "prefix", offset=len(whole)) == []
 
+    async def test_next_key_pages_on_to_the_last_match(self, w3):
+        """``nextKey`` is the next match's id, 8 bytes as the contract's ``registries`` cursor."""
+        whole = [r["id"] for r in await search(w3, "us-ca", "prefix", limit=200)]
+        params, seen = {"name": "us-ca", "mode": "prefix", "limit": 2}, []
+        for _ in range(len(whole)):
+            answer = await rpc_result(w3, "anchoring_searchRegistriesByName", [params])
+            seen += [r["id"] for r in answer["registries"]]
+            if answer["nextKey"] is None:
+                break
+            assert answer["nextKey"] == f"0x{whole[len(seen)]:016x}"
+            params["key"] = answer["nextKey"]
+        assert seen == whole
+
 
 class TestRefusals:
     """What each side will not answer."""
 
     async def test_the_index_refuses_a_query(self, w3):
-        for params in ({"name": ""}, {"name": "us", "mode": "regex"}):
+        for params in (
+            {"name": ""},
+            {"name": "us", "mode": "regex"},
+            {"name": "us", "key": "0x01"},
+            {"name": "us", "key": "0x0000000000000001", "offset": 1},
+        ):
             response = await w3.provider.make_request("anchoring_searchRegistriesByName", [params])
             assert response["error"]["code"] == -32602, response
 

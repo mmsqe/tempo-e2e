@@ -85,6 +85,26 @@ def test_the_enum_spelling_on_the_query_string(name_search):
         assert [r["id"] for r in search(name_search, name, mode)] == ["2"], mode
 
 
+def test_next_key_pages_on_to_the_last_match(name_search):
+    # The module's `PageResponse`: the next page's key in base64, and a total never counted.
+    whole = [r["id"] for r in search(name_search, "us-ca", "PREFIX")]
+    params = {
+        "name": "us-ca",
+        "mode": "REGISTRY_NAME_MATCH_MODE_PREFIX",
+        "pagination.limit": 2,
+        "pagination.count_total": "true",
+    }
+    seen = []
+    for _ in range(len(whole)):
+        page = requests.get(f"{name_search}{SEARCH_PATH}", params=params, timeout=10).json()
+        assert page["pagination"]["total"] == "0", page
+        seen += [r["id"] for r in page["registries"]]
+        if page["pagination"]["next_key"] is None:
+            break
+        params["pagination.key"] = page["pagination"]["next_key"]
+    assert seen == whole
+
+
 def test_the_health_route_renames_what_the_node_reports(name_search):
     # The node answers `lastId` and `registryCount`; whether it is caught up is its own suite's.
     health = requests.get(f"{name_search}/health", timeout=10).json()
