@@ -76,24 +76,16 @@ async def test_header_embeds_consensus_context(consensus_w3):
     assert "consensusContext" not in await rpc_result(consensus_w3, "eth_getBlockByNumber", ["0x0", False])
 
 
-def _max_faults(n: int) -> int:
-    """Validators that can be offline while consensus keeps quorum (BFT: n = 3f + 1)."""
-    return (n - 1) // 3
-
-
 # Runs last (after the RPC tests) and restores the network, since it disrupts the shared localnet.
-def test_chain_survives_validator_restart(consensus_net, num_validators):
+def test_chain_survives_validator_restart(consensus_net, max_faults):
     """Chain keeps finalizing with the max tolerable validators down, then they rejoin."""
-    f = _max_faults(num_validators)
-    if f < 1:
-        pytest.skip(f"need >=4 validators to tolerate a fault (have {num_validators})")
-    victims = [f"node{i}" for i in range(1, f + 1)]  # node0 stays up as the observer
+    victims = [f"node{i}" for i in range(1, max_faults + 1)]  # node0 stays up as the observer
     primary = consensus_net.node_rpc_url("node0")
     start = poll_height(primary)
 
     for v in victims:
         consensus_net.stop_node(v)
-    assert wait_height(primary, start + 3) >= start + 3, f"chain halted with {f} validator(s) down"
+    assert wait_height(primary, start + 3) >= start + 3, f"chain halted with {max_faults} validator(s) down"
     progressed = poll_height(primary)
 
     for v in victims:
@@ -102,12 +94,9 @@ def test_chain_survives_validator_restart(consensus_net, num_validators):
     assert wait_height(rejoined, progressed) >= progressed, "restarted validator did not catch up"
 
 
-def test_chain_halts_without_quorum_and_recovers(consensus_net, num_validators):
+def test_chain_halts_without_quorum_and_recovers(consensus_net, max_faults):
     """One validator past the fault threshold halts the chain; it recovers on restart."""
-    f = _max_faults(num_validators)
-    if f < 1:
-        pytest.skip(f"need >=4 validators to lose quorum meaningfully (have {num_validators})")
-    victims = [f"node{i}" for i in range(1, f + 2)]  # f+1 down → below quorum; node0 stays
+    victims = [f"node{i}" for i in range(1, max_faults + 2)]  # f+1 down → below quorum; node0 stays
     primary = consensus_net.node_rpc_url("node0")
     for v in victims:
         consensus_net.stop_node(v)

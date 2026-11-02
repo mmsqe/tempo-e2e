@@ -57,10 +57,7 @@ async def _approve_and(w3, chain_id, signer, tokens, *dex_calls):
         chain_id=chain_id,
         private_key=signer.key.hex(),
         gas_limit=STATE_WRITE_GAS,
-        calls=[
-            *(approve_call(DEX_ADDR, t) for t in tokens),
-            *({"to": DEX_ADDR, "data": c.data} for c in dex_calls),
-        ],
+        calls=[*(approve_call(DEX_ADDR, t) for t in tokens), *dex_calls],
     )
     assert receipt["status"] == 1
     return receipt
@@ -88,8 +85,8 @@ async def test_place_get_and_cancel_order(w3, chain_id):
     assert HexBytes(order[1]) == HexBytes(maker.address)  # maker
     assert order[5] == 2_000_000_000  # amount
 
-    await send_call(w3, chain_id, maker, DEX_ADDR, DEX.fns.cancel(order_id).data)
-    assert "OrderDoesNotExist" in await call_revert(w3, DEX_ADDR, DEX.fns.getOrder(order_id).data)
+    await send_call(w3, chain_id, maker, DEX.fns.cancel(order_id))
+    assert "OrderDoesNotExist" in await call_revert(w3, DEX.fns.getOrder(order_id))
 
 
 # ---- swaps ----
@@ -127,8 +124,8 @@ async def test_swap_round_trip_against_self_placed_walls(w3, chain_id, funded_ac
     assert await DEX.fns.nextOrderId().call(w3) == first_order + 2  # both walls rest
 
     # Filled against the bid wall, then the ask wall.
-    await send_call(w3, chain_id, trader, DEX_ADDR, DEX.fns.swapExactAmountIn(token, PATH_USD, SWAP, 0).data)
-    await send_call(w3, chain_id, trader, DEX_ADDR, DEX.fns.swapExactAmountIn(PATH_USD, token, SWAP, 0).data)
+    await send_call(w3, chain_id, trader, DEX.fns.swapExactAmountIn(token, PATH_USD, SWAP, 0))
+    await send_call(w3, chain_id, trader, DEX.fns.swapExactAmountIn(PATH_USD, token, SWAP, 0))
 
 
 # ---- TIP-1030 / TIP-1056 same-tick flip orders ----
@@ -175,16 +172,13 @@ async def test_cancel_after_flip_refunds_flipped_side(w3, chain_id, funded_accou
         chain_id=chain_id,
         private_key=maker.key.hex(),
         gas_limit=STATE_WRITE_GAS,
-        calls=[
-            {"to": DEX_ADDR, "data": DEX.fns.cancel(order_id).data},
-            {"to": DEX_ADDR, "data": DEX.fns.withdraw(PATH_USD, AMOUNT).data},  # escrow -> wallet
-        ],
+        calls=[DEX.fns.cancel(order_id), DEX.fns.withdraw(PATH_USD, AMOUNT)],  # escrow -> wallet
     )
     assert cancelled["status"] == 1
     expected = path_before + AMOUNT - gas_cost_in_token(cancelled)  # quote refund, less gas paid in PATH
     assert await ERC20.fns.balanceOf(maker.address).call(w3, to=PATH_USD) == expected
 
-    assert "OrderDoesNotExist" in await call_revert(w3, DEX_ADDR, DEX.fns.getOrder(order_id).data)
+    assert "OrderDoesNotExist" in await call_revert(w3, DEX.fns.getOrder(order_id))
 
 
 async def test_bid_same_tick_flip_accepted_and_wrong_side_rejected(w3, chain_id, funded_account):
@@ -198,7 +192,7 @@ async def test_bid_same_tick_flip_accepted_and_wrong_side_rejected(w3, chain_id,
     assert order[3] and order[9] and order[10] == 0  # a resting same-tick bid flip
 
     # a bid must flip to an equal-or-higher tick: flipTick -10 < tick 0 -> InvalidBidFlipTick
-    reason = await call_revert(w3, DEX_ADDR, DEX.fns.placeFlip(token, AMOUNT, True, 0, -10).data, sender=maker.address)
+    reason = await call_revert(w3, DEX.fns.placeFlip(token, AMOUNT, True, 0, -10), sender=maker.address)
     assert "InvalidBidFlipTick" in reason or "InvalidFlipTick" in reason
 
 
@@ -207,9 +201,7 @@ async def test_ask_fliptick_above_tick_reverts(w3, chain_id):
     # approve on-chain so escrow isn't the first failure in the eth_call below
     await send_call(w3, chain_id, maker, **approve_call(DEX_ADDR, ALPHA_USD))
     # an ask requires flipTick <= tick; flipTick 10 > tick 0 -> InvalidFlipTick
-    reason = await call_revert(
-        w3, DEX_ADDR, DEX.fns.placeFlip(ALPHA_USD, 1_000_000_000, False, 0, 10).data, sender=maker.address
-    )
+    reason = await call_revert(w3, DEX.fns.placeFlip(ALPHA_USD, 1_000_000_000, False, 0, 10), sender=maker.address)
     assert "InvalidFlipTick" in reason or "0xf88aeb80" in reason
 
 
@@ -226,7 +218,7 @@ async def _new_token(w3, chain_id, admin, salt: bytes = bytes(32)) -> tuple[str,
 
 async def _create_pair(w3, chain_id, admin, salt: bytes = bytes(32)) -> tuple[HexBytes, int]:
     token, key = await _new_token(w3, chain_id, admin, salt)
-    await send_call(w3, chain_id, admin, DEX_ADDR, DEX.fns.createPair(token).data)
+    await send_call(w3, chain_id, admin, DEX.fns.createPair(token))
     is_set, index = await DEX.fns.bookIndexForKey(key).call(w3)
     assert is_set, "createPair did not persist a book index"
     return key, index
@@ -242,7 +234,7 @@ async def test_create_pair_persists_a_round_tripping_index(w3, chain_id, funded_
     assert await DEX.fns.bookKeyForIndex(first).call(w3) == first_key
     assert await DEX.fns.bookKeyForIndex(second).call(w3) == second_key
 
-    await send_call(w3, chain_id, funded_account, DEX_ADDR, DEX.fns.setBookIndex(second).data)
+    await send_call(w3, chain_id, funded_account, DEX.fns.setBookIndex(second))
     assert await DEX.fns.bookIndexForKey(second_key).call(w3) == (True, second)
 
 
@@ -250,7 +242,7 @@ async def test_placing_an_order_auto_creates_an_indexed_book(w3, chain_id, funde
     """`place` auto-creates a missing pair with an index too, or its orders would fall back to V1 layout."""
     admin = funded_account
     token, key = await _new_token(w3, chain_id, admin)
-    assert "PairDoesNotExist" in await call_revert(w3, DEX_ADDR, DEX.fns.bookIndexForKey(key).data)
+    assert "PairDoesNotExist" in await call_revert(w3, DEX.fns.bookIndexForKey(key))
 
     await _approve_and(w3, chain_id, admin, token, DEX.fns.place(token, 2_000_000_000, False, 0))
 
@@ -261,9 +253,9 @@ async def test_placing_an_order_auto_creates_an_indexed_book(w3, chain_id, funde
 
 async def test_book_index_rejects_unknown_books(w3):
     """An unknown key or an index past the end surfaces PairDoesNotExist, not a zero index."""
-    for data in (
-        DEX.fns.bookIndexForKey(HexBytes(b"\xab" * 32)).data,
-        DEX.fns.bookKeyForIndex(UNUSED_INDEX).data,
-        DEX.fns.setBookIndex(UNUSED_INDEX).data,
+    for call in (
+        DEX.fns.bookIndexForKey(HexBytes(b"\xab" * 32)),
+        DEX.fns.bookKeyForIndex(UNUSED_INDEX),
+        DEX.fns.setBookIndex(UNUSED_INDEX),
     ):
-        assert "PairDoesNotExist" in await call_revert(w3, DEX_ADDR, data)
+        assert "PairDoesNotExist" in await call_revert(w3, call)

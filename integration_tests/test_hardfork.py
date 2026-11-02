@@ -3,18 +3,14 @@ into the alloc and the boundary installers never fire; which forks own such stat
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import functools
-import json
 import os
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 import pytest
-from eth_account import Account
 from eth_utils import keccak, to_checksum_address
 from web3 import AsyncWeb3, Web3
 
@@ -29,54 +25,45 @@ from .anchoring import (
     RUNTIME_CODE,
     Page,
     deploy_relay,
-    emitted,
     genesis_with_anchoring,
     seed_fixture,
 )
 from .network import (
-    FAUCET_PRIVATE_KEY,
+    ACTIVATION_LEAD,
     TempoNode,
     dev_node,
+    fork_schedule,
     free_port,
     generate_dev_genesis,
+    genesis_alloc,
     resolve_tempo_bin,
+    run_binary,
+    running,
     xtask_forks,
 )
 from .utils import (
     FAR_FUTURE,
     STATE_WRITE_GAS,
     call_revert,
+    emitted,
     latest_timestamp,
     rpc,
     send_call,
     send_calls,
     wait_for_block,
+    wait_for_timestamp,
 )
+from .utils import GENESIS_ADMIN as ADMIN
 
 pytestmark = [pytest.mark.tempo, pytest.mark.slow]
-
-# Launch-to-fork gap: startup plus some pre-fork blocks; blocks land every 50ms, so generous is cheap.
-ACTIVATION_LEAD = 30
 
 MMR_FORK = "t10_time"  # once put a precompile, which answers before code, at 0x…0a00
 OWNER_FORK = "t12_time"
 DEPLOY_GAS = 25_000_000  # 20.7 KB of code at 1,000 gas a byte, and the creation around it
-ADMIN = Account.from_key(FAUCET_PRIVATE_KEY)  # the generated genesis's validator admin
-
-
-def _read_alloc(genesis: Path) -> dict[str, dict]:
-    return json.loads(genesis.read_text())["alloc"]
 
 
 def _generate_alloc(output_dir: Path, fork_times: dict[str, int] | None = None) -> dict[str, dict]:
-    return _read_alloc(generate_dev_genesis(output_dir, fork_times=fork_times))
-
-
-def _schedule(fork: str, activation: int) -> dict[str, int]:
-    """Activate ``fork`` and every later fork at ``activation``, leaving earlier ones at genesis; later
-    forks come along because a schedule has to stay ordered."""
-    order = xtask_forks()
-    return {f: activation for f in order[order.index(fork) :]}
+    return genesis_alloc(generate_dev_genesis(output_dir, fork_times=fork_times))
 
 
 @functools.lru_cache(maxsize=1)
@@ -89,16 +76,6 @@ def boundary_forks() -> tuple[str, ...]:
             return tuple(f for f in xtask_forks() if head - set(_generate_alloc(Path(tmp) / f, {f: FAR_FUTURE})))
     except (OSError, RuntimeError):
         return ()
-
-
-@contextlib.contextmanager
-def _running(node):
-    """Run ``node`` for the block, yielding a Web3 client bound to its RPC."""
-    try:
-        node.start().wait_for_rpc()
-        yield Web3(Web3.HTTPProvider(node.rpc_url))
-    finally:
-        node.stop()
 
 
 def _code(w3: Web3, address: str) -> bytes:
@@ -137,23 +114,12 @@ def _assert_pre_fork(w3: Web3, activation: int, fork: str) -> None:
     )
 
 
-def _wait_past(w3: Web3, activation: int, timeout: float = 120.0) -> None:
-    """Wait for a block at or past ``activation``."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if w3.eth.get_block("latest")["timestamp"] >= activation:
-            return
-        time.sleep(0.5)
-    raise TimeoutError(f"no block reached timestamp {activation} within {timeout}s")
-
-
 @pytest.fixture(scope="module")
 def head_chain(tmp_path_factory):
     """A chain with every fork active at genesis, T12 named outright since xtask leaves it off unless asked."""
     node = dev_node(tmp_path_factory.mktemp("head"), log_name="head.log", fork_times=dict.fromkeys(xtask_forks(), 0))
-    alloc = _read_alloc(node.genesis)
-    with _running(node) as w3:
-        yield w3, alloc
+    with running(node):
+        yield Web3(Web3.HTTPProvider(node.rpc_url)), genesis_alloc(node.genesis)
 
 
 @pytest.mark.parametrize("fork", boundary_forks())
@@ -163,23 +129,24 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
     head_w3, head_alloc = head_chain
     forks = xtask_forks()
     activation = int(time.time()) + ACTIVATION_LEAD
-    node = dev_node(tmp_path, log_name=f"{fork}.log", fork_times=_schedule(fork, activation))
+    node = dev_node(tmp_path, log_name=f"{fork}.log", fork_times=fork_schedule(fork, activation))
 
     # Whatever the scheduled genesis omits is precisely what the boundary installers owe.
-    owed = sorted(set(head_alloc) - set(_read_alloc(node.genesis)))
+    owed = sorted(set(head_alloc) - set(genesis_alloc(node.genesis)))
     assert owed, f"{fork} writes nothing into the alloc; boundary_forks() should not have yielded it"
 
     def fingerprints(client: Web3) -> dict[str, dict[str, str]]:
         return {a: _fingerprint(client, a, head_alloc[a].get("storage", {})) for a in owed}
 
-    with _running(node) as w3:
+    with running(node):
+        w3 = Web3(Web3.HTTPProvider(node.rpc_url))
         # Pre-fork: a live chain one fork short, holding none of the state.
         _assert_pre_fork(w3, activation, fork)
         assert _active_fork(w3) == forks[forks.index(fork) - 1]
         for address in owed:
             assert _code(w3, address) == b"", f"{address} must hold no code before {fork}"
 
-        _wait_past(w3, activation)
+        node.wait_for_rpc(timeout=120, want_timestamp=activation)
 
         # Post-fork: the executor installed it all on a chain already running without it.
         assert _active_fork(w3) == forks[-1]
@@ -190,7 +157,7 @@ def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
     """Its code, storage and answers come through the boundary unchanged."""
     activation = int(time.time()) + ACTIVATION_LEAD
     seed = seed_fixture()
-    genesis = genesis_with_anchoring(tmp_path, storage=seed, fork_times=_schedule(MMR_FORK, activation))
+    genesis = genesis_with_anchoring(tmp_path, storage=seed, fork_times=fork_schedule(MMR_FORK, activation))
     node = TempoNode(datadir=tmp_path / "node0", log_path=tmp_path / "t10.log", genesis=genesis, http_port=free_port())
     listing = ANCHORING.fns.registries(0, Page()).data
 
@@ -198,12 +165,13 @@ def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
         answer = bytes(w3.eth.call({"to": ANCHORING_ADDRESS, "data": listing}))
         return _fingerprint(w3, ANCHORING_ADDRESS, map(hex, seed)), answer
 
-    with _running(node) as w3:
+    with running(node):
+        w3 = Web3(Web3.HTTPProvider(node.rpc_url))
         _assert_pre_fork(w3, activation, MMR_FORK)
         before = state(w3)
         assert before[0]["code"] == PROXY_CODE.hex()
 
-        _wait_past(w3, activation)
+        node.wait_for_rpc(timeout=120, want_timestamp=activation)
 
         assert _active_fork(w3) == xtask_forks()[-1]
         assert state(w3) == before
@@ -218,7 +186,7 @@ async def _deploy(send, salt: int = 0) -> str:
 
 async def _added(send, name: str) -> list[tuple]:
     """The registries an ``addRegistry`` call reports, as ``(caller, id, name)``."""
-    return emitted(await send(ANCHORING_ADDRESS, ANCHORING.fns.addRegistry(name, "", "").data), "AddRegistry")
+    return emitted(await send(ANCHORING.fns.addRegistry(name, "", "")), ANCHORING, "AddRegistry")
 
 
 async def _implementation(w3: AsyncWeb3) -> str:
@@ -226,23 +194,13 @@ async def _implementation(w3: AsyncWeb3) -> str:
     return to_checksum_address((await w3.eth.get_storage_at(ANCHORING_ADDRESS, IMPLEMENTATION_SLOT))[12:])
 
 
-async def _wait_for_timestamp(w3: AsyncWeb3, timestamp: int, timeout: float = 120.0) -> None:
-    deadline = time.time() + timeout
-    while await latest_timestamp(w3) < timestamp:
-        if time.time() > deadline:
-            raise TimeoutError(f"no block reached timestamp {timestamp} within {timeout}s")
-        await asyncio.sleep(0.5)
-
-
 @contextlib.asynccontextmanager
 async def _launched(base: Path, genesis: Path):
     """A node on ``genesis``, its async client, and a sender bound to ``ADMIN``."""
     node = TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
-    try:
-        async with rpc(node.start().wait_for_rpc()) as w3:
+    with running(node):
+        async with rpc(node) as w3:
             yield node, w3, functools.partial(send_call, w3, node.chain_id, ADMIN)
-    finally:
-        node.stop()
 
 
 class TestCrossingT12:
@@ -251,7 +209,7 @@ class TestCrossingT12:
 
     @staticmethod
     def genesis(base: Path, activation: int) -> Path:
-        return generate_dev_genesis(base / "xtask", fork_times=_schedule(OWNER_FORK, activation), anchoring=True)
+        return generate_dev_genesis(base / "xtask", fork_times=fork_schedule(OWNER_FORK, activation), anchoring=True)
 
     @staticmethod
     async def assert_behind_the_proxy(w3: AsyncWeb3, send) -> None:
@@ -269,13 +227,13 @@ class TestCrossingT12:
             assert await _added(send, "before") == [(ADMIN.address, 1, "before")]
             await _deploy(send)
             assert await latest_timestamp(w3) < activation, "deployed too late to test"
-            await _wait_for_timestamp(w3, activation)
+            await wait_for_timestamp(w3, activation)
             await self.assert_behind_the_proxy(w3, send)
 
     async def test_t12_waits_for_the_implementation(self, tmp_path):
         activation = int(time.time()) + ACTIVATION_LEAD
         async with _launched(tmp_path, self.genesis(tmp_path, activation)) as (_, w3, send):
-            await _wait_for_timestamp(w3, activation)
+            await wait_for_timestamp(w3, activation)
             assert keccak(await w3.eth.get_code(ANCHORING_ADDRESS)) == LAUNCH_RUNTIME_HASH
             assert await _added(send, "before") == [(ADMIN.address, 1, "before")]
             await _deploy(send)
@@ -293,26 +251,24 @@ class TestCrossingT12:
         async with _launched(tmp_path, genesis) as (node, w3, send):
             # The shadow arm puts the proxy in at the block after this, and the calls below run through it.
             await _deploy(send)
-            data = ANCHORING.fns.addRegistry("replayed", "", "").data
-            await send(ANCHORING_ADDRESS, data)
+            write = ANCHORING.fns.addRegistry("replayed", "", "")
+            await send(write)
             relay = await deploy_relay(w3, node.chain_id, ADMIN)
-            calls = [{"to": relay, "data": data}]
+            calls = [{"to": relay, "data": write.data}]
             refused = await send_calls(
                 w3, chain_id=node.chain_id, private_key=ADMIN.key.hex(), calls=calls, gas_limit=STATE_WRITE_GAS
             )
             assert refused["status"] == 0, "the launch build refuses a contract"
             await wait_for_block(w3, refused["blockNumber"] + 20)  # until the blocks above persist
 
-        replay = subprocess.run(
-            [resolve_tempo_bin(), "shadow-replay", "--chain", str(genesis), "--datadir", str(node.datadir)]
-            + ["--hardfork", "T12", "--fail-on-findings"],
-            capture_output=True,
-            text=True,
+        replay = run_binary(
+            resolve_tempo_bin(),
+            *("shadow-replay", "--chain", str(genesis), "--datadir", str(node.datadir)),
+            *("--hardfork", "T12", "--fail-on-findings"),
             timeout=600,
             env=os.environ | {"RUST_LOG": "shadow_replay=debug"},
         )
         out = replay.stdout + replay.stderr
-        assert replay.returncode == 0, out[-4000:]
         for rule in ("t12.anchoring-upgrade", "t12.anchoring-calls", "t12.zone-factory-handover"):
             assert rule in out, f"{rule} explained nothing"
 
@@ -339,9 +295,9 @@ class TestLaunchingOnT12:
             assert await _added(send, "before") == [(ADMIN.address, 1, "before")]
             second = await _deploy(send, salt=1)
 
-            upgrade = ANCHORING.fns.upgradeToAndCall(second, b"").data
-            assert "sender not the owner" in await call_revert(w3, ANCHORING_ADDRESS, upgrade, sender=second)
-            assert emitted(await send(ANCHORING_ADDRESS, upgrade), "Upgraded") == [(second,)]
+            upgrade = ANCHORING.fns.upgradeToAndCall(second, b"")
+            assert "sender not the owner" in await call_revert(w3, upgrade, sender=second)
+            assert emitted(await send(upgrade), ANCHORING, "Upgraded") == [(second,)]
             assert await _implementation(w3) == second
             assert to_checksum_address(await ANCHORING.fns.owner().call(w3)) == ADMIN.address
             assert await _added(send, "after") == [(ADMIN.address, 2, "after")]

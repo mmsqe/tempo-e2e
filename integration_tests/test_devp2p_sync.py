@@ -2,13 +2,12 @@
 a follower whose upstream RPC is gone keeps up from its peers, backlog included."""
 
 import re
-import subprocess
 
 import pytest
 from web3 import Web3
 
 from .conftest import supervisord_net
-from .network import DEAD_UPSTREAM, FollowerNode, free_port, resolve_tempo_bin
+from .network import DEAD_UPSTREAM, FollowerNode, free_port, resolve_tempo_bin, run_binary, running
 from .utils import poll_height, wait_height
 
 pytestmark = [pytest.mark.tempo, pytest.mark.consensus, pytest.mark.slow]
@@ -22,7 +21,7 @@ def gossip_net(request, tmp_path_factory):
     """Four validators gossiping their finalizations."""
     if not request.config.getoption("--consensus"):
         pytest.skip("consensus localnet not requested (pass --consensus)")
-    if GOSSIP not in subprocess.run([resolve_tempo_bin(), "node", "--help"], capture_output=True, text=True).stdout:
+    if GOSSIP not in run_binary(resolve_tempo_bin(), "node", "--help").stdout:
         pytest.skip(f"this tempo has no {GOSSIP}")
     yield from supervisord_net(request, tmp_path_factory.mktemp("gossip-net"), VALIDATORS, patch_node_flags=[GOSSIP])
 
@@ -46,23 +45,17 @@ def _follower(cluster, base, *, gossip: bool) -> FollowerNode:
 
 
 def test_a_follower_syncs_over_devp2p_when_its_upstream_is_dead(gossip_net, tmp_path):
-    follower = _follower(gossip_net, tmp_path, gossip=True).start()
-    try:
-        # Past the validators' current height: certificates keep arriving, not just the backlog.
-        follower.wait_for_rpc(timeout=120, want_block=poll_height(gossip_net.node_rpc_url("node0")) + 5)
-    finally:
-        follower.stop()
+    # Past the validators' current height: certificates keep arriving, not just the backlog.
+    ahead = poll_height(gossip_net.node_rpc_url("node0")) + 5
+    with running(_follower(gossip_net, tmp_path, gossip=True), timeout=120, want_block=ahead):
+        pass
 
 
 def test_without_the_gossip_a_dead_upstream_leaves_a_follower_at_genesis(gossip_net, tmp_path):
-    follower = _follower(gossip_net, tmp_path, gossip=False).start()
-    try:
-        follower.wait_for_rpc(timeout=60, want_block=0)
+    with running(_follower(gossip_net, tmp_path, gossip=False), timeout=60, want_block=0) as follower:
         validator = gossip_net.node_rpc_url("node0")
         wait_height(validator, poll_height(validator) + 5)
         assert poll_height(follower.rpc_url) == 0
-    finally:
-        follower.stop()
 
 
 def test_a_late_follower_recovers_the_backlog_over_devp2p(gossip_net, tmp_path):
@@ -70,8 +63,5 @@ def test_a_late_follower_recovers_the_backlog_over_devp2p(gossip_net, tmp_path):
     exits, its log ending with the genesis header refused as a payload."""
     validator = gossip_net.node_rpc_url("node0")
     backlog = wait_height(validator, poll_height(validator) + 20)
-    follower = _follower(gossip_net, tmp_path, gossip=True).start()
-    try:
-        follower.wait_for_rpc(timeout=120, want_block=backlog + 5)
-    finally:
-        follower.stop()
+    with running(_follower(gossip_net, tmp_path, gossip=True), timeout=120, want_block=backlog + 5):
+        pass

@@ -3,14 +3,12 @@
 import time
 
 import pytest
-from eth_account import Account
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 from web3 import Web3
 
 from .conftest import TWO_NET_FOLLOWER, TWO_NET_PROXY, TWO_NET_PUBLIC
-from .network import FAUCET_PRIVATE_KEY
-from .utils import DEFAULT_MAX_FEE_PER_GAS, DEFAULT_MAX_PRIORITY_FEE_PER_GAS, poll_height, wait_height
+from .utils import GENESIS_ADMIN, new_account, poll_height, rpc, send_type_2, wait_height
 
 pytestmark = pytest.mark.consensus
 
@@ -83,28 +81,12 @@ def test_follower_peers_with_proxy(two_network_net):
     _assert_peers_with_proxy(two_network_net, TWO_NET_FOLLOWER)
 
 
-def test_send_tx_via_public_node(two_network_net):
+async def test_send_tx_via_public_node(two_network_net):
     """A tx sent to public0 gossips via follower0 to a validator and is mined."""
     public = two_network_net.node_rpc_url(TWO_NET_PUBLIC)
 
     # Need a devp2p peer (the follower) before the tx has a gossip path upstream.
     assert _wait_for_peers(public) >= 1, "public node has no devp2p peer to gossip the tx to"
 
-    # A type-2 transfer from the faucet key, at a fixed fee: tempo's extraData trips web3.py's PoA check.
-    w3 = Web3(Web3.HTTPProvider(public))
-    faucet = Account.from_key(FAUCET_PRIVATE_KEY)
-    tx = {
-        "to": PATH_USD,
-        "data": ERC20.fns.transfer(Account.create().address, 4321).data,
-        "value": 0,
-        "nonce": w3.eth.get_transaction_count(faucet.address),
-        "chainId": w3.eth.chain_id,
-        "gas": 1_000_000,
-        "maxFeePerGas": DEFAULT_MAX_FEE_PER_GAS,
-        "maxPriorityFeePerGas": DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
-        "type": 2,
-    }
-    tx_hash = w3.eth.send_raw_transaction(Account.sign_transaction(tx, faucet.key).raw_transaction)
-
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
-    assert receipt["status"] == 1, f"tx reverted: {receipt}"
+    async with rpc(public) as w3:
+        await send_type_2(w3, GENESIS_ADMIN, PATH_USD, ERC20.fns.transfer(new_account().address, 4321).data)

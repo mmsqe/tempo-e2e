@@ -4,12 +4,12 @@ import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 
-from .utils import deploy_contract, new_account
+from .utils import deploy_contract, init_code, new_account
 
 pytestmark = pytest.mark.tempo
 
-# Runtime returns CALLER.balance (BALANCE opcode); init copies the 10-byte runtime out.
-CALLER_BALANCE_INIT = "600a600c600039600a6000f3" + "333160005260206000f3"
+# Returns CALLER.balance (the BALANCE opcode).
+CALLER_BALANCE_INIT = init_code(bytes.fromhex("333160005260206000f3"))
 
 # `eth_getBalance`'s answer for every address: NATIVE_BALANCE_PLACEHOLDER in tempo's crates/node/src/rpc/mod.rs.
 NATIVE_BALANCE_PLACEHOLDER = int("42" * 38)

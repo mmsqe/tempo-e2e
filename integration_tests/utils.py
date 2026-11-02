@@ -16,15 +16,8 @@ from eth_contract.erc20 import ERC20
 from eth_utils import keccak
 from hexbytes import HexBytes
 from tempo import Builder, Signer, add_fee_payer_signature, serialize, sign_transaction
-from tempo.constants import (
-    ALPHA_USD,
-    BETA_USD,
-    FEE_MANAGER_ADDRESS,
-    PATH_USD,
-    THETA_USD,
-    TIP20_FACTORY_ADDRESS,
-    TIP403_REGISTRY_ADDRESS,
-)
+from tempo.constants import ALPHA_USD, BETA_USD, FEE_MANAGER_ADDRESS, PATH_USD, THETA_USD, TIP20_FACTORY_ADDRESS
+from tempo.devnet.config import DEFAULT_MNEMONIC
 from web3 import AsyncWeb3, Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
@@ -62,20 +55,50 @@ SET_CODE_GAS = 500_000  # a 7702 delegation, plus whatever the delegated code th
 # authorizeKey needs a real one, since 0 is ExpiryInPast.
 FAR_FUTURE = 4_000_000_000
 
+# The prefunded dev account the generated genesis names as validator admin; the faucet sends from it.
+GENESIS_ADMIN = Account.from_key(FAUCET_PRIVATE_KEY)
+
 
 def key_restrictions(*, expiry=FAR_FUTURE, enforce_limits=False, limits=(), allow_any_calls=True, allowed_calls=()):
     """A KeyRestrictions ABI tuple: (expiry, enforceLimits, limits[], allowAnyCalls, allowedCalls[])."""
     return (expiry, enforce_limits, list(limits), allow_any_calls, list(allowed_calls))
 
 
-# Minimal EVM fixtures: init code that deploys runtime returning 42, and the ERC-20 Transfer topic.
-RETURN_42_INIT = "600a600c600039600a6000f3602a60005260206000f3"
+def init_code(runtime: bytes) -> bytes:
+    """Init code deploying ``runtime`` (under 256 bytes): copy it out past these 12 bytes and return it."""
+    size = bytes([len(runtime)])
+    return b"\x60" + size + b"\x60\x0c\x60\x00\x39\x60" + size + b"\x60\x00\xf3" + runtime
+
+
+# Minimal EVM fixtures: a contract returning 42, and the ERC-20 Transfer topic.
 RETURN_42_RUNTIME = bytes.fromhex("602a60005260206000f3")
+RETURN_42_INIT = init_code(RETURN_42_RUNTIME)
 TRANSFER_TOPIC = HexBytes("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
 
 def new_account():
     return Account.create()
+
+
+def mnemonic_account(index: int = 0, phrase: str = DEFAULT_MNEMONIC):
+    """Account ``index`` of ``phrase``; the default funds a localnet's genesis and names its validators."""
+    Account.enable_unaudited_hdwallet_features()
+    return Account.from_mnemonic(phrase, account_path=f"m/44'/60'/0'/0/{index}")
+
+
+def _call(to, data=None) -> dict:
+    """``{to, data}`` from a function of an address-bound ABI, or ``to`` and ``data`` as given."""
+    if data is None:
+        return {"to": to.parent.tx["to"], "data": to.data}
+    return {"to": to, "data": data}
+
+
+def emitted(receipt, contract, event: str) -> list[tuple]:
+    """The arguments, in ABI order, of each ``event`` that ``contract`` logged in ``receipt`` at its bound address."""
+    abi = getattr(contract.events, event)
+    address = contract.tx["to"].lower()
+    logs = [log for log in receipt["logs"] if log["address"].lower() == address]
+    return [tuple(parsed["args"][i["name"]] for i in abi.abi["inputs"]) for parsed in abi.parse_logs(logs)]
 
 
 def transfer_call(to: str, amount: int, token: str = PATH_USD) -> dict:
@@ -106,8 +129,7 @@ def funder():
     if key := os.environ.get("E2E_FUNDER_KEY"):
         return Account.from_key(key)
     if phrase := os.environ.get("MNEMONIC"):
-        Account.enable_unaudited_hdwallet_features()
-        return Account.from_mnemonic(phrase, account_path="m/44'/60'/0'/0/0")
+        return mnemonic_account(phrase=phrase)
     return None
 
 
@@ -150,8 +172,8 @@ def build_tempo_tx(
     valid_after: int | None = None,
     awaiting_fee_payer: bool = False,
 ):
-    """An unsigned tempo (``0x76``) tx; each call is ``{to (None=create), value?, data?}``. With
-    ``awaiting_fee_payer`` the sender's signature leaves out ``fee_token``, for a fee payer to sign."""
+    """An unsigned tempo (``0x76``) tx; each call is ``{to (None=create), value?, data?}`` or a bound function.
+    With ``awaiting_fee_payer`` the sender's signature leaves out ``fee_token``, for a fee payer to sign."""
     builder = (
         Builder()
         .chain_id(chain_id)
@@ -169,6 +191,8 @@ def build_tempo_tx(
     if valid_after is not None:
         builder.valid_after(valid_after)
     for call in calls:
+        if not isinstance(call, dict):
+            call = _call(call)
         builder.add_call(to=call.get("to") or "", value=call.get("value", 0), data=call.get("data", b""))
     return builder.build()
 
@@ -220,10 +244,11 @@ async def rpc_result(w3: AsyncWeb3, method: str, params: Sequence = ()):
     return resp["result"]
 
 
-async def call_revert(w3: AsyncWeb3, to: str, data, *, sender: str | None = None) -> str:
+async def call_revert(w3: AsyncWeb3, to, data=None, *, sender: str | None = None) -> str:
     """``eth_call`` that must revert; the error message and data joined, so a test can match a precompile's
     error name or selector."""
-    tx = {"to": to, "data": data if isinstance(data, str) else "0x" + bytes(data).hex()}
+    tx = _call(to, data)
+    tx["data"] = HexBytes(tx["data"]).to_0x_hex()
     if sender is not None:
         tx["from"] = sender
     resp = await w3.provider.make_request("eth_call", [tx, "latest"])
@@ -275,8 +300,8 @@ async def send_call(
     w3: AsyncWeb3,
     chain_id: int,
     signer,
-    to: str,
-    data,
+    to,
+    data=None,
     *,
     gas_limit: int = STATE_WRITE_GAS,
     fee_token: str = PATH_USD,
@@ -288,20 +313,20 @@ async def send_call(
         private_key=signer.key.hex(),
         gas_limit=gas_limit,
         fee_token=fee_token,
-        calls=[{"to": to, "data": data}],
+        calls=[_call(to, data)],
     )
     assert receipt["status"] == 1
     return receipt
 
 
-async def send_type_2(w3: AsyncWeb3, account, to: str, data, *, gas: int | None = None, value: int = 0):
+async def send_type_2(w3: AsyncWeb3, account, to, data=None, *, gas: int | None = None, value: int = 0):
     """A plain EIP-1559 tx from ``account``, asserting success. It names no fee token, so the payer's own
     setting decides; gas defaults to the estimate, since TIP-1016 charges per new slot."""
+    call = _call(to, data)
     if gas is None:
-        gas = await w3.eth.estimate_gas({"to": to, "from": account.address, "data": data, "value": value})
+        gas = await w3.eth.estimate_gas({**call, "from": account.address, "value": value})
     tx = {
-        "to": to,
-        "data": data,
+        **call,
         "value": value,
         "nonce": await w3.eth.get_transaction_count(account.address),
         "chainId": await w3.eth.chain_id,
@@ -334,6 +359,15 @@ async def wait_for_block(w3: AsyncWeb3, number: int, *, timeout: float = 300.0, 
             raise TimeoutError(f"chain stalled at block {height} after {timeout}s, waiting for {number}")
         await asyncio.sleep(poll)
     return height
+
+
+async def wait_for_timestamp(w3: AsyncWeb3, timestamp: int, *, timeout: float = 120.0, poll: float = 0.5) -> None:
+    """Wait for a block at or past ``timestamp``."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while await latest_timestamp(w3) < timestamp:
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError(f"no block reached timestamp {timestamp} within {timeout}s")
+        await asyncio.sleep(poll)
 
 
 def poll_height(rpc_url: str) -> int:
@@ -373,12 +407,7 @@ async def create_token(
         chain_id=chain_id,
         private_key=admin.key.hex(),
         gas_limit=STATE_WRITE_GAS,
-        calls=[
-            {
-                "to": TIP20_FACTORY_ADDRESS,
-                "data": TIP20_FACTORY.fns.createToken(name, name, "USD", quote, admin.address, salt).data,
-            }
-        ],
+        calls=[TIP20_FACTORY.fns.createToken(name, name, "USD", quote, admin.address, salt)],
     )
     assert created["status"] == 1
     token = token_from_receipt(created)
@@ -407,11 +436,8 @@ async def blacklist_token(w3: AsyncWeb3, *, chain_id: int, admin, token: str, bl
         private_key=admin.key.hex(),
         gas_limit=STATE_WRITE_GAS,
         calls=[
-            {"to": TIP403_REGISTRY_ADDRESS, "data": TIP403.fns.createPolicy(admin.address, BLACKLIST).data},
-            {
-                "to": TIP403_REGISTRY_ADDRESS,
-                "data": TIP403.fns.modifyPolicyBlacklist(policy_id, blocked, True).data,
-            },
+            TIP403.fns.createPolicy(admin.address, BLACKLIST),
+            TIP403.fns.modifyPolicyBlacklist(policy_id, blocked, True),
             {"to": token, "data": TIP20.fns.changeTransferPolicyId(policy_id).data},
         ],
     )
@@ -452,7 +478,7 @@ async def seed_fee_pool(
         gas_limit=STATE_WRITE_GAS,
         calls=[
             approve_call(FEE_MANAGER_ADDRESS, validator_token, amount * 4),
-            {"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.mint(user_token, validator_token, amount, funder).data},
+            FEE.fns.mint(user_token, validator_token, amount, funder),
         ],
     )
 
@@ -488,10 +514,8 @@ async def send_set_code_tx(
     return await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(signed.raw_transaction))
 
 
-async def deploy_contract(w3: AsyncWeb3, *, chain_id: int, private_key: str, bytecode, nonce: int | None = None):
+async def deploy_contract(w3: AsyncWeb3, *, chain_id: int, private_key: str, bytecode: bytes, nonce: int | None = None):
     """Deploy ``bytecode`` via a tempo create tx; return ``(receipt, address)``."""
-    if isinstance(bytecode, str):
-        bytecode = bytes.fromhex(bytecode[2:] if bytecode.startswith("0x") else bytecode)
     receipt = await send_calls(
         w3, chain_id=chain_id, private_key=private_key, calls=[{"to": None, "data": bytecode}], nonce=nonce
     )

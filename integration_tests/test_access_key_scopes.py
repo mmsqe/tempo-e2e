@@ -1,13 +1,10 @@
 """TIP-1011 access-key permissions: a non-admin key scoped to calls (CallScope) fails CallNotAllowed
 outside them, and one capped per token (TokenLimit) fails SpendingLimitExceeded over the cap."""
 
-import asyncio
-
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo import Signer
 from tempo.constants import ALPHA_USD, PATH_USD
-from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
 from tempo.keychain import CallScope, SelectorRule, TokenLimit, sign_tx_access_key, sign_tx_registered_key
 
 from .abi import ACCOUNT_KEYCHAIN as KC
@@ -17,12 +14,12 @@ from .utils import (
     fund_token,
     funded,
     key_restrictions,
-    latest_timestamp,
     new_account,
     prepare_tx,
     send_call,
     send_signed,
     transfer_call,
+    wait_for_timestamp,
 )
 
 pytestmark = pytest.mark.tempo
@@ -99,7 +96,7 @@ async def test_empty_scope_denies_all_calls(w3, chain_id):
 async def test_access_key_cannot_create_contracts(w3, chain_id):
     """An access-key-signed tx may not CREATE, even under an admin key -- rejected at admission."""
     root = await funded(w3)
-    tx = await prepare_tx(w3, chain_id, root, [{"to": None, "data": bytes.fromhex(RETURN_42_INIT)}])
+    tx = await prepare_tx(w3, chain_id, root, [{"to": None, "data": RETURN_42_INIT}])
     signed = sign_tx_access_key(tx, new_account().key.hex(), Signer(root.key.hex()), is_admin=True)
     with pytest.raises(Exception, match="cannot use CREATE"):
         await send_signed(w3, signed)
@@ -113,7 +110,7 @@ async def test_periodic_limit_resets_each_window(w3, chain_id):
     # register the key on-chain: 5000 ALPHA per 5-second window (PATH ample, for gas)
     limits = [(ALPHA_USD, 5000, 5), (PATH_USD, 10**12, 0)]
     restrictions = key_restrictions(enforce_limits=True, limits=limits)
-    await send_call(w3, chain_id, root, KC_ADDR, KC.fns.authorizeKey(key.address, 0, restrictions).data)
+    await send_call(w3, chain_id, root, KC.fns.authorizeKey(key.address, 0, restrictions))
 
     async def spend(amount):
         tx = await prepare_tx(w3, chain_id, root, [transfer_call(recipient, amount, ALPHA_USD)])
@@ -124,8 +121,5 @@ async def test_periodic_limit_resets_each_window(w3, chain_id):
 
     remaining_fn = KC.fns.getRemainingLimitWithPeriod(root.address, key.address, ALPHA_USD)
     _remaining, period_end = await remaining_fn.call(w3)
-    for _ in range(30):  # let the 1s-block chain cross the window boundary
-        if await latest_timestamp(w3) > period_end:
-            break
-        await asyncio.sleep(0.5)
+    await wait_for_timestamp(w3, period_end + 1)  # the window boundary crossed
     assert await spend(3000) == 1  # a fresh window restores the full 5000

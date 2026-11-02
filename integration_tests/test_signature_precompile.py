@@ -1,17 +1,22 @@
 """TIP-1020 SignatureVerifier: recover/verify a tempo signature; verifyKeychain* (T6+) check live keychain keys."""
 
-import asyncio
-
 import pytest
 from eth_utils import keccak
 from tempo import Signer
-from tempo.constants import SIGNATURE_VERIFIER_ADDRESS as SV
-from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
 from tempo.keychain import build_keychain_signature
 
 from .abi import ACCOUNT_KEYCHAIN as KC
 from .abi import SIGNATURE_VERIFIER as SIG
-from .utils import FAR_FUTURE, call_revert, funded, key_restrictions, latest_timestamp, new_account, send_call
+from .utils import (
+    FAR_FUTURE,
+    call_revert,
+    funded,
+    key_restrictions,
+    latest_timestamp,
+    new_account,
+    send_call,
+    wait_for_timestamp,
+)
 
 pytestmark = pytest.mark.tempo
 
@@ -31,10 +36,10 @@ def _keychain_blob(inner_signer, account_addr):
 
 async def _authorize(w3, chain_id, account, key_id, *, is_admin, expiry=FAR_FUTURE):
     if is_admin:
-        data = KC.fns.authorizeAdminKey(key_id, 0, bytes(32)).data
+        authorize = KC.fns.authorizeAdminKey(key_id, 0, bytes(32))
     else:
-        data = KC.fns.authorizeKey(key_id, 0, key_restrictions(expiry=expiry)).data
-    await send_call(w3, chain_id, account, KC_ADDR, data)
+        authorize = KC.fns.authorizeKey(key_id, 0, key_restrictions(expiry=expiry))
+    await send_call(w3, chain_id, account, authorize)
 
 
 async def test_recover_returns_signer(w3):
@@ -53,7 +58,7 @@ async def test_verify_matches_only_the_true_signer(w3):
 
 async def test_recover_rejects_malformed_signature(w3):
     # length != 65 and no valid type byte -> InvalidFormat()
-    reason = await call_revert(w3, SV, SIG.fns.recover(HASH, b"\x00" * 64).data)
+    reason = await call_revert(w3, SIG.fns.recover(HASH, b"\x00" * 64))
     assert "InvalidFormat" in reason or INVALID_FORMAT in reason
 
 
@@ -67,7 +72,7 @@ async def test_verify_keychain_admin_accepts_root_key(w3):
 async def test_verify_keychain_rejects_plain_signature(w3):
     # a plain secp256k1 sig is not a keychain V2 blob -> InvalidFormat()
     signer = _signer()
-    reason = await call_revert(w3, SV, SIG.fns.verifyKeychain(signer.address, HASH, signer.sign(HASH).to_bytes()).data)
+    reason = await call_revert(w3, SIG.fns.verifyKeychain(signer.address, HASH, signer.sign(HASH).to_bytes()))
     assert "InvalidFormat" in reason or INVALID_FORMAT in reason
 
 
@@ -82,7 +87,7 @@ async def test_verify_keychain_accepts_active_non_admin_key(w3, chain_id):
     assert await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3)
     assert not await SIG.fns.verifyKeychainAdmin(account.address, HASH, blob).call(w3)
     # revoking it invalidates verifyKeychain
-    await send_call(w3, chain_id, account, KC_ADDR, KC.fns.revokeKey(key.address).data)
+    await send_call(w3, chain_id, account, KC.fns.revokeKey(key.address))
     assert not await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3)
 
 
@@ -115,8 +120,5 @@ async def test_verify_keychain_rejects_expired_key(w3, chain_id):
     await _authorize(w3, chain_id, account, key.address, is_admin=False, expiry=expiry)
     assert await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3)  # active while unexpired
 
-    for _ in range(40):  # bounded poll, ~20s
-        if await latest_timestamp(w3) >= expiry:
-            break
-        await asyncio.sleep(0.5)
+    await wait_for_timestamp(w3, expiry)
     assert not await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3)  # expired

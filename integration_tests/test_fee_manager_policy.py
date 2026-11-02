@@ -72,8 +72,8 @@ async def test_mint_requires_the_fee_manager_as_recipient(w3, chain_id, funded_a
     admin = funded_account
     token = await _fee_token(w3, chain_id, admin, holder=admin.address, blocked=FEE_MANAGER_ADDRESS)
 
-    data = FEE.fns.mint(token, PATH_USD, POOL_SEED, admin.address).data
-    assert "PolicyForbids" in await call_revert(w3, FEE_MANAGER_ADDRESS, data, sender=admin.address)
+    mint = FEE.fns.mint(token, PATH_USD, POOL_SEED, admin.address)
+    assert "PolicyForbids" in await call_revert(w3, mint, sender=admin.address)
 
 
 async def test_burn_requires_an_authorized_sender(w3, chain_id, funded_account):
@@ -87,10 +87,10 @@ async def test_burn_requires_an_authorized_sender(w3, chain_id, funded_account):
     assert half > 0
 
     # Unrestricted, the LP burns its own liquidity back out.
-    await send_call(w3, chain_id, lp, FEE_MANAGER_ADDRESS, FEE.fns.burn(token, PATH_USD, half, lp.address).data)
+    burn = FEE.fns.burn(token, PATH_USD, half, lp.address)
+    await send_call(w3, chain_id, lp, burn)
     assert await FEE.fns.liquidityBalances(pool_id, lp.address).call(w3) == liquidity - half
 
     # Blacklisted on the user token, the same burn is unauthorized.
     await blacklist_token(w3, chain_id=chain_id, admin=lp, token=token, blocked=lp.address)
-    data = FEE.fns.burn(token, PATH_USD, half, lp.address).data
-    assert "PolicyForbids" in await call_revert(w3, FEE_MANAGER_ADDRESS, data, sender=lp.address)
+    assert "PolicyForbids" in await call_revert(w3, burn, sender=lp.address)

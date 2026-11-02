@@ -6,7 +6,6 @@ from eth_contract.erc20 import ERC20
 from eth_utils import keccak, to_checksum_address
 from tempo.constants import PATH_USD
 from tempo.constants import RECEIVE_POLICY_GUARD_ADDRESS as GUARD_ADDR
-from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
 from .abi import RECEIVE_POLICY_GUARD as GUARD
 from .abi import TIP20_ROLES, TIP403
@@ -47,8 +46,7 @@ async def _block_transfer(w3, chain_id, sender, receiver, amount, token=PATH_USD
 
 
 async def _set_receive_policy(w3, chain_id, receiver, sender_id, token_id, recovery):
-    data = TIP403.fns.setReceivePolicy(sender_id, token_id, recovery).data
-    await send_call(w3, chain_id, receiver, REGISTRY, data)
+    await send_call(w3, chain_id, receiver, TIP403.fns.setReceivePolicy(sender_id, token_id, recovery))
 
 
 async def _whitelist_policy(w3, chain_id, admin, member):
@@ -59,10 +57,7 @@ async def _whitelist_policy(w3, chain_id, admin, member):
         chain_id=chain_id,
         private_key=admin.key.hex(),
         gas_limit=STATE_WRITE_GAS,
-        calls=[
-            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, WHITELIST).data},
-            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyWhitelist(pid, member, True).data},
-        ],
+        calls=[TIP403.fns.createPolicy(admin.address, WHITELIST), TIP403.fns.modifyPolicyWhitelist(pid, member, True)],
     )
     return pid
 
@@ -85,11 +80,11 @@ async def test_blocked_transfer_is_escrowed_and_claimable(w3, chain_id):
     assert await GUARD.fns.balanceOf(witness).call(w3) == 4000
 
     # a non-receiver cannot claim the escrow
-    reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(sender.address, witness).data, sender=sender.address)
+    reason = await call_revert(w3, GUARD.fns.claim(sender.address, witness), sender=sender.address)
     assert "UnauthorizedClaimer" in reason or "0x5c4aa7dc" in reason
 
     # the receiver claims it back to itself
-    claimed = await send_call(w3, chain_id, receiver, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data)
+    claimed = await send_call(w3, chain_id, receiver, GUARD.fns.claim(receiver.address, witness))
     # receiver regains the 4000, less the gas it paid (in PATH_USD) to claim
     expected = receiver_before + 4000 - gas_cost_in_token(claimed)
     assert await ERC20.fns.balanceOf(receiver.address).call(w3, to=PATH_USD) == expected
@@ -110,7 +105,7 @@ async def test_blocked_mint_is_escrowed_and_claimable(w3, chain_id, funded_accou
     assert await ERC20.fns.balanceOf(GUARD_ADDR).call(w3, to=token) == 7000  # freshly minted to the guard
     assert await GUARD.fns.balanceOf(witness).call(w3) == 7000
 
-    await send_call(w3, chain_id, receiver, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data)
+    await send_call(w3, chain_id, receiver, GUARD.fns.claim(receiver.address, witness))
     assert await ERC20.fns.balanceOf(receiver.address).call(w3, to=token) == 7000
     assert await GUARD.fns.balanceOf(witness).call(w3) == 0
 
@@ -125,14 +120,14 @@ async def test_burn_blocked_receipt(w3, chain_id, funded_account):
     amount, witness = await _block_transfer(w3, chain_id, sender, receiver, 6000, token)
 
     # without BURN_BLOCKED_ROLE the escrow cannot be burned
-    reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.burnBlockedReceipt(witness).data, sender=sender.address)
+    reason = await call_revert(w3, GUARD.fns.burnBlockedReceipt(witness), sender=sender.address)
     assert "Unauthorized" in reason or "0x82b42900" in reason
 
     # burning needs the receiver to be unauthorized as a sender under the token's policy
     await blacklist_token(w3, chain_id=chain_id, admin=admin, token=token, blocked=receiver.address)
 
     supply_before = await ERC20.fns.totalSupply().call(w3, to=token)
-    await send_call(w3, chain_id, admin, GUARD_ADDR, GUARD.fns.burnBlockedReceipt(witness).data)
+    await send_call(w3, chain_id, admin, GUARD.fns.burnBlockedReceipt(witness))
     assert await GUARD.fns.balanceOf(witness).call(w3) == 0  # receipt consumed
     assert await ERC20.fns.balanceOf(GUARD_ADDR).call(w3, to=token) == 0  # escrow drained
     assert await ERC20.fns.totalSupply().call(w3, to=token) == supply_before - amount  # supply burned
@@ -182,15 +177,15 @@ async def test_originator_recovery_reroutes(w3, chain_id):
     _amount, witness = await _block_transfer(w3, chain_id, sender, receiver, 4000)
 
     # the receiver is not the recovery authority
-    r1 = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data, sender=receiver.address)
+    r1 = await call_revert(w3, GUARD.fns.claim(receiver.address, witness), sender=receiver.address)
     assert "UnauthorizedClaimer" in r1
     # rerouting back to the still-blocking receiver re-runs its receive policy -> PolicyForbids
-    r2 = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data, sender=sender.address)
+    r2 = await call_revert(w3, GUARD.fns.claim(receiver.address, witness), sender=sender.address)
     assert "PolicyForbids" in r2
 
     # ...but rerouting to a policy-free destination (the sender itself) succeeds
     after_block = await ERC20.fns.balanceOf(sender.address).call(w3, to=PATH_USD)
-    claimed = await send_call(w3, chain_id, sender, GUARD_ADDR, GUARD.fns.claim(sender.address, witness).data)
+    claimed = await send_call(w3, chain_id, sender, GUARD.fns.claim(sender.address, witness))
     expected = after_block + 4000 - gas_cost_in_token(claimed)  # the 4000 returns, less claim gas
     assert await ERC20.fns.balanceOf(sender.address).call(w3, to=PATH_USD) == expected
     assert await GUARD.fns.balanceOf(witness).call(w3) == 0
@@ -203,12 +198,12 @@ async def test_third_party_recovery_claim(w3, chain_id):
     _amount, witness = await _block_transfer(w3, chain_id, sender, receiver, 4000)
 
     for who in (sender, receiver):  # neither the originator nor the receiver is the authority
-        reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(who.address, witness).data, sender=who.address)
+        reason = await call_revert(w3, GUARD.fns.claim(who.address, witness), sender=who.address)
         assert "UnauthorizedClaimer" in reason
 
     # the helper claims to the receiver (third-party -> receiver is a resume); the helper pays gas
     receiver_before = await ERC20.fns.balanceOf(receiver.address).call(w3, to=PATH_USD)
-    await send_call(w3, chain_id, helper, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data)
+    await send_call(w3, chain_id, helper, GUARD.fns.claim(receiver.address, witness))
     assert await ERC20.fns.balanceOf(receiver.address).call(w3, to=PATH_USD) == receiver_before + 4000
     assert await GUARD.fns.balanceOf(witness).call(w3) == 0
 
@@ -237,8 +232,8 @@ async def test_double_claim_reverts(w3, chain_id):
     _amount, witness = await _block_transfer(w3, chain_id, sender, receiver, 4000)
 
     # first claim consumes the receipt
-    await send_call(w3, chain_id, receiver, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data)
-    reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data, sender=receiver.address)
+    await send_call(w3, chain_id, receiver, GUARD.fns.claim(receiver.address, witness))
+    reason = await call_revert(w3, GUARD.fns.claim(receiver.address, witness), sender=receiver.address)
     assert "InvalidReceipt" in reason or "0xc0098aac" in reason
 
 
@@ -255,16 +250,14 @@ async def test_set_receive_policy_rejects_compound_and_virtual(w3, chain_id, fun
 
     # a COMPOUND policy cannot be used as a receive-policy filter (only simple / built-in ids)
     compound = await TIP403.fns.policyIdCounter().call(w3)
-    await send_call(
-        w3, chain_id, admin, REGISTRY, TIP403.fns.createCompoundPolicy(ALLOW_ALL, ALLOW_ALL, ALLOW_ALL).data
-    )
-    compound_data = TIP403.fns.setReceivePolicy(compound, ALLOW_ALL, receiver).data
-    assert "InvalidReceivePolicyType" in await call_revert(w3, REGISTRY, compound_data, sender=receiver)
+    await send_call(w3, chain_id, admin, TIP403.fns.createCompoundPolicy(ALLOW_ALL, ALLOW_ALL, ALLOW_ALL))
+    set_compound = TIP403.fns.setReceivePolicy(compound, ALLOW_ALL, receiver)
+    assert "InvalidReceivePolicyType" in await call_revert(w3, set_compound, sender=receiver)
 
     # a virtual address may not set a receive policy
     virtual = to_checksum_address(b"\xaa\xbb\xcc\xdd" + b"\xfd" * 10 + b"\x00" * 6)
-    data = TIP403.fns.setReceivePolicy(ALLOW_ALL, ALLOW_ALL, receiver).data
-    assert "VirtualAddressNotAllowed" in await call_revert(w3, REGISTRY, data, sender=virtual)
+    set_any = TIP403.fns.setReceivePolicy(ALLOW_ALL, ALLOW_ALL, receiver)
+    assert "VirtualAddressNotAllowed" in await call_revert(w3, set_any, sender=virtual)
 
 
 async def test_resume_claim_enforces_token_transfer_policy(w3, chain_id, funded_account):
@@ -278,5 +271,5 @@ async def test_resume_claim_enforces_token_transfer_policy(w3, chain_id, funded_
     # after escrow, bind the token to a policy that blocks the receiver as a recipient
     await blacklist_token(w3, chain_id=chain_id, admin=admin, token=token, blocked=receiver.address)
     # resume skips the receive-policy recheck but still enforces the token's TIP-403 destination check
-    reason = await call_revert(w3, GUARD_ADDR, GUARD.fns.claim(receiver.address, witness).data, sender=receiver.address)
+    reason = await call_revert(w3, GUARD.fns.claim(receiver.address, witness), sender=receiver.address)
     assert "PolicyForbids" in reason

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,8 +12,8 @@ from typing import NamedTuple
 from eth_utils import to_checksum_address
 
 from .abi import ANCHORING, ANCHORING_ADDRESS
-from .network import TempoNode, default_genesis, free_port, generate_dev_genesis, resolve_tempo_bin
-from .utils import deploy_contract, send_call
+from .network import TempoNode, default_genesis, free_port, generate_dev_genesis, resolve_tempo_bin, run_binary, running
+from .utils import deploy_contract, emitted, init_code, send_call
 
 LAYOUT = Path(__file__).parent.parent / "contracts" / "layout"
 if not LAYOUT.is_dir():
@@ -117,10 +116,8 @@ def load_dump(genesis: Path, datadir: Path, slots: dict[int, int]) -> None:
         for slot, value in pairs:
             f.write(slot.to_bytes(32, "big") + value.to_bytes(32, "big"))
     chain = ("--chain", str(genesis), "--datadir", str(datadir))
-    for args in (("init", *chain), ("init-from-binary-dump", *chain, str(dump))):
-        done = subprocess.run([resolve_tempo_bin(), *args], capture_output=True, text=True, timeout=300)
-        if done.returncode != 0:
-            raise RuntimeError(f"tempo {args[0]} failed (exit {done.returncode}):\n{done.stderr[-2000:]}")
+    run_binary(resolve_tempo_bin(), "init", *chain)
+    run_binary(resolve_tempo_bin(), "init-from-binary-dump", *chain, str(dump))
 
 
 @contextmanager
@@ -137,9 +134,9 @@ def anchoring_node(base: Path, *, owner: str | None = None, extra_args: list[str
         extra_args=extra_args,
     )
     try:
-        yield node.start().wait_for_rpc()
+        with running(node):
+            yield node
     finally:
-        node.stop()
         print(f"\n  anchoring node kept: python -m integration_tests.devnode up --datadir {node.datadir}")
 
 
@@ -152,9 +149,7 @@ RELAY_RUNTIME = (
 
 async def deploy_relay(w3, chain_id: int, account) -> str:
     runtime = bytes.fromhex(RELAY_RUNTIME.format(addr=ANCHORING_ADDRESS[2:]))
-    size = f"60{len(runtime):02x}"
-    init = bytes.fromhex(f"{size} 600c 6000 39 {size} 6000 f3") + runtime  # copy the runtime out, return it
-    _, relay = await deploy_contract(w3, chain_id=chain_id, private_key=account.key.hex(), bytecode=init)
+    _, relay = await deploy_contract(w3, chain_id=chain_id, private_key=account.key.hex(), bytecode=init_code(runtime))
     return relay
 
 
@@ -178,10 +173,10 @@ def bech32(address: str, hrp: str = "nvnm") -> str:
     return hrp + "1" + "".join("qpzry9x8gf2tvdw0s3jn54khce6mua7l"[w] for w in words)
 
 
-def add_record(registry_id: int, checksum: str, uri: str = "", algo: str = "sha256") -> bytes:
-    """``addRecord`` calldata. The chain fills in the timestamp, ids and ``isLatest``."""
+def add_record(registry_id: int, checksum: str, uri: str = "", algo: str = "sha256"):
+    """An ``addRecord`` call. The chain fills in the timestamp, ids and ``isLatest``."""
     record = (uri or f"https://ex.test/{checksum}", checksum, algo, '{"by":"tempo-e2e"}', "", "Active")
-    return ANCHORING.fns.addRecord((*record, 0, 0, False, registry_id)).data
+    return ANCHORING.fns.addRecord((*record, 0, 0, False, registry_id))
 
 
 async def registries(w3, registry_id: int = 0, page: Page = Page()) -> list[Registry]:
@@ -202,13 +197,6 @@ async def records(
 
 
 async def new_registry(w3, chain_id: int, creator, name: str = "tempo-e2e") -> int:
-    receipt = await send_call(w3, chain_id, creator, ANCHORING_ADDRESS, ANCHORING.fns.addRegistry(name, "", "").data)
-    [(_, registry_id, _)] = emitted(receipt, "AddRegistry")
+    receipt = await send_call(w3, chain_id, creator, ANCHORING.fns.addRegistry(name, "", ""))
+    [(_, registry_id, _)] = emitted(receipt, ANCHORING, "AddRegistry")
     return registry_id
-
-
-def emitted(receipt, event: str, contract=ANCHORING, address: str = ANCHORING_ADDRESS) -> list[tuple]:
-    """Each ``event`` the contract logged in ``receipt``, as a tuple of its arguments in ABI order."""
-    abi = getattr(contract.events, event)
-    logs = [log for log in receipt["logs"] if log["address"] == address]
-    return [tuple(parsed["args"][i["name"]] for i in abi.abi["inputs"]) for parsed in abi.parse_logs(logs)]

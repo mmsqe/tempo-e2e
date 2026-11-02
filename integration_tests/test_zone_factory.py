@@ -1,16 +1,13 @@
 """The zone factory (TIP-1091), which this fork gives to the validator registry's owner at genesis or T12."""
 
-import functools
 import json
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from eth_account import Account
 from eth_utils import to_checksum_address
 from tempo.constants import PATH_USD, VALIDATOR_CONFIG_V2_ADDRESS
-from web3 import Web3
 
 from .abi import (
     UPSTREAM_ZONE_OWNER,
@@ -22,32 +19,39 @@ from .abi import (
     ZONE_VERIFIER_ADDRESS,
 )
 from .abi import VALIDATOR_CONFIG_V2 as V2
-from .anchoring import emitted
-from .network import FAUCET_PRIVATE_KEY, TempoNode, free_port, generate_dev_genesis, xtask_forks
+from .network import (
+    ACTIVATION_LEAD,
+    TempoNode,
+    fork_schedule,
+    free_port,
+    generate_dev_genesis,
+    genesis_alloc,
+    running,
+)
 from .utils import (
     FAR_FUTURE,
     ZERO_ADDRESS,
     active_forks,
     call_revert,
     create_token,
+    emitted,
     new_account,
     rpc,
     send_call,
     wait_for_block,
 )
+from .utils import GENESIS_ADMIN as ADMIN
 
-pytestmark = [pytest.mark.tempo]
+pytestmark = pytest.mark.tempo
 
-ADMIN = Account.from_key(FAUCET_PRIVATE_KEY)  # the generated genesis's validator admin
 NAMED = to_checksum_address("0x" + "b0" * 20)  # a --zone-owner
 T12_LATER = {"t12_time": FAR_FUTURE}
 ZONE_GAS = 25_000_000  # creation charges 15M before it starts
 ZONES_BEFORE = 3  # nextZoneId the testnet-like chain launches with, for the fork to keep
-ACTIVATION_LEAD = 30  # seconds from launch to T12: node startup, then pre-fork blocks
 
 
 def genesis_owner(genesis: Path) -> str:
-    factory = json.loads(genesis.read_text())["alloc"][ZONE_FACTORY_ADDRESS.lower()]
+    factory = genesis_alloc(genesis)[ZONE_FACTORY_ADDRESS.lower()]
     return to_checksum_address(f"0x{int(factory['storage'][f'0x{0:064x}'], 16) >> 32:040x}")
 
 
@@ -55,24 +59,15 @@ def genesis_owner(genesis: Path) -> str:
 def past_t12(base: Path, *, zone_owner: str = UPSTREAM_ZONE_OWNER, next_zone_id: int = 1, **options):
     """A testnet-like node, its factory on ``zone_owner`` with ``next_zone_id`` before T12, yielded at T12."""
     activation = int(time.time()) + ACTIVATION_LEAD
-    forks = xtask_forks()
-    schedule = dict.fromkeys(forks[forks.index("t12_time") :], activation)
+    schedule = fork_schedule("t12_time", activation)
     genesis = generate_dev_genesis(base, fork_times=schedule, zone_owner=zone_owner, **options)
     launch = json.loads(genesis.read_text())
     storage, slot = launch["alloc"][ZONE_FACTORY_ADDRESS.lower()]["storage"], f"0x{0:064x}"
     storage[slot] = f"0x{int(storage[slot], 16) >> 32 << 32 | next_zone_id:064x}"
     genesis.write_text(json.dumps(launch))
     node = TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
-    try:
-        node.start().wait_for_rpc()
-        client = Web3(Web3.HTTPProvider(node.rpc_url))
-        deadline = time.time() + ACTIVATION_LEAD + 90
-        while client.eth.get_block("latest")["timestamp"] < activation:
-            assert time.time() < deadline, f"no block reached T12 at {activation}"
-            time.sleep(0.5)
+    with running(node, timeout=ACTIVATION_LEAD + 90, want_timestamp=activation):
         yield node
-    finally:
-        node.stop()
 
 
 async def view(w3, fn, at: str = ZONE_FACTORY_ADDRESS, block: int | str = "latest"):
@@ -91,8 +86,8 @@ async def new_zone(w3, chain_id: int, name: str) -> tuple[int, str, str, str]:
     token = await create_token(w3, chain_id=chain_id, admin=ADMIN, name=name, salt=name.encode().rjust(32, b"\0"))
     sequencer = new_account().address
     create = ZONE_FACTORY.fns.createZone(open_zone(token, ADMIN.address, sequencer))
-    receipt = await send_call(w3, chain_id, ADMIN, ZONE_FACTORY_ADDRESS, create.data, gas_limit=ZONE_GAS)
-    [(zone_id, portal, *_)] = emitted(receipt, "ZoneCreated", ZONE_FACTORY, ZONE_FACTORY_ADDRESS)
+    receipt = await send_call(w3, chain_id, ADMIN, create, gas_limit=ZONE_GAS)
+    [(zone_id, portal, *_)] = emitted(receipt, ZONE_FACTORY, "ZoneCreated")
     return zone_id, portal, token, sequencer
 
 
@@ -147,7 +142,7 @@ class TestOwner:
             ZONE_FACTORY.fns.createZone(open_zone(PATH_USD, caller, caller)),
             ZONE_FACTORY.fns.transferOwnership(caller),
         ):
-            assert "NotOwner" in await call_revert(w3, ZONE_FACTORY_ADDRESS, call.data, sender=caller)
+            assert "NotOwner" in await call_revert(w3, call, sender=caller)
 
     async def test_the_owner_creates_the_next_zone_after_those_from_before(self, w3, chain_id):
         zone_id, portal, token, sequencer = await new_zone(w3, chain_id, "ZONE")
@@ -163,20 +158,16 @@ class TestOwner:
         """The fork never takes it back: the new owner still holds it blocks later."""
 
         def hand_to(account):
-            return ZONE_FACTORY.fns.transferOwnership(account.address).data
+            return ZONE_FACTORY.fns.transferOwnership(account.address)
 
-        handed = functools.partial(
-            emitted, event="OwnershipTransferred", contract=ZONE_FACTORY, address=ZONE_FACTORY_ADDRESS
-        )
-
-        receipt = await send_call(w3, chain_id, ADMIN, ZONE_FACTORY_ADDRESS, hand_to(funded_account))
-        assert handed(receipt) == [(ADMIN.address, funded_account.address)]
-        assert "NotOwner" in await call_revert(w3, ZONE_FACTORY_ADDRESS, hand_to(ADMIN), sender=ADMIN.address)
+        receipt = await send_call(w3, chain_id, ADMIN, hand_to(funded_account))
+        assert emitted(receipt, ZONE_FACTORY, "OwnershipTransferred") == [(ADMIN.address, funded_account.address)]
+        assert "NotOwner" in await call_revert(w3, hand_to(ADMIN), sender=ADMIN.address)
         await wait_for_block(w3, receipt["blockNumber"] + 2)
         assert await view(w3, ZONE_FACTORY.fns.owner()) == funded_account.address
 
-        receipt = await send_call(w3, chain_id, funded_account, ZONE_FACTORY_ADDRESS, hand_to(ADMIN))
-        assert handed(receipt) == [(funded_account.address, ADMIN.address)]
+        receipt = await send_call(w3, chain_id, funded_account, hand_to(ADMIN))
+        assert emitted(receipt, ZONE_FACTORY, "OwnershipTransferred") == [(funded_account.address, ADMIN.address)]
 
 
 @pytest.mark.slow
@@ -204,7 +195,7 @@ class TestPortal:
 
     async def test_t13_replaced_the_implementation(self, w3, tempo, tmp_path):
         def implementation(genesis: Path) -> bytes:
-            account = json.loads(genesis.read_text())["alloc"][ZONE_PORTAL_IMPLEMENTATION.lower()]
+            account = genesis_alloc(genesis)[ZONE_PORTAL_IMPLEMENTATION.lower()]
             return bytes.fromhex(account["code"].removeprefix("0x"))
 
         launched = implementation(tempo.genesis)

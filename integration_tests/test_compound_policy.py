@@ -3,7 +3,6 @@ mint), so a transfer checks its sender and recipient against different policies.
 
 import pytest
 from eth_contract.erc20 import ERC20
-from tempo.constants import TIP403_REGISTRY_ADDRESS as REGISTRY
 
 from .abi import TIP20, TIP20_ROLES, TIP403
 from .utils import (
@@ -34,11 +33,11 @@ async def _create_compound(w3, chain_id, admin, *, sender, recipient):
         private_key=admin.key.hex(),
         gas_limit=STATE_WRITE_GAS,
         calls=[
-            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, WHITELIST).data},
-            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyWhitelist(sender_pid, sender, True).data},
-            {"to": REGISTRY, "data": TIP403.fns.createPolicy(admin.address, WHITELIST).data},
-            {"to": REGISTRY, "data": TIP403.fns.modifyPolicyWhitelist(recip_pid, recipient, True).data},
-            {"to": REGISTRY, "data": TIP403.fns.createCompoundPolicy(sender_pid, recip_pid, ALLOW_ALL).data},
+            TIP403.fns.createPolicy(admin.address, WHITELIST),
+            TIP403.fns.modifyPolicyWhitelist(sender_pid, sender, True),
+            TIP403.fns.createPolicy(admin.address, WHITELIST),
+            TIP403.fns.modifyPolicyWhitelist(recip_pid, recipient, True),
+            TIP403.fns.createCompoundPolicy(sender_pid, recip_pid, ALLOW_ALL),
         ],
     )
     assert receipt["status"] == 1
@@ -101,10 +100,10 @@ async def test_create_compound_rejects_invalid_references(w3, chain_id, funded_a
     cid, _, _ = await _create_compound(w3, chain_id, admin, sender=admin.address, recipient=admin.address)
     missing = await TIP403.fns.policyIdCounter().call(w3) + 999
 
-    bad_ref = TIP403.fns.createCompoundPolicy(missing, ALLOW_ALL, ALLOW_ALL).data
-    assert "PolicyNotFound" in await call_revert(w3, REGISTRY, bad_ref, sender=admin.address)
-    nested = TIP403.fns.createCompoundPolicy(cid, ALLOW_ALL, ALLOW_ALL).data
-    assert "PolicyNotSimple" in await call_revert(w3, REGISTRY, nested, sender=admin.address)
+    bad_ref = TIP403.fns.createCompoundPolicy(missing, ALLOW_ALL, ALLOW_ALL)
+    assert "PolicyNotFound" in await call_revert(w3, bad_ref, sender=admin.address)
+    nested = TIP403.fns.createCompoundPolicy(cid, ALLOW_ALL, ALLOW_ALL)
+    assert "PolicyNotSimple" in await call_revert(w3, nested, sender=admin.address)
 
 
 async def test_mint_policy_dispatches_separately_from_recipient(w3, chain_id, funded_account):

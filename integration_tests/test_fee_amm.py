@@ -15,11 +15,13 @@ from web3.exceptions import Web3RPCError
 
 from .abi import FEE, TIP20, TIP20_ROLES
 from .conftest import supervisord_net
-from .network import FAUCET_PRIVATE_KEY, dev_node
+from .network import dev_node, gas_token_flags, running
 from .utils import (
+    GENESIS_ADMIN,
     create_token,
     fund_token,
     gas_cost_in_token,
+    mnemonic_account,
     new_account,
     prepare_tx,
     rpc,
@@ -51,7 +53,7 @@ async def test_pool_has_reserves(w3):
 
 
 async def test_set_user_token(w3, chain_id, funded_account):
-    await send_call(w3, chain_id, funded_account, FEE_MANAGER_ADDRESS, FEE.fns.setUserToken(ALPHA_USD).data)
+    await send_call(w3, chain_id, funded_account, FEE.fns.setUserToken(ALPHA_USD))
     stored = await FEE.fns.userTokens(funded_account.address).call(w3)
     assert HexBytes(stored) == HexBytes(ALPHA_USD)
 
@@ -120,18 +122,15 @@ class TestDeploymentGasToken:
     """Fees on xtask's temporary gas token, before any stablecoin is bridged. On a dev node every
     block's fee recipient is address zero, which has no key, so only the payer's side is tested."""
 
-    ISSUER = Account.from_key(FAUCET_PRIVATE_KEY)
+    ISSUER = GENESIS_ADMIN
     PAYER = Account.from_key("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")  # a genesis account
 
     @pytest.fixture
     async def gas_token_w3(self, tmp_path):
         node = dev_node(tmp_path, log_name="deployment-gas-token.log", gas_token_admin=self.ISSUER.address)
-        try:
-            node.start().wait_for_rpc()
+        with running(node):
             async with rpc(node) as w3:
                 yield w3
-        finally:
-            node.stop()
 
     async def test_a_payer_leaves_it_only_through_a_pool(self, gas_token_w3):
         w3 = gas_token_w3
@@ -148,29 +147,19 @@ class TestDeploymentGasToken:
         assert await balance.call(w3, to=PATH_USD) == usd - 1
 
         # Paying in nUSD needs a pool into the token the recipient takes; the issuer seeds one.
-        switch = FEE.fns.setUserToken(PATH_USD).data
+        switch = FEE.fns.setUserToken(PATH_USD)
         with pytest.raises(Web3RPCError, match="insufficient liquidity"):
-            await send_type_2(w3, payer, FEE_MANAGER_ADDRESS, switch)
+            await send_type_2(w3, payer, switch)
         liquidity = 10**10
         await send_type_2(w3, self.ISSUER, token, ERC20.fns.approve(FEE_MANAGER_ADDRESS, liquidity).data)
-        await send_type_2(
-            w3, self.ISSUER, FEE_MANAGER_ADDRESS, FEE.fns.mint(PATH_USD, token, liquidity, self.ISSUER.address).data
-        )
-        await send_type_2(w3, payer, FEE_MANAGER_ADDRESS, switch)
+        await send_type_2(w3, self.ISSUER, FEE.fns.mint(PATH_USD, token, liquidity, self.ISSUER.address))
+        await send_type_2(w3, payer, switch)
 
         pool = FEE.fns.getPool(PATH_USD, token)
         gas, reserve = await balance.call(w3, to=token), (await pool.call(w3))[0]
         await send_type_2(w3, payer, PATH_USD, ERC20.fns.transfer(new_account().address, 1).data)
         assert await balance.call(w3, to=token) == gas, "no temporary token spent"
         assert (await pool.call(w3))[0] > reserve, "the nUSD fee went through the pool"
-
-
-def _dev_account(index: int):
-    """An account of the dev mnemonic, which funds the localnet's genesis and names its validators."""
-    Account.enable_unaudited_hdwallet_features()
-    return Account.from_mnemonic(
-        "test test test test test test test test test test test junk", account_path=f"m/44'/60'/0'/0/{index}"
-    )
 
 
 @pytest.mark.consensus
@@ -183,7 +172,7 @@ class TestDeploymentGasTokenOnValidators:
 
     @pytest.fixture(scope="class")
     def gas_token_net(self, request, tmp_path_factory):
-        flags = ["--deployment-gas-token", "--deployment-gas-token-admin", _dev_account(0).address]
+        flags = gas_token_flags(mnemonic_account(0).address)
         base = tmp_path_factory.mktemp("gas-token-net")
         yield from supervisord_net(request, base, self.VALIDATORS, patch_genesis_flags=flags)
 
@@ -191,8 +180,8 @@ class TestDeploymentGasTokenOnValidators:
         async with rpc(gas_token_net.node_rpc_url("node0")) as w3:
             cs = Web3.to_checksum_address
             chain_id = await w3.eth.chain_id
-            admin, payer = _dev_account(0), _dev_account(10)
-            validators = [_dev_account(i) for i in range(1, self.VALIDATORS + 1)]
+            admin, payer = mnemonic_account(0), mnemonic_account(10)
+            validators = [mnemonic_account(i) for i in range(1, self.VALIDATORS + 1)]
             transfer = ERC20.fns.transfer(new_account().address, 1).data
 
             token = cs(await FEE.fns.userTokens(payer.address).call(w3))
@@ -206,18 +195,16 @@ class TestDeploymentGasTokenOnValidators:
             # 1. The admin seeds the nUSD -> token pool with the token alone.
             liquidity = 10**10
             await send_type_2(w3, admin, token, ERC20.fns.approve(FEE_MANAGER_ADDRESS, liquidity).data)
-            await send_type_2(
-                w3, admin, FEE_MANAGER_ADDRESS, FEE.fns.mint(PATH_USD, token, liquidity, admin.address).data
-            )
+            await send_type_2(w3, admin, FEE.fns.mint(PATH_USD, token, liquidity, admin.address))
             await send_type_2(w3, newcomer, PATH_USD, transfer)
 
             # 2. Every account on the token moves to nUSD, validators and admin included.
-            switch = FEE.fns.setUserToken(PATH_USD).data
+            switch = FEE.fns.setUserToken(PATH_USD)
             for account in (admin, payer, *validators):
-                await send_type_2(w3, account, FEE_MANAGER_ADDRESS, switch)
+                await send_type_2(w3, account, switch)
 
             # 3. Each validator takes nUSD at once; the call reverts in a block its sender proposes, so those resend.
-            calls = [{"to": FEE_MANAGER_ADDRESS, "data": FEE.fns.setValidatorToken(PATH_USD).data}]
+            calls = [FEE.fns.setValidatorToken(PATH_USD)]
             pending = validators
             for _ in range(5):
                 receipts = await asyncio.gather(
@@ -243,7 +230,7 @@ class TestDeploymentGasTokenOnValidators:
             # 4. The admin takes the collected nUSD out, then pauses the token.
             pool_id = await FEE.fns.getPoolId(PATH_USD, token).call(w3)
             shares = await FEE.fns.liquidityBalances(pool_id, admin.address).call(w3)
-            await send_type_2(w3, admin, FEE_MANAGER_ADDRESS, FEE.fns.burn(PATH_USD, token, shares, admin.address).data)
+            await send_type_2(w3, admin, FEE.fns.burn(PATH_USD, token, shares, admin.address))
             assert (await pool.call(w3))[0] < reserves[0]
             pause_role = await TIP20.fns.PAUSE_ROLE().call(w3, to=token)
             await send_type_2(w3, admin, token, TIP20_ROLES.fns.grantRole(pause_role, admin.address).data)

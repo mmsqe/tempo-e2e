@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import re
 import shutil
@@ -11,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import requests
@@ -29,6 +31,9 @@ DEFAULT_HTTP_PORT = 8545
 
 # A follower's upstream that refuses: the discard port, so no block comes over websocket.
 DEAD_UPSTREAM = "ws://127.0.0.1:9"
+
+# Seconds from launching a chain to a fork it schedules: startup, then some pre-fork blocks.
+ACTIVATION_LEAD = 30
 
 
 def free_port() -> int:
@@ -74,9 +79,22 @@ def resolve_xtask_bin() -> str:
     return resolve_bin("tempo-xtask", "TEMPO_XTASK_BIN")
 
 
-def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None) -> int:
-    """Poll ``rpc_url`` until ``block >= want_block`` and return its chain id; ``check_alive`` raises once the
-    node dies."""
+def run_binary(binary: str, *args: str, timeout: float = 300, env=None) -> subprocess.CompletedProcess[str]:
+    """Run ``binary`` to completion; a nonzero exit raises with the tail of its output."""
+    done = subprocess.run(
+        [binary, *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout, env=env
+    )
+    if done.returncode != 0:
+        output = (done.stdout + done.stderr)[-4000:]
+        raise RuntimeError(f"{Path(binary).name} {args[0]} failed (exit {done.returncode}):\n{output}")
+    return done
+
+
+def _poll_rpc(
+    rpc_url: str, *, timeout: float, want_block: int, want_timestamp: int | None = None, check_alive=None
+) -> int:
+    """Poll ``rpc_url`` until ``block >= want_block`` and, if given, ``want_timestamp``; return its chain id.
+    ``check_alive`` raises once the node dies."""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     deadline = time.time() + timeout
     last_err: Exception | None = None
@@ -85,7 +103,8 @@ def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None
             check_alive()
         try:
             if w3.is_connected() and w3.eth.block_number >= want_block:
-                return w3.eth.chain_id
+                if want_timestamp is None or w3.eth.get_block("latest")["timestamp"] >= want_timestamp:
+                    return w3.eth.chain_id
         except Exception as e:  # noqa: BLE001 - RPC not up yet
             last_err = e
         time.sleep(0.5)
@@ -96,12 +115,26 @@ def _poll_rpc(rpc_url: str, *, timeout: float, want_block: int, check_alive=None
 def xtask_forks() -> tuple[str, ...]:
     """The ``tN_time`` forks the installed ``tempo-xtask`` can schedule, oldest first, read off its flags so a
     test that schedules a newer fork can skip."""
-    result = subprocess.run([resolve_xtask_bin(), "generate-genesis", "--help"], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"tempo-xtask generate-genesis --help failed (exit {result.returncode}):\n{result.stderr}")
-    forks = re.findall(r"--t(\d+)([a-z]?)-time", result.stdout)
+    forks = re.findall(r"--t(\d+)([a-z]?)-time", run_binary(resolve_xtask_bin(), "generate-genesis", "--help").stdout)
     # Numeric sort, point releases after their base: t1 < t1a < t2 < ... < t9 < t10.
     return tuple(f"t{num}{point}_time" for num, point in sorted(forks, key=lambda f: (int(f[0]), f[1])))
+
+
+def fork_schedule(fork: str, activation: int) -> dict[str, int]:
+    """Activate ``fork`` and every later fork at ``activation``, leaving earlier ones at genesis; later
+    forks come along because a schedule has to stay ordered."""
+    order = xtask_forks()
+    return {f: activation for f in order[order.index(fork) :]}
+
+
+def gas_token_flags(admin: str) -> list[str]:
+    """xtask's flags for a genesis that pays fees in the temporary deployment gas token ``admin`` issues."""
+    return ["--deployment-gas-token", "--deployment-gas-token-admin", admin]
+
+
+def genesis_alloc(genesis: Path) -> dict[str, dict]:
+    """The accounts of ``genesis``, keyed by lowercase address."""
+    return {address.lower(): account for address, account in json.loads(genesis.read_text())["alloc"].items()}
 
 
 def generate_dev_genesis(
@@ -137,7 +170,7 @@ def generate_dev_genesis(
         *(("--anchoring",) if anchoring else ()),
         *(("--anchoring-owner", anchoring_owner) if anchoring_owner else ()),
         *(("--zone-owner", zone_owner) if zone_owner else ()),
-        *(("--deployment-gas-token", "--deployment-gas-token-admin", gas_token_admin) if gas_token_admin else ()),
+        *(gas_token_flags(gas_token_admin) if gas_token_admin else ()),
         *(("--validator-addresses", validator_address) if validator_address else ()),
     ]
     if not options and not dkg:
@@ -149,26 +182,14 @@ def generate_dev_genesis(
         if genesis.exists():
             return genesis
     output_dir.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [
-            resolve_xtask_bin(),
-            "generate-genesis",
-            "--output",
-            str(output_dir),
-            "--accounts",
-            str(DEV_GENESIS_ACCOUNTS),
-            "--seed",
-            "0",
-            "--validators",
-            "127.0.0.1:30303",
-            *(() if dkg else ("--no-dkg-in-genesis",)),
-            *options,
-        ],
-        capture_output=True,
-        text=True,
+    run_binary(
+        resolve_xtask_bin(),
+        "generate-genesis",
+        *("--output", str(output_dir), "--accounts", str(DEV_GENESIS_ACCOUNTS), "--seed", "0"),
+        *("--validators", "127.0.0.1:30303"),
+        *(() if dkg else ("--no-dkg-in-genesis",)),
+        *options,
     )
-    if result.returncode != 0 or not genesis.exists():
-        raise RuntimeError(f"tempo-xtask generate-genesis failed (exit {result.returncode}):\n{result.stderr}")
     return genesis
 
 
@@ -282,14 +303,16 @@ class TempoNode:
         )
         return self
 
-    def wait_for_rpc(self, timeout: float = 180.0, want_block: int = 1) -> "TempoNode":
-        """Poll the HTTP RPC until it answers with ``block >= want_block``; cache the chain id."""
+    def wait_for_rpc(self, timeout: float = 180.0, want_block: int = 1, want_timestamp: int | None = None) -> TempoNode:
+        """Poll the HTTP RPC until ``block >= want_block`` and, if given, ``want_timestamp``; cache the chain id."""
 
         def check_alive():
             if self.proc is not None and self.proc.poll() is not None:
                 raise RuntimeError(f"node exited early (code {self.proc.returncode}); see {self.log_path}")
 
-        self.chain_id = _poll_rpc(self.rpc_url, timeout=timeout, want_block=want_block, check_alive=check_alive)
+        self.chain_id = _poll_rpc(
+            self.rpc_url, timeout=timeout, want_block=want_block, want_timestamp=want_timestamp, check_alive=check_alive
+        )
         return self
 
     def stop(self) -> None:
@@ -378,6 +401,15 @@ def dev_node(
     genesis = generate_dev_genesis(devnet, fork_times=fork_times, chain_id=chain_id, gas_token_admin=gas_token_admin)
     kwargs.setdefault("http_port", free_port())
     return TempoNode(datadir=devnet / "node0", log_path=devnet / log_name, genesis=genesis, **kwargs)
+
+
+@contextmanager
+def running(node, **wait):
+    """Run ``node`` for the block, once ``wait_for_rpc(**wait)`` returns."""
+    try:
+        yield node.start().wait_for_rpc(**wait)
+    finally:
+        node.stop()
 
 
 class ExternalNode:

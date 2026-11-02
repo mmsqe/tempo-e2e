@@ -19,7 +19,6 @@ from .anchoring import (
     anchoring_node,
     bech32,
     deploy_relay,
-    emitted,
     new_registry,
     records,
     registries,
@@ -33,6 +32,7 @@ from .utils import (
     active_forks,
     call_revert,
     deploy_contract,
+    emitted,
     fund,
     funded,
     get_nonce,
@@ -165,10 +165,9 @@ class TestSeededCorpus:
         me = funded_account.address
         [last] = await registries(w3, page=Page(limit=1, reverse=True))
         new_id = last.id + 1
-        data = ANCHORING.fns.addRegistry("us-ca1", "Again", "{}").data
-        receipt = await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, data)
+        receipt = await send_call(w3, chain_id, funded_account, ANCHORING.fns.addRegistry("us-ca1", "Again", "{}"))
 
-        assert emitted(receipt, "AddRegistry") == [(me, new_id, "us-ca1")]
+        assert emitted(receipt, ANCHORING, "AddRegistry") == [(me, new_id, "us-ca1")]
         at = time.strftime(GO_TIME, time.gmtime((await w3.eth.get_block(receipt["blockNumber"]))["timestamp"]))
         assert await registries(w3, new_id) == [Registry(new_id, "us-ca1", "Again", bech32(me), at, "{}")]
         ids = [r.id for r in await registries_by_name(w3, "us-ca1")]
@@ -176,10 +175,9 @@ class TestSeededCorpus:
 
     async def test_a_seeded_checksum_in_a_new_registry(self, w3, chain_id, funded_account):
         registry_id = await new_registry(w3, chain_id, funded_account)
-        data = add_record(registry_id, self.CITATION)
-        receipt = await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, data)
+        receipt = await send_call(w3, chain_id, funded_account, add_record(registry_id, self.CITATION))
 
-        assert emitted(receipt, "AddRecord") == [(funded_account.address, registry_id, 1, 1, self.CITATION)]
+        assert emitted(receipt, ANCHORING, "AddRecord") == [(funded_account.address, registry_id, 1, 1, self.CITATION)]
         across = await records(w3, checksum=self.CITATION)
         assert across[:2] == [self.SECOND, self.ELSEWHERE]
         assert across[-1].registry_id == registry_id
@@ -187,8 +185,8 @@ class TestSeededCorpus:
     async def test_registry_3_is_frozen_to_everyone_but_the_owner(self, w3):
         """Registry 3's only admin has no key, so no key can appoint another."""
         successor = await funded(w3)
-        grant = ANCHORING.fns.grantRole(3, "", successor.address, "admin").data
-        assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, grant, sender=successor.address)
+        grant = ANCHORING.fns.grantRole(3, "", successor.address, "admin")
+        assert "missing required role" in await call_revert(w3, grant, sender=successor.address)
         assert await ANCHORING.fns.roleMemberCount(keccak(text="registry:3:admin")).call(w3) == 1
 
 
@@ -200,13 +198,13 @@ class TestWrites:
             add_record(registry_id, "sha:v", "https://ex.test/v1"),
             add_record(registry_id, "sha:v", "https://ex.test/v2"),
         )
-        await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, v1)
-        second = await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, v2)
-        assert emitted(second, "AddRecord") == [(me, registry_id, 1, 2, "sha:v")]
+        await send_call(w3, chain_id, funded_account, v1)
+        second = await send_call(w3, chain_id, funded_account, v2)
+        assert emitted(second, ANCHORING, "AddRecord") == [(me, registry_id, 1, 2, "sha:v")]
 
-        status = ANCHORING.fns.updateRecordStatus(registry_id, 1, 1, "Superseded").data
-        updated = await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, status)
-        assert emitted(updated, "UpdateRecordStatus") == [(me, registry_id, 1, 1, "Superseded")]
+        status = ANCHORING.fns.updateRecordStatus(registry_id, 1, 1, "Superseded")
+        updated = await send_call(w3, chain_id, funded_account, status)
+        assert emitted(updated, ANCHORING, "UpdateRecordStatus") == [(me, registry_id, 1, 1, "Superseded")]
 
         [first] = await records(w3, registry_id, "sha:v", index=1)
         [latest] = await records(w3, registry_id, "sha:v")
@@ -218,19 +216,19 @@ class TestWrites:
     async def test_roles(self, w3, chain_id, funded_account):
         admin, editor = funded_account, await funded(w3)
         registry_id = await new_registry(w3, chain_id, admin)
-        grant = ANCHORING.fns.grantRole(registry_id, "", editor.address, "editor").data
-        revoke = ANCHORING.fns.revokeRole(registry_id, "", editor.address, "editor").data
+        grant = ANCHORING.fns.grantRole(registry_id, "", editor.address, "editor")
+        revoke = ANCHORING.fns.revokeRole(registry_id, "", editor.address, "editor")
         change = (admin.address, registry_id, "", editor.address, "editor")
         first, second = add_record(registry_id, "sha:1"), add_record(registry_id, "sha:2")
 
-        assert "unauthorized" in await call_revert(w3, ANCHORING_ADDRESS, first, sender=editor.address)
-        assert emitted(await send_call(w3, chain_id, admin, ANCHORING_ADDRESS, grant), "GrantRole") == [change]
-        await send_call(w3, chain_id, editor, ANCHORING_ADDRESS, first)
-        assert emitted(await send_call(w3, chain_id, admin, ANCHORING_ADDRESS, revoke), "RevokeRole") == [change]
-        assert "unauthorized" in await call_revert(w3, ANCHORING_ADDRESS, second, sender=editor.address)
+        assert "unauthorized" in await call_revert(w3, first, sender=editor.address)
+        assert emitted(await send_call(w3, chain_id, admin, grant), ANCHORING, "GrantRole") == [change]
+        await send_call(w3, chain_id, editor, first)
+        assert emitted(await send_call(w3, chain_id, admin, revoke), ANCHORING, "RevokeRole") == [change]
+        assert "unauthorized" in await call_revert(w3, second, sender=editor.address)
 
-        last_admin = ANCHORING.fns.revokeRole(registry_id, "", admin.address, "admin").data
-        refused = await call_revert(w3, ANCHORING_ADDRESS, last_admin, sender=admin.address)
+        last_admin = ANCHORING.fns.revokeRole(registry_id, "", admin.address, "admin")
+        refused = await call_revert(w3, last_admin, sender=admin.address)
         assert "cannot revoke the last registry admin" in refused
 
 
@@ -238,36 +236,37 @@ class TestGas:
     """What the node charges: forge prices its own VM, and an estimate is not a receipt."""
 
     async def test_an_estimate_covers_the_write(self, w3, funded_account):
-        data = ANCHORING.fns.addRegistry("estimate", "covers the receipt", "{}").data
-        await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data)  # at the estimate, which must not run out
+        write = ANCHORING.fns.addRegistry("estimate", "covers the receipt", "{}")
+        await send_type_2(w3, funded_account, write)  # at the estimate, which must not run out
 
     async def test_every_write_costs_more_than_its_calldata(self, w3, chain_id, funded_account):
         """Each method runs: one that did nothing would stop at the intrinsic cost."""
         editor = new_account().address
         registry_id = await new_registry(w3, chain_id, funded_account, name="gas-matrix")
-        await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, add_record(registry_id, "sha:gas"))
+        await send_call(w3, chain_id, funded_account, add_record(registry_id, "sha:gas"))
         [record] = await records(w3, registry_id, "sha:gas")
-        status = ANCHORING.fns.updateRecordStatus(registry_id, record.record_id, record.index, "Superseded")
 
         writes = {
-            "addRegistry": ANCHORING.fns.addRegistry("gas-matrix-2", "", "{}").data,
+            "addRegistry": ANCHORING.fns.addRegistry("gas-matrix-2", "", "{}"),
             "addRecord": add_record(registry_id, "sha:gas-2"),
-            "updateRecordStatus": status.data,
-            "grantRole": ANCHORING.fns.grantRole(registry_id, "", editor, "editor").data,
-            "revokeRole": ANCHORING.fns.revokeRole(registry_id, "", editor, "editor").data,
+            "updateRecordStatus": ANCHORING.fns.updateRecordStatus(
+                registry_id, record.record_id, record.index, "Superseded"
+            ),
+            "grantRole": ANCHORING.fns.grantRole(registry_id, "", editor, "editor"),
+            "revokeRole": ANCHORING.fns.revokeRole(registry_id, "", editor, "editor"),
         }
 
-        for method, data in writes.items():
-            receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data)
-            assert receipt["gasUsed"] > intrinsic(data), method
+        for method, write in writes.items():
+            receipt = await send_type_2(w3, funded_account, write)
+            assert receipt["gasUsed"] > intrinsic(write.data), method
 
     async def test_a_bigger_metadata_costs_more(self, w3, funded_account):
         """Past the calldata it adds: the string lands in storage, a slot at a time."""
         costs = {}
         for size in (100, 1000):
-            data = ANCHORING.fns.addRegistry(f"gas-scale-{size}", "", "m" * size).data
-            receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data)
-            costs[size] = receipt["gasUsed"] - intrinsic(data)
+            write = ANCHORING.fns.addRegistry(f"gas-scale-{size}", "", "m" * size)
+            receipt = await send_type_2(w3, funded_account, write)
+            costs[size] = receipt["gasUsed"] - intrinsic(write.data)
 
         assert costs[1000] > costs[100]
 
@@ -279,11 +278,10 @@ class TestFieldLimits:
         """MAX_CHECKSUM_ALGO is 128 bytes."""
         registry_id = await new_registry(w3, chain_id, funded_account, name="limits")
 
-        at_cap = add_record(registry_id, "sha:at-cap", algo="a" * 128)
-        await send_call(w3, chain_id, funded_account, ANCHORING_ADDRESS, at_cap)
+        await send_call(w3, chain_id, funded_account, add_record(registry_id, "sha:at-cap", algo="a" * 128))
 
         over = add_record(registry_id, "sha:over-cap", algo="a" * 129)
-        refused = await call_revert(w3, ANCHORING_ADDRESS, over, sender=funded_account.address)
+        refused = await call_revert(w3, over, sender=funded_account.address)
         assert "checksum algorithm exceeds max length" in refused
 
 
@@ -294,7 +292,7 @@ class TestCaller:
     async def assert_created_by(w3, receipt, account: str) -> None:
         """``receipt`` created a registry with ``account`` as its caller, creator and admin."""
         assert receipt["status"] == 1
-        [(caller, registry_id, _)] = emitted(receipt, "AddRegistry")
+        [(caller, registry_id, _)] = emitted(receipt, ANCHORING, "AddRegistry")
         assert caller == account
         [registry] = await registries(w3, registry_id)
         assert registry.creator == bech32(account)
@@ -302,38 +300,30 @@ class TestCaller:
 
     async def test_type_2(self, w3, funded_account):
         """What the old chain's integrations send."""
-        data = ANCHORING.fns.addRegistry("type-2", "", "").data
-        receipt = await send_type_2(w3, funded_account, ANCHORING_ADDRESS, data, gas=STATE_WRITE_GAS)
+        write = ANCHORING.fns.addRegistry("type-2", "", "")
+        receipt = await send_type_2(w3, funded_account, write, gas=STATE_WRITE_GAS)
         assert receipt["type"] == 2
         await self.assert_created_by(w3, receipt, funded_account.address)
 
     async def test_a_tempo_batch(self, w3, chain_id, funded_account):
         [last] = await registries(w3, page=Page(limit=1, reverse=True))
-        calls = [
-            {"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.addRegistry("batched", "", "").data},
-            {"to": ANCHORING_ADDRESS, "data": add_record(last.id + 1, "sha:b")},
-        ]
+        calls = [ANCHORING.fns.addRegistry("batched", "", ""), add_record(last.id + 1, "sha:b")]
         receipt = await send_calls(
             w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=calls, gas_limit=STATE_WRITE_GAS
         )
         await self.assert_created_by(w3, receipt, funded_account.address)
-        assert emitted(receipt, "AddRecord") == [(funded_account.address, last.id + 1, 1, 1, "sha:b")]
+        assert emitted(receipt, ANCHORING, "AddRecord") == [(funded_account.address, last.id + 1, 1, 1, "sha:b")]
 
     async def test_a_fee_payer(self, w3, chain_id):
         """The sender holds nothing and is still the caller."""
         sender, payer = new_account(), await funded(w3)
-        calls = [{"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.addRegistry("sponsored", "", "").data}]
+        calls = [ANCHORING.fns.addRegistry("sponsored", "", "")]
         signed = await sign_sponsored(w3, chain_id, sender, payer, calls)
         await self.assert_created_by(w3, await send_signed(w3, signed), sender.address)
 
     async def test_an_access_key(self, w3, chain_id):
         root, key = await funded(w3), new_account()
-        tx = await prepare_tx(
-            w3,
-            chain_id,
-            root,
-            [{"to": ANCHORING_ADDRESS, "data": ANCHORING.fns.addRegistry("access-key", "", "").data}],
-        )
+        tx = await prepare_tx(w3, chain_id, root, [ANCHORING.fns.addRegistry("access-key", "", "")])
         receipt = await send_signed(w3, sign_tx_access_key(tx, key.key.hex(), Signer(root.key.hex()), is_admin=True))
         await self.assert_created_by(w3, receipt, root.address)
 
@@ -353,17 +343,15 @@ class TestCaller:
             to=funded_account.address,
         )
         assert len(await w3.eth.get_code(authority.address)) == 23
-        data = ANCHORING.fns.addRegistry("delegated", "", "").data
-        await self.assert_created_by(
-            w3, await send_call(w3, chain_id, authority, ANCHORING_ADDRESS, data), authority.address
-        )
+        write = ANCHORING.fns.addRegistry("delegated", "", "")
+        await self.assert_created_by(w3, await send_call(w3, chain_id, authority, write), authority.address)
 
     async def test_a_contract_anchors_as_itself(self, w3, chain_id, funded_account):
         relay = await deploy_relay(w3, chain_id, funded_account)
         data = ANCHORING.fns.addRegistry("relayed", "", "").data
         receipt = await send_call(w3, chain_id, funded_account, relay, data)
         await self.assert_created_by(w3, receipt, relay)
-        [(_, registry_id, _)] = emitted(receipt, "AddRegistry")
+        [(_, registry_id, _)] = emitted(receipt, ANCHORING, "AddRegistry")
         assert not await ANCHORING.fns.hasRole(
             keccak(text=f"registry:{registry_id}:admin"), funded_account.address
         ).call(w3)
@@ -383,32 +371,32 @@ class TestOwner:
         role = keccak(text="registry:3:admin")
 
         successor = await funded(w3)
-        grant = ANCHORING.fns.grantRole(3, "", successor.address, "admin").data
-        receipt = await send_call(w3, chain_id, OWNER, ANCHORING_ADDRESS, grant)
-        assert emitted(receipt, "GrantRole") == [(OWNER.address, 3, "", successor.address, "admin")]
+        grant = ANCHORING.fns.grantRole(3, "", successor.address, "admin")
+        receipt = await send_call(w3, chain_id, OWNER, grant)
+        assert emitted(receipt, ANCHORING, "GrantRole") == [(OWNER.address, 3, "", successor.address, "admin")]
         assert await ANCHORING.fns.roleMemberCount(role).call(w3) == 2
-        receipt = await send_call(w3, chain_id, successor, ANCHORING_ADDRESS, add_record(3, "sha:recovered"))
-        assert emitted(receipt, "AddRecord") == [(successor.address, 3, 1, 1, "sha:recovered")]
+        receipt = await send_call(w3, chain_id, successor, add_record(3, "sha:recovered"))
+        assert emitted(receipt, ANCHORING, "AddRecord") == [(successor.address, 3, 1, 1, "sha:recovered")]
 
         # The break-glass is a registry admin and nothing else.
-        editor = ANCHORING.fns.grantRole(3, "", successor.address, "editor").data
-        assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, editor, sender=OWNER.address)
+        editor = ANCHORING.fns.grantRole(3, "", successor.address, "editor")
+        assert "missing required role" in await call_revert(w3, editor, sender=OWNER.address)
 
     async def test_the_ownership_moves_to_a_contract(self, w3, chain_id, funded_account):
         relay = await deploy_relay(w3, chain_id, funded_account)
-        zero = ANCHORING.fns.transferOwnership(ZERO_ADDRESS).data
-        assert "new owner is the zero address" in await call_revert(w3, ANCHORING_ADDRESS, zero, sender=OWNER.address)
-        handover = ANCHORING.fns.transferOwnership(relay).data
-        receipt = await send_call(w3, chain_id, OWNER, ANCHORING_ADDRESS, handover)
-        assert emitted(receipt, "OwnershipTransferred") == [(OWNER.address, relay)]
+        zero = ANCHORING.fns.transferOwnership(ZERO_ADDRESS)
+        assert "new owner is the zero address" in await call_revert(w3, zero, sender=OWNER.address)
+        handover = ANCHORING.fns.transferOwnership(relay)
+        receipt = await send_call(w3, chain_id, OWNER, handover)
+        assert emitted(receipt, ANCHORING, "OwnershipTransferred") == [(OWNER.address, relay)]
         assert to_checksum_address(await ANCHORING.fns.owner().call(w3)) == relay
 
-        grant = ANCHORING.fns.grantRole(2, "", funded_account.address, "admin").data
-        assert "missing required role" in await call_revert(w3, ANCHORING_ADDRESS, grant, sender=OWNER.address)
-        receipt = await send_call(w3, chain_id, funded_account, relay, grant)
-        assert emitted(receipt, "GrantRole") == [(relay, 2, "", funded_account.address, "admin")]
+        grant = ANCHORING.fns.grantRole(2, "", funded_account.address, "admin")
+        assert "missing required role" in await call_revert(w3, grant, sender=OWNER.address)
+        receipt = await send_call(w3, chain_id, funded_account, relay, grant.data)
+        assert emitted(receipt, ANCHORING, "GrantRole") == [(relay, 2, "", funded_account.address, "admin")]
 
         # And back, for the rest of the module.
         back = ANCHORING.fns.transferOwnership(OWNER.address).data
         receipt = await send_call(w3, chain_id, funded_account, relay, back)
-        assert emitted(receipt, "OwnershipTransferred") == [(relay, OWNER.address)]
+        assert emitted(receipt, ANCHORING, "OwnershipTransferred") == [(relay, OWNER.address)]

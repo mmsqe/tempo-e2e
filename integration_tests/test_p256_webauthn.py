@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
-from tempo.contracts import ACCOUNT_KEYCHAIN_ADDRESS as KC_ADDR
 from tempo.keychain import SignatureType, sign_tx_registered_key
 from tempo.p256 import (
     AT,
@@ -54,8 +53,7 @@ async def spend(w3, chain_id, key, recipient, amount, *, account=None, **kwargs)
 
 
 async def authorize(w3, chain_id, root, key, key_type):
-    data = KC.fns.authorizeKey(key.checksum_address, key_type, key_restrictions()).data
-    return await send_call(w3, chain_id, root, KC_ADDR, data)
+    return await send_call(w3, chain_id, root, KC.fns.authorizeKey(key.checksum_address, key_type, key_restrictions()))
 
 
 def sign_tx(tx, signer: P256Signer, *, account=None, webauthn: bool = False, **kwargs):
@@ -230,7 +228,7 @@ class TestAsAccessKey:
         await authorize(w3, chain_id, root, key, SignatureType.P256)
 
         assert (await spend(w3, chain_id, key, recipient, 500, account=root))["status"] == 1
-        await send_call(w3, chain_id, root, KC_ADDR, KC.fns.revokeKey(key.checksum_address).data)
+        await send_call(w3, chain_id, root, KC.fns.revokeKey(key.checksum_address))
 
         with pytest.raises(Exception, match="KeyAlreadyRevoked"):
             await spend(w3, chain_id, key, recipient, 500, account=root)

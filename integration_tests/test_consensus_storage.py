@@ -8,18 +8,12 @@ import pytest
 from .docker_cluster import DockerCluster
 from .utils import poll_height, wait_height
 
-pytestmark = pytest.mark.consensus
+pytestmark = [pytest.mark.consensus, pytest.mark.usefixtures("max_faults")]
 
 KILL_ROUNDS = 3
 
 # Startup says this when the execution layer has state the certificates cannot account for.
 STRICT_REJECTION = "consensus startup requires a finalized certificate archive"
-
-
-def _require_fault_tolerance(num_validators: int) -> None:
-    """Skip unless one validator can be down while consensus keeps quorum (n = 3f + 1)."""
-    if (num_validators - 1) // 3 < 1:
-        pytest.skip(f"need >=4 validators to tolerate a fault (have {num_validators})")
 
 
 def _log_size(net, moniker: str) -> int:
@@ -79,9 +73,8 @@ def _wait_for_log(net, moniker: str, since: int, needle: str, timeout: float = 6
     return False
 
 
-def test_unclean_kill_recovers(consensus_net, num_validators):
+def test_unclean_kill_recovers(consensus_net):
     """A SIGKILLed validator must reopen its journals after a torn write and catch up, not panic."""
-    _require_fault_tolerance(num_validators)
     victim = "node1"  # node0 stays up as the observer
     primary = consensus_net.node_rpc_url("node0")
     victim_rpc = consensus_net.node_rpc_url(victim)
@@ -104,7 +97,6 @@ def test_unclean_kill_recovers(consensus_net, num_validators):
 
 def test_certificate_less_restart_is_refused(consensus_net, num_validators):
     """A validator with its EL state but no finalization certificates refuses to start, then rejoins."""
-    _require_fault_tolerance(num_validators)
     victim = f"node{num_validators - 1}"
     primary = consensus_net.node_rpc_url("node0")
     victim_rpc = consensus_net.node_rpc_url(victim)

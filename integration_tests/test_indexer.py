@@ -16,6 +16,7 @@ from tempo.constants import PATH_USD
 from web3 import AsyncWeb3
 
 from .drivers.base import CAP_INDEXER, CAP_INDEXER_RPC, CAP_TEMPO_NATIVE
+from .tidx import bytea
 from .utils import ISSUER_ROLE, create_token, new_account, rpc_result
 
 pytestmark = pytest.mark.requires(CAP_INDEXER_RPC)
@@ -417,11 +418,6 @@ class TestTokenNamespace:
         assert _hex(change["transactionHash"]) == _hex(grants[0]["transactionHash"])
 
 
-def _sql_literal(value) -> str:
-    """A 0x hex string as the PostgreSQL BYTEA literal tidx's columns compare against."""
-    return "'\\x" + HexBytes(value).hex() + "'::bytea"
-
-
 class TestTidxDifferential:
     """The node's answers match tidx indexing the same chain; tidx decodes only tempo blocks."""
 
@@ -432,9 +428,7 @@ class TestTidxDifferential:
         receipts = [await driver.send_tx(w3, chain_id, funded_account) for _ in range(3)]
         tidx.wait_for_block(max(r["blockNumber"] for r in receipts))
 
-        rows = tidx.sql(
-            f'SELECT hash, block_num, idx, type FROM txs WHERE "from" = {_sql_literal(funded_account.address)}'
-        )
+        rows = tidx.sql(f'SELECT hash, block_num, idx, type FROM txs WHERE "from" = {bytea(funded_account.address)}')
         expected = {_hex(row["hash"]): row for row in rows}
         assert len(expected) >= 3, f"tidx indexed {len(expected)} txs for the sender, expected at least 3"
 
@@ -460,7 +454,7 @@ class TestTidxDifferential:
 
         for entry in senders:
             sender = AsyncWeb3.to_checksum_address(entry["from"])
-            rows = tidx.sql(f'SELECT hash FROM txs WHERE "from" = {_sql_literal(sender)} AND block_num <= {head}')
+            rows = tidx.sql(f'SELECT hash FROM txs WHERE "from" = {bytea(sender)} AND block_num <= {head}')
             want = {_hex(row["hash"]) for row in rows}
             await _eventually(
                 lambda want=want, sender=sender: _covered(w3, sender, want),

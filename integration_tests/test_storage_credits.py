@@ -3,7 +3,6 @@
 import pytest
 from tempo.constants import ALPHA_USD
 from tempo.constants import STABLECOIN_DEX_ADDRESS as DEX_ADDR
-from tempo.constants import STORAGE_CREDITS_ADDRESS as SC_ADDR
 
 from .abi import DEX
 from .abi import STORAGE_CREDITS as SC
@@ -36,7 +35,7 @@ async def test_fresh_account_reads_zero(w3):
 
 
 async def test_reserved_mode_reverts(w3):
-    reason = await call_revert(w3, SC_ADDR, SC.fns.setMode(3).data)
+    reason = await call_revert(w3, SC.fns.setMode(3))
     if "T11" in await active_forks(w3):
         # Strict decoding refuses the out-of-range enum before dispatch, so no error selector.
         assert reason == "execution reverted"
@@ -51,11 +50,7 @@ async def test_valid_mode_and_budget_calls_succeed(w3, chain_id):
         chain_id=chain_id,
         private_key=payer.key.hex(),
         gas_limit=STATE_WRITE_GAS,
-        calls=[
-            {"to": SC_ADDR, "data": SC.fns.setMode(2).data},  # Direct
-            {"to": SC_ADDR, "data": SC.fns.setBudget(7).data},
-            {"to": SC_ADDR, "data": SC.fns.setMode(0).data},  # back to Refund
-        ],
+        calls=[SC.fns.setMode(2), SC.fns.setBudget(7), SC.fns.setMode(0)],  # Direct, a budget, back to Refund
     )
     assert receipt["status"] == 1
 
@@ -105,15 +100,12 @@ async def test_dex_order_cancel_credits_the_maker(w3, chain_id):
         chain_id=chain_id,
         private_key=maker.key.hex(),
         gas_limit=STATE_WRITE_GAS,
-        calls=[
-            approve_call(DEX_ADDR, ALPHA_USD),
-            {"to": DEX_ADDR, "data": DEX.fns.place(ALPHA_USD, 2_000_000_000, False, 0).data},
-        ],
+        calls=[approve_call(DEX_ADDR, ALPHA_USD), DEX.fns.place(ALPHA_USD, 2_000_000_000, False, 0)],
     )
     assert placed["status"] == 1
     assert await DEX.fns.storageCredits(maker.address).call(w3) == 0  # placing does not credit
 
-    await send_call(w3, chain_id, maker, DEX_ADDR, DEX.fns.cancel(order_id).data)
+    await send_call(w3, chain_id, maker, DEX.fns.cancel(order_id))
     # cancelling frees the order's storage slots, crediting the maker for a future reuse (TIP-1064)
     assert 0 < await DEX.fns.storageCredits(maker.address).call(w3) <= 6
 
@@ -124,14 +116,14 @@ async def test_dex_replace_consumes_maker_credits(w3, chain_id, funded_account):
     token = await create_token(w3, chain_id=chain_id, admin=funded_account, mint=(maker.address, 10_000_000_000))
     await send_call(w3, chain_id, maker, **approve_call(DEX_ADDR, token))
 
-    place = DEX.fns.place(token, 2_000_000_000, False, 0).data
+    place = DEX.fns.place(token, 2_000_000_000, False, 0)
     order_id = await DEX.fns.nextOrderId().call(w3)
-    first = await send_call(w3, chain_id, maker, DEX_ADDR, place)  # no credits: full storage cost
-    await send_call(w3, chain_id, maker, DEX_ADDR, DEX.fns.cancel(order_id).data)
+    first = await send_call(w3, chain_id, maker, place)  # no credits: full storage cost
+    await send_call(w3, chain_id, maker, DEX.fns.cancel(order_id))
     earned = await DEX.fns.storageCredits(maker.address).call(w3)
     assert earned > 0
 
-    second = await send_call(w3, chain_id, maker, DEX_ADDR, place)  # reuses the freed slots
+    second = await send_call(w3, chain_id, maker, place)  # reuses the freed slots
     assert await DEX.fns.storageCredits(maker.address).call(w3) < earned  # credits were consumed...
     assert second["gasUsed"] < first["gasUsed"]  # ...making the identical placement cheaper
 
@@ -144,7 +136,7 @@ async def test_mode_and_budget_are_transient(w3, chain_id):
         chain_id=chain_id,
         private_key=payer.key.hex(),
         gas_limit=STATE_WRITE_GAS,
-        calls=[{"to": SC_ADDR, "data": SC.fns.setMode(2).data}, {"to": SC_ADDR, "data": SC.fns.setBudget(7).data}],
+        calls=[SC.fns.setMode(2), SC.fns.setBudget(7)],
     )
     assert receipt["status"] == 1
     # the next tx (and eth_call) observes the defaults again: Refund mode, zero budget

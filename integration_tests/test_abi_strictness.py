@@ -4,14 +4,11 @@ Every precompile shares the decoder, so one TIP-20 getter stands in for all of t
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 
-from .network import dev_node, xtask_forks
+from .network import dev_node, fork_schedule, running, xtask_forks
 from .utils import FAR_FUTURE, active_forks, call_revert, rpc
 
 pytestmark = pytest.mark.tempo
@@ -55,18 +52,13 @@ async def test_dirty_address_padding_is_refused_at_t11(w3):
 
 
 @pytest.fixture(scope="module")
-def pre_t11_node():
+def pre_t11_node(tmp_path_factory):
     """A node held at the fork before T11, to price the same call on both sides."""
-    order = xtask_forks()
-    if "t11_time" not in order:
+    if "t11_time" not in xtask_forks():
         pytest.skip("tempo-xtask cannot schedule t11_time")
-    held_back = {fork: FAR_FUTURE for fork in order[order.index("t11_time") :]}
-    node = dev_node(Path(tempfile.mkdtemp()), log_name="pre_t11.log", fork_times=held_back)
-    try:
-        node.start().wait_for_rpc()
+    held_back = fork_schedule("t11_time", FAR_FUTURE)
+    with running(dev_node(tmp_path_factory.mktemp("pre-t11"), log_name="pre_t11.log", fork_times=held_back)) as node:
         yield node
-    finally:
-        node.stop()
 
 
 @pytest.mark.slow

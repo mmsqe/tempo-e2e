@@ -25,12 +25,15 @@ from .abi import (
     TIP403,
     VALIDATOR_CONFIG,
 )
-from .utils import deploy_contract
+from .utils import deploy_contract, init_code
 
 pytestmark = pytest.mark.tempo
 
 # Standard EVM identity precompile: echoes its input unchanged.
 IDENTITY_PRECOMPILE = "0x0000000000000000000000000000000000000004"
+
+# Forwards its calldata to {addr}, returning 32 bytes: calldatacopy, staticcall, pop the flag, return.
+FORWARDER_RUNTIME = "36 6000 6000 37  6020 6000 36 6000 73{addr} 5a fa 50  6020 6000 f3"
 
 # Reused / long calldatas (kept short for the case table below).
 _VALIDATOR_COUNT = bytes(VALIDATOR_CONFIG.fns.validatorCount().data)
@@ -53,49 +56,11 @@ _PRECOMPILE_CASES = [
 ]
 
 
-def _staticcall_forwarder(precompile: str) -> bytes:
-    """Init code for a contract that STATICCALLs ``precompile`` with its calldata and returns 32 bytes."""
-    addr = bytes.fromhex(precompile.removeprefix("0x"))
-    assert len(addr) == 20, "precompile must be a 20-byte address"
-    runtime = bytes(
-        [
-            0x36,
-            0x60,
-            0x00,
-            0x60,
-            0x00,
-            0x37,  # calldatacopy(dest=0, off=0, size=calldatasize)
-            0x60,
-            0x20,
-            0x60,
-            0x00,
-            0x36,
-            0x60,
-            0x00,  # STATICCALL args: retSize=32, retOff=0, argsSize=cds, argsOff=0
-            0x73,
-            *addr,  # push20 <precompile>
-            0x5A,
-            0xFA,
-            0x50,  # gas ; STATICCALL ; POP(success)
-            0x60,
-            0x20,
-            0x60,
-            0x00,
-            0xF3,  # return(off=0, size=32)
-        ]
-    )
-    n = len(runtime)
-    # init: codecopy(dest=0, off=12, size=n) ; return(0, n)  -- 12-byte prefix
-    init = bytes([0x60, n, 0x60, 0x0C, 0x60, 0x00, 0x39, 0x60, n, 0x60, 0x00, 0xF3])
-    return init + runtime
-
-
 @pytest.mark.parametrize("label,address,calldata", _PRECOMPILE_CASES, ids=[c[0] for c in _PRECOMPILE_CASES])
 async def test_precompile_callable_from_contract(w3, chain_id, funded_account, label, address, calldata):
     """A contract's STATICCALL to the precompile returns the direct call's non-empty result."""
-    _, fwd = await deploy_contract(
-        w3, chain_id=chain_id, private_key=funded_account.key.hex(), bytecode=_staticcall_forwarder(address)
-    )
+    forwarder = init_code(bytes.fromhex(FORWARDER_RUNTIME.format(addr=address[2:])))
+    _, fwd = await deploy_contract(w3, chain_id=chain_id, private_key=funded_account.key.hex(), bytecode=forwarder)
     data = "0x" + calldata.hex()
     via_contract = bytes(await w3.eth.call({"to": fwd, "data": data}))
     direct = bytes(await w3.eth.call({"to": address, "data": data}))

@@ -23,8 +23,8 @@ async def test_dev_node_precompile_is_deployed_and_empty(w3):
 
 async def test_set_committee_members_is_system_only(w3, account):
     """Only the system caller (address 0) may write the committee; an EOA gets Unauthorized()."""
-    data = COMMITTEE.fns.setCommitteeMembers(1, [ZERO_KEY]).data
-    assert "Unauthorized" in await call_revert(w3, COMMITTEE_ADDRESS, data, sender=account.address)
+    write = COMMITTEE.fns.setCommitteeMembers(1, [ZERO_KEY])
+    assert "Unauthorized" in await call_revert(w3, write, sender=account.address)
 
 
 @pytest.mark.slow

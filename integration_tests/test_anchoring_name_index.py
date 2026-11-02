@@ -6,18 +6,9 @@ import time
 
 import pytest
 
-from .abi import ANCHORING, ANCHORING_ADDRESS
-from .anchoring import (
-    GO_TIME,
-    Page,
-    anchoring_node,
-    bech32,
-    emitted,
-    new_registry,
-    registries,
-    registries_by_name,
-)
-from .utils import call_revert, rpc_result, send_call
+from .abi import ANCHORING
+from .anchoring import GO_TIME, Page, anchoring_node, bech32, new_registry, registries, registries_by_name
+from .utils import call_revert, emitted, rpc_result, send_call
 
 pytestmark = [pytest.mark.tempo, pytest.mark.anchoring]
 
@@ -75,10 +66,8 @@ class TestWhatIsIndexed:
     async def test_a_new_registry_arrives_with_its_block(self, w3, chain_id, funded_account):
         tag = secrets.token_hex(4)
         name = f"Live Fund {tag}"
-        receipt = await send_call(
-            w3, chain_id, funded_account, ANCHORING_ADDRESS, ANCHORING.fns.addRegistry(name, "", "{}").data
-        )
-        [(_, registry_id, _)] = emitted(receipt, "AddRegistry")
+        receipt = await send_call(w3, chain_id, funded_account, ANCHORING.fns.addRegistry(name, "", "{}"))
+        [(_, registry_id, _)] = emitted(receipt, ANCHORING, "AddRegistry")
         await indexed(w3, registry_id)
 
         block = await w3.eth.get_block(receipt["blockNumber"])
@@ -195,8 +184,8 @@ class TestRefusals:
     async def test_the_contract_answers_only_exact(self, w3):
         """Block execution cannot read the index, so nodes that disagree about it still agree on blocks."""
         for mode in (2, 3, 4):
-            err = await call_revert(w3, ANCHORING_ADDRESS, ANCHORING.fns.registriesByName("us-ca1", mode, Page()).data)
+            err = await call_revert(w3, ANCHORING.fns.registriesByName("us-ca1", mode, Page()))
             assert "only exact match is on chain" in err, (mode, err)
 
-        err = await call_revert(w3, ANCHORING_ADDRESS, ANCHORING.fns.registriesByName("us-ca1", 9, Page()).data)
+        err = await call_revert(w3, ANCHORING.fns.registriesByName("us-ca1", 9, Page()))
         assert "invalid matchMode" in err, err

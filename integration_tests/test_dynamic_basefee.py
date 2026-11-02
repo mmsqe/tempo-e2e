@@ -5,8 +5,8 @@ import asyncio
 
 import pytest
 
-from .network import dev_node
-from .utils import STATE_WRITE_GAS, funded, new_account, rpc, send_calls, transfer_call, wait_for_block
+from .network import dev_node, running
+from .utils import STATE_WRITE_GAS, funded, new_account, send_calls, transfer_call, wait_for_block
 
 pytestmark = pytest.mark.tempo
 
@@ -18,25 +18,9 @@ BASE_FEE_CAP = 12_000_000_000
 # One AA tx caps at 32 calls (~8M gas), under the 10M target, so congestion needs several txs per
 # block; the default block time mines before the mempool fills, so this module runs a 1sec node.
 @pytest.fixture(scope="module")
-def basefee_node(tmp_path_factory):
-    base = tmp_path_factory.mktemp("basefee")
-    node = dev_node(base, block_time="1sec")
-    try:
-        node.start().wait_for_rpc()
+def tempo(tmp_path_factory):
+    with running(dev_node(tmp_path_factory.mktemp("basefee"), block_time="1sec")) as node:
         yield node
-    finally:
-        node.stop()
-
-
-@pytest.fixture
-async def w3(basefee_node):
-    async with rpc(basefee_node) as client:
-        yield client
-
-
-@pytest.fixture
-def chain_id(basefee_node) -> int:
-    return basefee_node.chain_id
 
 
 def _next_base_fee(fee: int, gas: int) -> int:

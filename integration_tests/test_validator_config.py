@@ -9,18 +9,17 @@ import time
 import pytest
 from Crypto.PublicKey import ECC
 from Crypto.Signature import eddsa
-from eth_account import Account
 from eth_contract.erc20 import ERC20
 from eth_utils import keccak, to_checksum_address
-from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
+from tempo.constants import PATH_USD
 from tempo.constants import VALIDATOR_CONFIG_V2_ADDRESS as V2_ADDR
 from tempo.devnet.supervisor import _trusted_peers
 
 from .abi import CURRENT_COMMITTEE, FEE
 from .abi import VALIDATOR_CONFIG_V2 as V2
 from .conftest import supervisord_net
-from .network import FAUCET_PRIVATE_KEY, ValidatorNode, free_port
-from .utils import call_revert, new_account, rpc, send_call, send_type_2
+from .network import ValidatorNode, free_port, gas_token_flags, running
+from .utils import GENESIS_ADMIN, call_revert, new_account, rpc, send_call, send_type_2
 
 pytestmark = pytest.mark.tempo
 
@@ -60,12 +59,12 @@ async def join(w3, chain_id, owner, address: str, ingress: str, *, key=None, fee
     """The owner enrolling a validator that signed for it, which is the only way in."""
     pubkey, signature, egress, fee = enrolment(chain_id, address, ingress, key=key)
     add = V2.fns.addValidator(address, pubkey, ingress, egress, fee, signature)
-    return pubkey, await send_call(w3, chain_id, owner, V2_ADDR, add.data, fee_token=fee_token)
+    return pubkey, await send_call(w3, chain_id, owner, add, fee_token=fee_token)
 
 
 @pytest.fixture
 def owner():
-    return Account.from_key(FAUCET_PRIVATE_KEY)
+    return GENESIS_ADMIN
 
 
 class TestGenesisState:
@@ -105,7 +104,7 @@ class TestJoining:
         await join(w3, chain_id, owner, joiner.address, ingress)
         index = (await V2.fns.validatorByAddress(joiner.address).call(w3))[5]
 
-        await send_call(w3, chain_id, joiner, V2_ADDR, V2.fns.deactivateValidator(index).data)
+        await send_call(w3, chain_id, joiner, V2.fns.deactivateValidator(index))
         assert (await V2.fns.validatorByAddress(joiner.address).call(w3))[7] != 0
         assert joiner.address not in [to_checksum_address(v[1]) for v in await V2.fns.getActiveValidators().call(w3)]
 
@@ -120,7 +119,7 @@ class TestJoining:
 
         new, signature, egress, _ = enrolment(chain_id, validator, second, namespace=NS_ROTATE)
         rotate = V2.fns.rotateValidator(index, new, second, egress, signature)
-        await send_call(w3, chain_id, funded_account, V2_ADDR, rotate.data)
+        await send_call(w3, chain_id, funded_account, rotate)
 
         was, now = [await V2.fns.validatorByPublicKey(key).call(w3) for key in (old, new)]
         assert to_checksum_address(was[1]) == to_checksum_address(now[1]) == validator
@@ -133,34 +132,34 @@ class TestRefusals:
     async def test_mutators_are_owner_gated(self, w3):
         outsider = new_account()
         add = V2.fns.addValidator(outsider.address, b"\x11" * 32, "1.2.3.4:26656", "", outsider.address, b"")
-        assert "Unauthorized" in await call_revert(w3, V2_ADDR, add.data, sender=outsider.address)
+        assert "Unauthorized" in await call_revert(w3, add, sender=outsider.address)
         handoff = V2.fns.transferOwnership(outsider.address)
-        assert "Unauthorized" in await call_revert(w3, V2_ADDR, handoff.data, sender=outsider.address)
+        assert "Unauthorized" in await call_revert(w3, handoff, sender=outsider.address)
 
     async def test_the_owner_cannot_enrol_a_key_it_does_not_hold(self, w3, chain_id, owner):
         """The signature is what stops an admin from naming a node nobody runs."""
         joiner = new_account()
         pubkey, signature, egress, fee = enrolment(chain_id, joiner.address, "10.8.0.1:26656")
         stolen = V2.fns.addValidator(joiner.address, pubkey, "10.8.0.2:26656", egress, fee, signature)
-        assert "InvalidSignature" in await call_revert(w3, V2_ADDR, stolen.data, sender=owner.address)
+        assert "InvalidSignature" in await call_revert(w3, stolen, sender=owner.address)
 
     async def test_a_signature_does_not_cross_chains(self, w3, chain_id, owner):
         joiner = new_account()
         pubkey, signature, egress, fee = enrolment(chain_id + 1, joiner.address, "10.7.0.1:26656")
         add = V2.fns.addValidator(joiner.address, pubkey, "10.7.0.1:26656", egress, fee, signature)
-        assert "InvalidSignature" in await call_revert(w3, V2_ADDR, add.data, sender=owner.address)
+        assert "InvalidSignature" in await call_revert(w3, add, sender=owner.address)
 
     async def test_an_endpoint_has_to_be_one(self, w3, chain_id, owner):
         joiner = new_account()
         pubkey, signature, egress, fee = enrolment(chain_id, joiner.address, "not-an-endpoint", egress="10.6.0.1")
         add = V2.fns.addValidator(joiner.address, pubkey, "not-an-endpoint", egress, fee, signature)
-        assert "NotIpPort" in await call_revert(w3, V2_ADDR, add.data, sender=owner.address)
+        assert "NotIpPort" in await call_revert(w3, add, sender=owner.address)
 
 
 @pytest.fixture(scope="module")
 def onboarding_net(request, tmp_path_factory):
     """Three validators paying fees in xtask's temporary token, as the testnet does; short epochs."""
-    flags = ["--deployment-gas-token", "--deployment-gas-token-admin", Account.from_key(FAUCET_PRIVATE_KEY).address]
+    flags = gas_token_flags(GENESIS_ADMIN.address)
     base = tmp_path_factory.mktemp("onboarding-net")
     yield from supervisord_net(request, base, 3, epoch_length=20, patch_genesis_flags=flags)
 
@@ -184,8 +183,7 @@ class TestJoiningTheCommittee:
 
             # Without the token its blocks could collect no fee.
             await send_type_2(w3, owner, token, ERC20.fns.transfer(newcomer.address, 10**9).data)
-            take = FEE.fns.setValidatorToken(token).data
-            await send_call(w3, chain_id, newcomer, FEE_MANAGER_ADDRESS, take, fee_token=token)
+            await send_call(w3, chain_id, newcomer, FEE.fns.setValidatorToken(token), fee_token=token)
             pubkey, _ = await join(w3, chain_id, owner, newcomer.address, ingress, key=key, fee_token=token)
 
             node = ValidatorNode(
@@ -197,8 +195,7 @@ class TestJoiningTheCommittee:
                 genesis=onboarding_net.data_dir / "genesis.json",
                 http_port=free_port(),
             )
-            node.start()
-            try:
+            with running(node, want_block=0):
                 deadline = time.time() + self.SHARE_TIMEOUT
                 while not node.is_signer():
                     assert node.proc.poll() is None, f"the newcomer exited; see {node.log_path}"
@@ -214,5 +211,3 @@ class TestJoiningTheCommittee:
                         break
                 else:
                     pytest.fail(f"none of {self.BLOCKS} blocks was the newcomer's; see {node.log_path}")
-            finally:
-                node.stop()

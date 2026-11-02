@@ -7,7 +7,6 @@ import pytest
 from eth_account import Account
 from eth_contract.erc20 import ERC20
 from eth_utils import to_checksum_address
-from tempo.constants import ADDRESS_REGISTRY_ADDRESS as REG_ADDR
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, STABLECOIN_DEX_ADDRESS
 from tempo.constants import TIP20_CHANNEL_RESERVE_ADDRESS as CHANNEL_RESERVE
 
@@ -33,7 +32,7 @@ async def _ensure_master(w3, chain_id):
     """Register MASTER once; idempotent so tests share the session's single registration."""
     if int(await REG.fns.getMaster(MASTER_ID).call(w3), 16) == 0:
         await fund(w3, MASTER.address)
-        await send_call(w3, chain_id, MASTER, REG_ADDR, REG.fns.registerVirtualMaster(SALT).data)
+        await send_call(w3, chain_id, MASTER, REG.fns.registerVirtualMaster(SALT))
 
 
 async def test_deposit_to_virtual_forwards_to_master(w3, chain_id):
@@ -91,7 +90,7 @@ async def test_resolve_recipient(w3, chain_id):
     assert (await REG.fns.resolveRecipient(plain).call(w3)).lower() == plain.lower()
     # an unregistered virtual reverts
     unregistered = _virtual(master_id=b"\xde\xad\xbe\xef")
-    assert "VirtualAddressUnregistered" in await call_revert(w3, REG_ADDR, REG.fns.resolveRecipient(unregistered).data)
+    assert "VirtualAddressUnregistered" in await call_revert(w3, REG.fns.resolveRecipient(unregistered))
 
 
 async def test_decode_virtual_address(w3):
@@ -112,7 +111,7 @@ async def test_is_implicitly_approved(w3):
 async def test_master_id_collision(w3, chain_id):
     await _ensure_master(w3, chain_id)
     # re-registering the same (master, salt) collides with the existing masterId
-    reason = await call_revert(w3, REG_ADDR, REG.fns.registerVirtualMaster(SALT).data, sender=MASTER.address)
+    reason = await call_revert(w3, REG.fns.registerVirtualMaster(SALT), sender=MASTER.address)
     assert "MasterIdCollision" in reason
 
 

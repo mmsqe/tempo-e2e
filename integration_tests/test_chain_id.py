@@ -10,7 +10,7 @@ from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 from web3.exceptions import Web3RPCError
 
-from .network import DEAD_UPSTREAM, FollowerNode, dev_node, free_port, generate_dev_genesis, node_log
+from .network import DEAD_UPSTREAM, FollowerNode, dev_node, free_port, generate_dev_genesis, node_log, running
 from .utils import funded, new_account, rpc, send_call, transfer_call
 
 # An id no binary claims -- upstream keys chains off 4217/42431.
@@ -53,8 +53,8 @@ class TestUnclaimedChainId:
     async def test_runs_from_genesis_alone(self, tmp_path):
         """Editing ``chainId`` in genesis is enough: nothing the node needs is keyed off it."""
         node = dev_node(tmp_path, log_name="unclaimed-chain-id.log", chain_id=UNCLAIMED_CHAIN_ID)
-        try:
-            async with rpc(node.start().wait_for_rpc()) as w3:
+        with running(node):
+            async with rpc(node) as w3:
                 assert await w3.eth.chain_id == UNCLAIMED_CHAIN_ID
                 assert int(await w3.net.version) == UNCLAIMED_CHAIN_ID
 
@@ -67,8 +67,6 @@ class TestUnclaimedChainId:
                 # Signed one id over, the same write has to bounce.
                 with pytest.raises(Web3RPCError, match="chain ID"):
                     await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, **transfer)
-        finally:
-            node.stop()
 
 
 @pytest.mark.slow
@@ -94,11 +92,8 @@ class TestBootnodes:
                 http_port=free_port(),
                 extra_args=["--nat", "none", *args],  # no public-ip lookups through the proxy
             )
-            try:
-                node.start().wait_for_rpc(timeout=60, want_block=0)
+            with running(node, timeout=60, want_block=0):
                 time.sleep(3)  # discv4 bootstraps and the endpoint is fetched just after start
-            finally:
-                node.stop()
             return {"pinged": sorted(set(BOOT_PING.findall(node_log(node)))), "fetched": fetched}
 
         yield run

@@ -21,7 +21,7 @@ from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
 from .drivers import get_driver
 from .drivers.base import CAP_CONSENSUS_NET, CAP_INDEXER, CAP_TEMPO_NATIVE
-from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin
+from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin, running
 from .utils import new_account, rpc
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
@@ -75,14 +75,10 @@ def tempo(request, driver, tmp_path_factory):
         return
 
     base = tmp_path_factory.mktemp(driver.name)
-    node = driver.dev_node(base, log_name=f"{driver.name}.log")
-    try:
-        node.start().wait_for_rpc()
+    with running(driver.dev_node(base, log_name=f"{driver.name}.log")) as node:
         yield node
-    finally:
-        node.stop()
-        if request.config.getoption("--clean-data"):
-            shutil.rmtree(base, ignore_errors=True)
+    if request.config.getoption("--clean-data"):
+        shutil.rmtree(base, ignore_errors=True)
 
 
 @pytest.fixture
@@ -342,6 +338,15 @@ def _serve_docker_cluster(request, base, data_dir, wait_ready, *, label):
 def num_validators(request) -> int:
     """Validator count of the consensus localnet (see ``--consensus-validators``)."""
     return request.config.getoption("--consensus-validators")
+
+
+@pytest.fixture
+def max_faults(num_validators) -> int:
+    """Validators that can be down while consensus keeps quorum (BFT: n = 3f + 1); skips when none can."""
+    faults = (num_validators - 1) // 3
+    if faults < 1:
+        pytest.skip(f"need >=4 validators to tolerate a fault (have {num_validators})")
+    return faults
 
 
 @pytest.fixture

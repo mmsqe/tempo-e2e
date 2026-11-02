@@ -94,9 +94,8 @@ class QueryRefused(RuntimeError):
 
 
 def bytea(value) -> str:
-    """A byte string as PostgreSQL's ``'\\x…'`` literal (ClickHouse's ``'0x…'`` matches nothing), uncast
-    because tidx's pushdown reads no cast."""
-    return "'\\x" + HexBytes(value).hex() + "'"
+    """A byte string as PostgreSQL's ``'\\x…'::bytea`` literal; ClickHouse's ``'0x…'`` matches nothing."""
+    return "'\\x" + HexBytes(value).hex() + "'::bytea"
 
 
 class Tidx:
