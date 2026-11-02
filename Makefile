@@ -23,10 +23,10 @@ test-consensus-docker:
 	$(BIN)/pytest -m consensus --consensus-docker -vv
 
 lint:
-	$(BIN)/ruff check integration_tests
+	$(BIN)/ruff format --check . && $(BIN)/ruff check .
 
 fmt:
-	$(BIN)/ruff format integration_tests
+	$(BIN)/ruff format .
 
 # Launch / stop a standalone dev node (uses the same flags as the test harness).
 node-up:

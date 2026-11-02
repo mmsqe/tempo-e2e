@@ -5,7 +5,7 @@ import pytest
 from .utils import rpc_result
 
 # allegro, a bare reth fork, serves neither the txpool namespace nor `operator_*`.
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 async def test_txpool_status_has_pending_and_queued(w3):

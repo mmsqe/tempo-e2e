@@ -29,7 +29,7 @@ if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     tempfile.tempdir = "/tmp"
 
 
-# Legacy feature marks map onto capability tokens so existing tests gate cleanly.
+# Marks that stand for a capability, so `-m tempo` also selects by what a backend must support.
 _MARK_CAPABILITY = {"tempo": CAP_TEMPO_NATIVE, "consensus": CAP_CONSENSUS_NET}
 
 

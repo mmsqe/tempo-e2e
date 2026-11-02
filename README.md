@@ -94,6 +94,7 @@ variant.
 
 - `tempo` — tempo-native features (TIP-20, AA tx, nonces, fees, DEX)
 - `consensus` — needs the multi-validator consensus localnet; skips on a `--dev` node
+- `anchoring` — needs the nvnmchain-contracts submodule at `contracts/`
 - `slow` — long-running (e.g. node restart)
 
 ## Test map
@@ -120,6 +121,15 @@ variant.
 | `test_validation.py` | — | malformed / unfunded tx rejection |
 | `test_gas.py` | TIP-1000, TIP-1010 | gas estimation/accounting: state-creation cost, 30M per-tx cap |
 | `test_node_ops.py` | — | node resumes from persisted state on restart (`slow`) |
+| `test_snapshot.py` | — | `tempo snapshot-manifest` / `tempo download` round trip, for a dev node and a follower (`slow`) |
+
+### Genesis & hardforks
+
+| File | TIP(s) | Covers |
+|---|---|---|
+| `test_genesis.py` | — | what `tempo-xtask generate-genesis` writes: anchoring proxy, nUSD, the deployment gas token |
+| `test_hardfork.py` | — | fork boundaries crossed on a running chain install the genesis state they skipped; T12's anchoring proxy; `shadow-replay` (`slow`) |
+| `test_abi_strictness.py` | TIP-1100 | strict precompile calldata decoding from T11, trailing bytes allowed again at T12, per-word gas |
 
 ### Tempo native tx & account abstraction
 
@@ -181,7 +191,8 @@ variant.
 | `test_precompiles.py` | — | a contract STATICCALLs each enshrined precompile for deterministic output |
 | `test_current_committee.py` | TIP-1070 | current-committee precompile (T8+): read members, system-only writes, epoch boundary |
 | `test_validator_config.py` | TIP-1017 | ValidatorConfig V2 append-only registry: genesis state, key rotation, owner-gated mutators |
-| `test_anchoring.py` | — | anchoring contract at `0x…0a00`: the precompile's ABI, a seed corpus loaded at block 0, writes on top, EOA gate per sender type |
+| `test_zone_factory.py` | TIP-1091 | zone factory: the genesis owner flags, T12 handing it to the registry owner, a zone's portal |
+| `test_anchoring.py` | — | anchoring contract at `0x…0a00`: the precompile's ABI, a seed corpus loaded at block 0, writes on top, each sender type as the caller, owner recovery |
 | `test_anchoring_service.py` | — | nvnmchain-anchoring translating the node's search onto the module's REST route: its JSON, its mode names and `/health` |
 | `test_anchoring_name_index.py` | — | the node's own name index (`--anchoring.name-index`): the seeded corpus, which emitted no logs, and a live registry |
 
@@ -192,3 +203,11 @@ variant.
 | `test_consensus_rpc.py` | TIP-1031 | `consensus_*` RPC on a multi-validator localnet; restart / quorum recovery |
 | `test_consensus_storage.py` | — | SIGKILL/unclean-kill recovery, consensus-storage wipe rejoin, strict-startup (`slow`) |
 | `test_public_node.py` | — | validators→follower→public→proxy: sync, same-fork, devp2p peering, tx gossip |
+| `test_devp2p_sync.py` | — | `--consensus.devp2p.finalizations`: a follower with a dead upstream syncs from its peers (`slow`) |
+
+### allegro (`--backend allegro`)
+
+| File | TIP(s) | Covers |
+|---|---|---|
+| `test_valset.py` | — | genesis-embedded validators, finalization, sub-second timestamps |
+| `test_payload.py` | — | proposals reuse the payload job prepared a view early |

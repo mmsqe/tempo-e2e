@@ -7,7 +7,7 @@ from tempo.constants import PATH_USD
 
 from .utils import TRANSFER_TOPIC, new_account, send_call, transfer_call
 
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 async def test_transfer_emits_transfer_log(w3, chain_id, funded_account):

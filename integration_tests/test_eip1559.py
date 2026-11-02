@@ -13,7 +13,7 @@ from .utils import (
     transfer_call,
 )
 
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 async def _base_fee(w3, block: int | str = "latest") -> int:

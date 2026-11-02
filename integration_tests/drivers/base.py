@@ -11,9 +11,8 @@ suite is plain Ethereum JSON-RPC. Drivers are duck-typed (see ``tempo.py`` and
     async send_tx(w3, chain_id, sender)    # one ordinary tx from sender -> receipt
 
 Nodes expose ``start()`` / ``wait_for_rpc()`` / ``stop()``, ``rpc_url`` /
-``ws_url``, and ``chain_id``. A test that needs a fork-specific feature
-declares ``@pytest.mark.requires("<cap>")`` (or the legacy ``tempo`` /
-``consensus`` marks) and is skipped when the active backend lacks the cap.
+``ws_url``, and ``chain_id``. A test marked ``tempo``, ``consensus`` or
+``requires("<cap>")`` is skipped when the active backend lacks that capability.
 """
 
 CAP_TEMPO_NATIVE = "tempo-native"  # native/AA (0x76) txs, fee tokens, tempo precompiles

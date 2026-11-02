@@ -4,7 +4,7 @@ import pytest
 
 from .utils import RETURN_42_INIT, RETURN_42_RUNTIME, deploy_contract
 
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 async def test_deploy_sets_code(w3, chain_id, funded_account):

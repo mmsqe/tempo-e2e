@@ -5,7 +5,7 @@ from hexbytes import HexBytes
 
 from .utils import RETURN_42_INIT, deploy_contract, new_account, rpc_result, send_call, send_calls, transfer_call
 
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 async def test_call_tracer_shows_create_and_call_subcalls(w3, chain_id, funded_account):

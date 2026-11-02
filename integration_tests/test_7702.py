@@ -8,7 +8,7 @@ from web3 import AsyncWeb3
 
 from .utils import RETURN_42_INIT, ZERO_ADDRESS, deploy_contract, new_account, send_set_code_tx
 
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 def _designator(delegate: str) -> HexBytes:

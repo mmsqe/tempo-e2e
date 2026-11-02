@@ -8,7 +8,7 @@ from web3 import AsyncWeb3, WebSocketProvider
 
 from .utils import TRANSFER_TOPIC, new_account, send_call, transfer_call
 
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 @pytest.fixture

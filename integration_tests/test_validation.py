@@ -5,7 +5,7 @@ from tempo import Signer, serialize, sign_transaction
 
 from .utils import build_tempo_tx, new_account, suggested_max_fee, transfer_call
 
-pytestmark = pytest.mark.requires("tempo-native")
+pytestmark = pytest.mark.tempo
 
 
 async def test_wrong_chain_id_is_rejected(w3, chain_id, funded_account):
