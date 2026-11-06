@@ -158,12 +158,21 @@ class Node:
 
     def versions(self, rid: int, start: int, count: int) -> list[tuple]:
         """Every version of records start..start+count-1, through tempo_vs_export's bulk reader laid over the
-        contract."""
+        contract, the chunk halved whenever a call runs out of gas: 500 long records exceed the call's 50M."""
         self.reader = self.reader or {ANCHORING_ADDRESS: {"code": reader_code()}}
-        rows = []
-        for at in range(start, start + count, CHUNK):
-            data = VERSIONS + encode(["uint64"] * 3, [rid, at, min(CHUNK, start + count - at)])
-            rows += decode([RECORD + "[]"], self.call(data, self.reader))[0]
+        rows, at, chunk = [], start, CHUNK
+        while at < start + count:
+            n = min(chunk, start + count - at)
+            try:
+                rows += decode(
+                    [RECORD + "[]"], self.call(VERSIONS + encode(["uint64"] * 3, [rid, at, n]), self.reader)
+                )[0]
+            except RuntimeError as e:
+                if "out of gas" not in str(e) or chunk == 1:
+                    raise
+                chunk //= 2
+                continue
+            at += n
         return rows
 
 
