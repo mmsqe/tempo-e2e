@@ -15,6 +15,7 @@ import bisect
 import gzip
 import itertools
 import json
+import multiprocessing
 import os
 import time
 import urllib.parse
@@ -23,16 +24,20 @@ from collections import Counter
 
 from eth_abi import decode, encode
 from eth_account import Account
+from tempo import Builder, Signer, serialize, sign_transaction
+from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 from web3 import HTTPProvider
 
-from .abi import ANCHORING, ANCHORING_ADDRESS
+from .abi import ANCHORING, ANCHORING_ADDRESS, FEE
 from .anchoring import Page, Record, Registry, bech32
 from .tempo_vs_export import ADMIN, CHUNK, EXPORT, FIRST_SEEDED_ID, RECORD, VERSIONS, reader_code
 
 API = os.getenv("NVNMCHAIN_API", "https://api.nvnmchain.io") + "/NVNM-Chain/nvnmchain/anchoring/v1"
 BASE_FEE_CAP = 12_000_000_000  # TIP-1067's ceiling; a fee under it stalls once full blocks raise the base fee
 TX_GAS_CAP = 30_000_000
-WINDOW = 256  # unconfirmed transactions kept in the pool
+WINDOW = 8192  # unconfirmed transactions kept in the pool
+ROUND = 1000  # transactions signed, then sent, at a time
+WORKERS = max(1, (os.cpu_count() or 4) - 4)  # signers, leaving cores to a node on the same machine
 PAGE = 200
 REPLAYED = {"timestamp", "created_at", "creator"}  # what the replay sets itself
 
@@ -106,6 +111,8 @@ class Node:
         return reply["result"]
 
     def batch(self, method: str, params: list[list]) -> list:
+        if not params:  # a node answers an empty batch with one error, not a list
+            return []
         replies = self.provider.make_batch_request([(method, p) for p in params])
         for reply in replies:
             if "error" in reply:
@@ -114,6 +121,15 @@ class Node:
 
     def nonce(self, address: str, block: str = "latest") -> int:
         return int(self.rpc("eth_getTransactionCount", address, block), 16)
+
+    def check(self, address: str, after: int, until: int) -> int:
+        """Stops on any of `address`'s transactions that failed in blocks after..until, and returns `until`: a
+        failed one still took its nonce, so every record sent after it took the wrong id."""
+        for receipts in self.batch("eth_getBlockReceipts", [[hex(n)] for n in range(after + 1, until + 1)]):
+            for r in receipts:
+                if r["status"] != "0x1" and r["from"].lower() == address.lower():
+                    raise SystemExit(f"{r['transactionHash']} failed: rebuild the chain, the ids after it are off")
+        return until
 
     def call(self, data: bytes, override: dict | None = None) -> bytes:
         params = [{"to": ANCHORING_ADDRESS, "data": "0x" + data.hex()}, "latest"] + ([override] if override else [])
@@ -151,8 +167,18 @@ class Node:
         return rows
 
 
+def gas_bound(record: Record) -> int:
+    """At most what adding `record` costs: TIP-1000's 250k for each slot its strings, timestamp, packed integers
+    and index entries could newly take, plus 1M; measured gas stays within 200k of the slots alone."""
+    lengths = [
+        len(s.encode()) for s in (record.uri, record.checksum, record.checksum_algo, record.metadata, record.status)
+    ]
+    return 250_000 * (sum(0 if n == 0 else 1 if n < 32 else 1 + (n + 31) // 32 for n in lengths) + 7) + 1_000_000
+
+
 def remaining(node: Node, registry: Registry, rows: list[Record]):
-    """The calldata of `rows` not yet on the node: whole records by bisection, then the last one's versions."""
+    """Each of `rows` not yet on the node, as calldata and a gas bound: whole records by bisection, then the last
+    one's versions."""
     if not rows:
         return
     rid = registry.id
@@ -162,40 +188,92 @@ def remaining(node: Node, registry: Registry, rows: list[Record]):
     done = sum(r.record_id < have for r in rows) + len(node.versions(rid, have, 1)) if have else 0
     if done < len(rows):
         print(f"{registry.name}: {done} of {len(rows)} rows here", flush=True)
-    yield from (ANCHORING.fns.addRecord(r).data for r in rows[done:])
+    yield from ((ANCHORING.fns.addRecord(r).data, gas_bound(r)) for r in rows[done:])
 
 
-def send(node: Node, acct, calls, per_block: int, label: str) -> None:
-    """Sends each calldata in order from one key, at most `per_block` new ones a block."""
+def packed(calls):
+    """Consecutive calls grouped while their bounds fit one transaction; order is kept, so the ids they take are
+    too."""
+    batch, total = [], 0
+    for data, bound in calls:
+        if batch and total + bound > TX_GAS_CAP:
+            yield batch
+            batch, total = [], 0
+        batch.append(data)
+        total += bound
+    if batch:
+        yield batch
+
+
+SIGNER: tuple  # a pool worker's signer, chain id, fee and fee token
+
+
+def _signer(key: str, chain_id: int, fee: int, token: str) -> None:
+    global SIGNER
+    SIGNER = Signer(key), chain_id, fee, token
+
+
+def _sign(job: tuple[int, list[bytes], int]) -> str:
+    """A tempo transaction calling the contract once for each calldata, signed in a pool worker."""
+    nonce, datas, gas = job
+    signer, chain_id, fee, token = SIGNER
+    tx = Builder().chain_id(chain_id).gas_limit(gas).max_fee_per_gas(fee).max_priority_fee_per_gas(0)
+    tx = tx.nonce(nonce).nonce_key(0).fee_token(token)
+    for data in datas:
+        tx.add_call(to=ANCHORING_ADDRESS, value=0, data=data)
+    return serialize(sign_transaction(tx.build(), signer))
+
+
+def send(node: Node, key: str, calls, per_block: int, label: str) -> None:
+    """Sends the calls in order from one key, at most `per_block` transactions a block, workers signing each round
+    while the one before goes out. A lane far wider than one transaction is filled by declared gas anyway, so
+    there every transaction declares the cap and packs calls under it by their bounds; a normal lane needs each
+    call's estimate to fit several a block."""
+    address = Account.from_key(key).address
     chain_id = int(node.rpc("eth_chainId"), 16)
-    nonce = node.nonce(acct.address, "pending")
     fee = max(2 * int(node.rpc("eth_gasPrice"), 16), BASE_FEE_CAP)
-    tx = {"from": acct.address, "to": ANCHORING_ADDRESS}
-    fixed = {**tx, "type": 2, "chainId": chain_id, "value": 0, "maxFeePerGas": fee, "maxPriorityFeePerGas": 0}
-    calls, last_block, budget, sent, start = iter(calls), None, 0, 0, time.time()
-    while True:
-        block = int(node.rpc("eth_blockNumber"), 16)
-        if block != last_block:
-            last_block, budget = block, per_block
-        room = min(WINDOW - (nonce - node.nonce(acct.address)), budget)
-        if room <= 0:
-            time.sleep(0.01)
-            continue
-        chunk = list(itertools.islice(calls, room))
-        if not chunk:
-            break
-        gases = node.batch("eth_estimateGas", [[{**tx, "data": "0x" + data.hex()}] for data in chunk])
-        raws = []
-        for i, (data, estimate) in enumerate(zip(chunk, gases)):
-            gas = min(TX_GAS_CAP, int(estimate, 16) * 11 // 10)
-            signed = acct.sign_transaction({**fixed, "nonce": nonce + i, "data": data, "gas": gas})
-            raws.append(["0x" + signed.raw_transaction.hex()])
-        node.batch("eth_sendRawTransaction", raws)
-        nonce, budget, sent = nonce + len(chunk), budget - len(chunk), sent + len(chunk)
-        if sent // 1000 != (sent - len(chunk)) // 1000:
-            print(f"{label}: {sent} sent, block {block}, {sent / (time.time() - start):.1f}/s", flush=True)
-    while node.nonce(acct.address) < nonce:
+    fn = FEE.fns.userTokens(address)
+    token = fn.decode(
+        bytes.fromhex(node.rpc("eth_call", {"to": FEE_MANAGER_ADDRESS, "data": "0x" + fn.data.hex()}, "latest")[2:])
+    )
+    token = PATH_USD if int(token, 16) == 0 else token
+    lifted = int(node.rpc("eth_getBlockByNumber", "latest", False)["mainBlockGeneralGasLimit"], 16) >= 100 * TX_GAS_CAP
+    txs = packed(calls) if lifted else ([data] for data, _ in calls)
+    nonce, checked = node.nonce(address, "pending"), int(node.rpc("eth_blockNumber"), 16)
+    last_block, budget, sent, start, signed = None, 0, 0, time.time(), []
+    with multiprocessing.Pool(WORKERS, _signer, (key, chain_id, fee, token)) as pool:
+        while True:
+            block = int(node.rpc("eth_blockNumber"), 16)
+            if block != last_block:
+                last_block, budget = block, per_block
+                checked = node.check(address, checked, block)
+            room = min(WINDOW - (nonce - node.nonce(address)), budget, ROUND)
+            if room <= 0:
+                time.sleep(0.01)
+                continue
+            chunk = list(itertools.islice(txs, room))
+            if lifted:
+                gases = [TX_GAS_CAP] * len(chunk)
+            else:
+                estimates = node.batch(
+                    "eth_estimateGas",
+                    [[{"from": address, "to": ANCHORING_ADDRESS, "data": "0x" + data.hex()}] for [data] in chunk],
+                )
+                gases = [min(TX_GAS_CAP, int(e, 16) * 11 // 10) for e in estimates]
+            job = pool.map_async(
+                _sign, [(nonce + i, tx, g) for i, (tx, g) in enumerate(zip(chunk, gases))], chunksize=25
+            )
+            for i in range(0, len(signed), 250):  # the round before, while this one is signed
+                node.batch("eth_sendRawTransaction", [[raw] for raw in signed[i : i + 250]])
+            rows = sum(map(len, chunk))
+            signed, nonce, budget, sent = job.get(), nonce + len(chunk), budget - len(chunk), sent + rows
+            if sent // 10_000 != (sent - rows) // 10_000:
+                print(f"{label}: {sent} sent, block {block}, {sent / (time.time() - start):.0f}/s", flush=True)
+            if not chunk:
+                break
+    while node.nonce(address) < nonce:
         time.sleep(0.2)
+    node.check(address, checked, int(node.rpc("eth_blockNumber"), 16))
     print(f"{label}: {sent} confirmed in {time.time() - start:.0f}s", flush=True)
 
 
@@ -267,20 +345,22 @@ def main() -> None:
     if args.cmd == "verify":
         raise SystemExit(1 if verify(node, old, chosen, seeded) else 0)
 
-    acct = Account.from_key(os.environ["REPLAY_KEY"])
-    creator = bech32(acct.address)
+    key = os.environ["REPLAY_KEY"]
+    address = Account.from_key(key).address
+    creator = bech32(address)
     print(f"signing as {creator}" + ("" if creator == ADMIN else f", not {ADMIN}"), flush=True)
     # Resume from what landed: wait out this key's pending transactions, which a node restart drops.
-    while node.nonce(acct.address, "pending") > node.nonce(acct.address):
+    while node.nonce(address, "pending") > node.nonce(address):
         time.sleep(0.5)
     if args.cmd == "registries":
         have = node.count(lambda offset: ANCHORING.fns.registries(0, Page(offset=offset, limit=1)), len(old))
         print(f"{have} registries here, {len(old) - have} to send", flush=True)
-        calls = (ANCHORING.fns.addRegistry(r.name, r.description, r.metadata).data for r in old[have:])
-        send(node, acct, calls, args.per_block, "registries")
+        # A registry each to a transaction: there are only a few thousand.
+        calls = ((ANCHORING.fns.addRegistry(r.name, r.description, r.metadata).data, TX_GAS_CAP) for r in old[have:])
+        send(node, key, calls, args.per_block, "registries")
     else:
         calls = itertools.chain.from_iterable(remaining(node, r, rows_of(r, seeded)) for r in chosen)
-        send(node, acct, calls, args.per_block, "records")
+        send(node, key, calls, args.per_block, "records")
 
 
 if __name__ == "__main__":
