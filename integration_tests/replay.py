@@ -2,10 +2,14 @@
 registry's records in write order, so ids, versions and checksum lookups come out as the old chain has them.
 A rerun resumes.
 
-    .venv/bin/python -m integration_tests.replay registries
+    .venv/bin/python -m integration_tests.replay registries [--genesis FILE]
     .venv/bin/python -m integration_tests.replay records [REGISTRY...]
+    .venv/bin/python -m integration_tests.replay handover [REGISTRY...]
     .venv/bin/python -m integration_tests.replay verify [REGISTRY...]
 
+With --genesis, a chain not yet started gets the registries in its genesis instead, keeping the old chain's
+creators and times, and its admins: each creator, but the genesis owner for the old module admin, a multisig
+no key derives. REPLAY_KEY administers every registry too, so it can write their records, until `handover`.
 A REGISTRY is an id or a name only one registry has; none means every one. REPLAY_KEY signs. Seeded court
 registries' rows come from NVNMCHAIN_EXPORT_DIR unless the old chain has written to them since, everything else
 from the old chain at NVNMCHAIN_API.
@@ -21,6 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter
+from pathlib import Path
 
 from eth_abi import decode, encode
 from eth_account import Account
@@ -30,7 +35,7 @@ from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 from web3 import HTTPProvider
 
 from .abi import ANCHORING, ANCHORING_ADDRESS, FEE
-from .anchoring import Page, Record, Registry, bech32
+from .anchoring import Page, Record, Registry, bech32, from_bech32
 from .tempo_vs_export import ADMIN, CHUNK, EXPORT, FIRST_SEEDED_ID, RECORD, VERSIONS, reader_code
 
 API = os.getenv("NVNMCHAIN_API", "https://api.nvnmchain.io")
@@ -42,6 +47,19 @@ ROUND = 1000  # transactions signed, then sent, at a time
 WORKERS = max(1, (os.cpu_count() or 4) - 4)  # signers or verifiers, leaving cores to a node on the same machine
 PAGE = 200
 REPLAYED = {"timestamp", "created_at", "creator"}  # what the replay sets itself
+
+
+def word(n: int) -> bytes:
+    return n.to_bytes(32, "big")
+
+
+def slot(key: bytes, parent: int) -> int:
+    """`mapping[key]` of the mapping at slot `parent`: a value key padded to a word, a string key as it is."""
+    return int.from_bytes(keccak(key + word(parent)), "big")
+
+
+def admin_role(rid: int) -> bytes:
+    return keccak(f"registry:{rid}:admin".encode())
 
 
 def fetch(path: str, params: dict) -> dict:
@@ -154,16 +172,16 @@ class Node:
     def call(self, data: bytes, override: dict | None = None) -> bytes:
         return self.calls([data], override)[0]
 
-    def word(self, slot: bytes) -> int:
-        return int(self.rpc("eth_getStorageAt", ANCHORING_ADDRESS, "0x" + slot.hex(), "latest"), 16)
+    def stored(self, at: int) -> int:
+        return int(self.rpc("eth_getStorageAt", ANCHORING_ADDRESS, "0x" + word(at).hex(), "latest"), 16)
 
     def registry_count(self) -> int:
         """`_registryCount`, in slot 3 above the 160-bit `_formerAdmin`."""
-        return self.word((3).to_bytes(32, "big")) >> 160
+        return self.stored(3) >> 160
 
     def record_count(self, rid: int) -> int:
         """`_recordCount[rid]`, of the mapping at slot 5."""
-        return self.word(keccak(encode(["uint256"] * 2, [rid, 5])))
+        return self.stored(slot(word(rid), 5))
 
     def registries(self) -> list[Registry]:
         rows = []
@@ -228,6 +246,57 @@ def packed(calls):
         total += bound
     if batch:
         yield batch
+
+
+def string_slots(at: int, s: str) -> dict[int, bytes]:
+    """A string at slot `at`: under 32 bytes in that slot, twice its length in the last byte; else twice its
+    length plus one there and the bytes from keccak(at)."""
+    b = s.encode()
+    if len(b) < 32:
+        return {at: b.ljust(31, b"\0") + bytes([2 * len(b)])}
+    data = int.from_bytes(keccak(word(at)), "big")
+    return {at: word(2 * len(b) + 1)} | {data + i // 32: b[i : i + 32].ljust(32, b"\0") for i in range(0, len(b), 32)}
+
+
+def registry_slots(registries: list[Registry], admins: dict[int, set[str]]) -> dict[int, bytes]:
+    """What `addRegistry` leaves for each registry, with `admins` holding its admin role: the fields, the role,
+    the name index keyed by the ASCII-lowered name, and the count."""
+    slots, by_name = {3: word(len(registries) << 160)}, {}
+    for r in registries:
+        base = slot(word(r.id), 4)
+        slots[base] = word(r.id)
+        for i, field in enumerate(r[1:], 1):
+            slots |= string_slots(base + i, field)
+        role, members = admin_role(r.id), admins[r.id]
+        slots[slot(role, 0)] = role  # the role administers itself
+        for admin in sorted(members):  # in a fixed order, so the file is reproducible
+            slots[slot(bytes.fromhex(admin[2:]).rjust(32, b"\0"), slot(role, 1))] = word(1)
+        slots[slot(role, 2)] = word(len(members))
+        by_name.setdefault(r.name.encode().lower(), []).append(r.id)
+    for name, ids in by_name.items():
+        length = slot(name, 10)
+        slots[length] = word(len(ids))
+        data = int.from_bytes(keccak(word(length)), "big")
+        for i in range(0, len(ids), 4):  # four ids a word, the first in the low bytes
+            slots[data + i // 4] = b"".join(n.to_bytes(8, "big") for n in reversed(ids[i : i + 4])).rjust(32, b"\0")
+    return {at: value for at, value in slots.items() if any(value)}
+
+
+def into_genesis(path: Path, registries: list[Registry], me: str) -> None:
+    """Writes the registries into the genesis file's anchoring storage. `me` is lower-cased as the other admins
+    are, so where it is the creator it counts once."""
+    genesis = json.loads(path.read_text())
+    storage = genesis["alloc"][ANCHORING_ADDRESS.lower()].setdefault("storage", {})
+    if not (owner := storage.get("0x" + word(11).hex())):  # `_owner`, which a genesis at T12 names
+        raise SystemExit(f"{path} names no anchoring owner, so its chain starts before T12")
+    owner, me = "0x" + owner[-40:], me.lower()
+    module_admin = fetch("NVNM-Chain/nvnmchain/anchoring/v1/params", {})["params"]["admin"]
+    admins = {r.id: {me, owner if r.creator == module_admin else from_bech32(r.creator)} for r in registries}
+    new = {"0x" + word(at).hex(): "0x" + value.hex() for at, value in registry_slots(registries, admins).items()}
+    assert not new.keys() & storage.keys(), f"{path} already holds anchoring rows"
+    storage |= new
+    path.write_text(json.dumps(genesis, indent=2))
+    print(f"{len(registries)} registries into {path} ({len(new)} slots), {me} administering each", flush=True)
 
 
 SIGNER: tuple  # a pool worker's signer, chain id, fee and fee token
@@ -364,13 +433,18 @@ def verify(node: Node, old: list[Registry], chosen: list[Registry], seeded: dict
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["registries", "records", "verify"])
-    ap.add_argument("registries", nargs="*", help="ids or names, for records and verify; none means all")
+    ap.add_argument("cmd", choices=["registries", "records", "handover", "verify"])
+    ap.add_argument("registries", nargs="*", help="ids or names, for all but registries; none means all")
     ap.add_argument("--rpc", default=os.getenv("TEMPO_RPC", "http://127.0.0.1:8545"))
     ap.add_argument("--per-block", type=int, default=WINDOW, help="new transactions a block, to pace a drip")
+    ap.add_argument("--genesis", type=Path, help="for registries: write them into this genesis file instead")
     args = ap.parse_args()
+    if args.genesis and args.cmd != "registries":
+        ap.error("--genesis goes with registries")
 
     node, old = Node(args.rpc), old_registries()
+    if args.genesis:
+        return into_genesis(args.genesis, old, Account.from_key(os.environ["REPLAY_KEY"]).address)
     chosen = old
     if args.registries:
         chosen = []
@@ -400,6 +474,14 @@ def main() -> None:
         # A registry each to a transaction: there are only a few thousand.
         calls = ((ANCHORING.fns.addRegistry(r.name, r.description, r.metadata).data, TX_GAS_CAP) for r in old[have:])
         send(node, key, calls, args.per_block, "registries")
+    elif args.cmd == "handover":  # leave every registry another admin holds; the contract keeps the last one
+        roles = [admin_role(r.id) for r in chosen]
+        held = node.calls([ANCHORING.fns.hasRole(role, address).data for role in roles])
+        counts = node.calls([ANCHORING.fns.roleMemberCount(role).data for role in roles])
+        leave = [r.id for r, h, n in zip(chosen, held, counts) if any(h) and int.from_bytes(n, "big") > 1]
+        print(f"{len(leave)} registries to leave", flush=True)
+        calls = ((ANCHORING.fns.revokeRole(rid, "", address, "admin").data, TX_GAS_CAP) for rid in leave)
+        send(node, key, calls, args.per_block, "handover")
     else:
         calls = itertools.chain.from_iterable(remaining(node, r, rows_of(r, seeded)) for r in chosen)
         send(node, key, calls, args.per_block, "records")

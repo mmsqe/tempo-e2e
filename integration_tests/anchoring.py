@@ -153,6 +153,9 @@ async def deploy_relay(w3, chain_id: int, account) -> str:
     return relay
 
 
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
 def bech32(address: str, hrp: str = "nvnm") -> str:
     """BIP-173, written from the spec so it shares nothing with the contract's Bech32.sol."""
     acc, bits, words = 0, 0, []
@@ -170,7 +173,20 @@ def bech32(address: str, hrp: str = "nvnm") -> str:
             if top >> i & 1:
                 chk ^= generator
     words += [(chk ^ 1) >> 5 * (5 - i) & 31 for i in range(6)]
-    return hrp + "1" + "".join("qpzry9x8gf2tvdw0s3jn54khce6mua7l"[w] for w in words)
+    return hrp + "1" + "".join(CHARSET[w] for w in words)
+
+
+def from_bech32(account: str) -> str:
+    """The 20-byte address a bech32 account holds, checked by encoding it back."""
+    acc, bits, out = 0, 0, bytearray()
+    for c in account[account.rindex("1") + 1 : -6]:
+        acc, bits = acc << 5 | CHARSET.index(c), bits + 5
+        if bits >= 8:
+            bits -= 8
+            out.append(acc >> bits & 255)
+    address = "0x" + out.hex()
+    assert bech32(address, account[: account.rindex("1")]) == account, f"{account} is not a bech32 account"
+    return address
 
 
 def add_record(registry_id: int, checksum: str, uri: str = "", algo: str = "sha256"):
