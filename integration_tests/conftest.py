@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -21,8 +22,17 @@ from . import tidx as tidx_mod
 from .docker_cluster import DockerCluster
 from .drivers import get_driver
 from .drivers.base import CAP_CONSENSUS_NET, CAP_INDEXER, CAP_TEMPO_NATIVE
-from .network import ExternalNode, free_port, resolve_tempo_bin, resolve_xtask_bin, running
-from .utils import new_account, rpc
+from .network import (
+    ExternalNode,
+    dev_node,
+    fork_schedule,
+    free_port,
+    resolve_tempo_bin,
+    resolve_xtask_bin,
+    running,
+    xtask_forks,
+)
+from .utils import FAR_FUTURE, new_account, rpc
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -90,6 +100,25 @@ async def w3(tempo):
 @pytest.fixture
 def chain_id(tempo) -> int:
     return tempo.chain_id
+
+
+@pytest.fixture(scope="session")
+def held_back(tmp_path_factory):
+    """``held_back("t13_time")``: a dev node running every fork before T13 and none from it on, to show a
+    fork's change against the session node; started on first use and shared."""
+    nodes = {}
+    with contextlib.ExitStack() as stack:
+
+        def node(fork: str):
+            if fork not in nodes:
+                if fork not in xtask_forks():
+                    pytest.skip(f"tempo-xtask cannot schedule {fork}")
+                base = tmp_path_factory.mktemp(f"pre_{fork}")
+                held = dev_node(base, log_name=f"pre_{fork}.log", fork_times=fork_schedule(fork, FAR_FUTURE))
+                nodes[fork] = stack.enter_context(running(held))
+            return nodes[fork]
+
+        yield node
 
 
 @pytest.fixture(scope="session")

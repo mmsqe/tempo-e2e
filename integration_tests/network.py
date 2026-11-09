@@ -122,7 +122,7 @@ def xtask_forks() -> tuple[str, ...]:
 
 def fork_schedule(fork: str, activation: int) -> dict[str, int]:
     """Activate ``fork`` and every later fork at ``activation``, leaving earlier ones at genesis; later
-    forks come along because a schedule has to stay ordered."""
+    forks have to be named, since xtask starts an unnamed one at genesis, ahead of ``fork``."""
     order = xtask_forks()
     return {f: activation for f in order[order.index(fork) :]}
 
@@ -141,6 +141,7 @@ def generate_dev_genesis(
     output_dir: Path,
     *,
     fork_times: dict[str, int] | None = None,
+    hardfork: str | None = None,
     chain_id: int | None = None,
     epoch_length: int | None = None,
     anchoring: bool = False,
@@ -154,8 +155,9 @@ def generate_dev_genesis(
     default, else generated there by ``tempo-xtask``.
 
     ``fork_times`` (``{"t10_time": <unix seconds>}``) goes through xtask, which keys parts of the alloc off
-    each activation; ``epoch_length`` lets a long run pass the boundary a single validator halts at; ``dkg``
-    keeps the DKG outcome in the header, which a follower needs.
+    each activation; ``hardfork`` (``"T12"``) leaves every later fork off; ``epoch_length`` lets a long run
+    pass the boundary a single validator halts at; ``dkg`` keeps the DKG outcome in the header, which a
+    follower needs.
     """
     genesis = output_dir / "genesis.json"
     if fork_times:
@@ -165,6 +167,7 @@ def generate_dev_genesis(
     options = [
         # t10_time -> --t10-time <ts>
         *[a for name, ts in (fork_times or {}).items() for a in (f"--{name.replace('_', '-')}", str(ts))],
+        *(("--hardfork", hardfork) if hardfork else ()),
         *(("--chain-id", str(chain_id)) if chain_id is not None else ()),
         *(("--epoch-length", str(epoch_length)) if epoch_length is not None else ()),
         *(("--anchoring",) if anchoring else ()),
@@ -401,6 +404,15 @@ def dev_node(
     genesis = generate_dev_genesis(devnet, fork_times=fork_times, chain_id=chain_id, gas_token_admin=gas_token_admin)
     kwargs.setdefault("http_port", free_port())
     return TempoNode(datadir=devnet / "node0", log_path=devnet / log_name, genesis=genesis, **kwargs)
+
+
+def patched_node(base: Path, genesis: Path, patch) -> TempoNode:
+    """A node in ``base`` on a copy of ``genesis`` that ``patch`` edits in place, on a free HTTP port."""
+    spec = json.loads(genesis.read_text())
+    patch(spec)
+    copy = base / "genesis.json"
+    copy.write_text(json.dumps(spec))
+    return TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=copy, http_port=free_port())
 
 
 @contextmanager

@@ -105,7 +105,7 @@ variant.
 |---|---|---|
 | `test_smoke.py` | — | node connected, chain started, blocks advance |
 | `test_chain_id.py` | — | `eth_chainId` / `net_version` consistency |
-| `test_rpc.py` | TIP-1031 | client version, not-syncing, tx-by-hash (0x76 AA), block receipts, state override |
+| `test_rpc.py` | TIP-1031 | client version, not-syncing, tx-by-hash (0x76 AA), block receipts, state override, the gas-price oracle over zero tips |
 | `test_eip1559.py` | EIP-1559 | base fee present, effective price ≤ maxFee, maxFee-below-basefee rejection |
 | `test_fee_history.py` | — | `eth_feeHistory` shape and reward percentiles |
 | `test_filters.py` | — | event logs / filters: transfer log, `get_logs`, block & log filters |
@@ -120,15 +120,15 @@ variant.
 | `test_simulate.py` | — | `tempo_simulateV1`: gas for a reverting call, transfer trace + TIP-20 metadata |
 | `test_validation.py` | — | malformed / unfunded tx rejection |
 | `test_gas.py` | TIP-1000, TIP-1010 | gas estimation/accounting: state-creation cost, 30M per-tx cap |
-| `test_node_ops.py` | — | node resumes from persisted state on restart (`slow`) |
+| `test_node_ops.py` | — | restart from persisted state, refused start-up flags and `consensus info` misuse, a genesis ahead of the clock (`slow`) |
 | `test_snapshot.py` | — | `tempo snapshot-manifest` / `tempo download` round trip, for a dev node and a follower (`slow`) |
 
 ### Genesis & hardforks
 
 | File | TIP(s) | Covers |
 |---|---|---|
-| `test_genesis.py` | — | what `tempo-xtask generate-genesis` writes: anchoring proxy, nUSD, the deployment gas token |
-| `test_hardfork.py` | — | fork boundaries crossed on a running chain install the genesis state they skipped; T12's anchoring proxy; `shadow-replay` (`slow`) |
+| `test_genesis.py` | — | what `tempo-xtask generate-genesis` writes: anchoring proxy, nUSD, OUSD, the deployment gas token, `--hardfork` |
+| `test_hardfork.py` | — | fork boundaries crossed on a running chain install the genesis state they skipped; T12's anchoring proxy; T13's dropped system calls; `shadow-replay` (`slow`) |
 | `test_abi_strictness.py` | TIP-1100 | strict precompile calldata decoding from T11, trailing bytes allowed again at T12, per-word gas |
 
 ### Tempo native tx & account abstraction
@@ -170,7 +170,7 @@ variant.
 |---|---|---|
 | `test_fee_amm.py` | — | gas paid in a non-validator stablecoin via the FeeManager AMM pool, no-pool token rejected naming the fee token |
 | `test_fee_routing.py` | TIP-1033 | two-hop FeeAMM routing X→ALPHA→PATH; direct-pool preference; m² haircut |
-| `test_fee_token.py` | — | pay gas in a chosen stablecoin via the `fee_token` field (FeeAMM) |
+| `test_fee_token.py` | TIP-1115 | pay gas in a chosen stablecoin via the `fee_token` field (FeeAMM), or by the fallback list when none is named |
 | `test_fee_sponsor.py` | — | a fee payer covers gas for another account; unfunded payer rejected |
 | `test_fee_manager_policy.py` | TIP-1042 | FeeManager policy exemptions (T8+): blacklist still pays gas; mint/burn auth |
 | `test_dynamic_basefee.py` | TIP-1067 | dynamic base fee: congestion raises, idle decays (EIP-1559 integer formula) |

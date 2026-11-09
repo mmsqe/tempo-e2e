@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 
 # The four enshrined TIP-20 stablecoins, by symbol.
 STABLECOINS = {"PATH_USD": PATH_USD, "ALPHA_USD": ALPHA_USD, "BETA_USD": BETA_USD, "THETA_USD": THETA_USD}
+# OUSD at its mainnet address, where the dev genesis also creates it: TIP-1115's second fallback fee token.
+OUSD = Web3.to_checksum_address("0x20c0000000000000000000006a37da5c996874be")
 
 # ITIP403Registry.PolicyType. A whitelist authorizes only its members; a blacklist
 # authorizes everyone except its members.
@@ -50,6 +52,7 @@ STATE_WRITE_GAS = 8_000_000
 # What one account is given on a network funded by transfer: a few hundred writes' worth.
 FUNDED_AMOUNT = 5_000_000
 SET_CODE_GAS = 500_000  # a 7702 delegation, plus whatever the delegated code then does
+PLAIN_CALL_GAS = 300_000  # a call with no data, with TIP-1000's 250,000 for a sender's first transaction
 
 # A timestamp no run reaches (year ~2096): a key that never expires, a fork that never activates.
 # authorizeKey needs a real one, since 0 is ExpiryInPast.
@@ -319,23 +322,41 @@ async def send_call(
     return receipt
 
 
+async def sign_type_2(
+    w3: AsyncWeb3,
+    account,
+    to: str,
+    data=b"",
+    *,
+    gas: int,
+    value: int = 0,
+    nonce: int | None = None,
+    max_fee_per_gas: int | None = None,
+    max_priority_fee_per_gas: int = DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+) -> bytes:
+    """A signed plain EIP-1559 tx from ``account``. It names no fee token, so the payer's own setting
+    decides, or failing that what it calls, or failing that the fallback list."""
+    tx = {
+        "to": to,
+        "data": data,
+        "value": value,
+        "nonce": await w3.eth.get_transaction_count(account.address) if nonce is None else nonce,
+        "chainId": await w3.eth.chain_id,
+        "gas": gas,
+        "maxFeePerGas": max_fee_per_gas or await suggested_max_fee(w3),
+        "maxPriorityFeePerGas": max_priority_fee_per_gas,
+        "type": 2,
+    }
+    return Account.sign_transaction(tx, account.key).raw_transaction
+
+
 async def send_type_2(w3: AsyncWeb3, account, to, data=None, *, gas: int | None = None, value: int = 0):
-    """A plain EIP-1559 tx from ``account``, asserting success. It names no fee token, so the payer's own
-    setting decides; gas defaults to the estimate, since TIP-1016 charges per new slot."""
+    """A plain EIP-1559 tx from ``account``, asserting success; gas defaults to the estimate, since
+    TIP-1016 charges per new slot."""
     call = _call(to, data)
     if gas is None:
         gas = await w3.eth.estimate_gas({**call, "from": account.address, "value": value})
-    tx = {
-        **call,
-        "value": value,
-        "nonce": await w3.eth.get_transaction_count(account.address),
-        "chainId": await w3.eth.chain_id,
-        "gas": gas,
-        "maxFeePerGas": await suggested_max_fee(w3),
-        "maxPriorityFeePerGas": DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
-        "type": 2,
-    }
-    raw = Account.sign_transaction(tx, account.key).raw_transaction
+    raw = await sign_type_2(w3, account, **call, gas=gas, value=value)
     receipt = await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw))
     assert receipt["status"] == 1, receipt
     return receipt
@@ -350,6 +371,12 @@ async def active_forks(w3: AsyncWeb3) -> set[str]:
     so a test can state what each fork brings instead of pinning one binary."""
     schedule = (await rpc_result(w3, "tempo_forkSchedule"))["schedule"]
     return {fork["name"].upper() for fork in schedule if fork["active"]}
+
+
+async def skip_before(w3: AsyncWeb3, fork: str) -> None:
+    """Skips the test when the node under test predates ``fork``."""
+    if fork not in await active_forks(w3):
+        pytest.skip(f"the node under test is older than {fork}")
 
 
 async def wait_for_block(w3: AsyncWeb3, number: int, *, timeout: float = 300.0, poll: float = 0.5) -> int:
@@ -447,14 +474,21 @@ async def blacklist_token(w3: AsyncWeb3, *, chain_id: int, admin, token: str, bl
 
 
 async def fund_token(
-    w3: AsyncWeb3, *, chain_id: int, to: str, token: str, amount: int, funder_pk: str = FAUCET_PRIVATE_KEY
+    w3: AsyncWeb3,
+    *,
+    chain_id: int,
+    to: str,
+    token: str,
+    amount: int,
+    funder_pk: str = FAUCET_PRIVATE_KEY,
+    fee_token: str | None = None,
 ):
-    """Transfer ``token`` from the prefunded genesis account, to test paying gas in a non-PATH_USD token."""
+    """Transfer ``token`` from the prefunded genesis account, paying the fee in ``fee_token``, else in ``token``."""
     return await send_calls(
         w3,
         chain_id=chain_id,
         private_key=funder_pk,
-        fee_token=token,
+        fee_token=fee_token or token,
         calls=[{"to": token, "data": ERC20.fns.transfer(to, amount).data}],
     )
 

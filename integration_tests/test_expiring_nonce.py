@@ -12,6 +12,7 @@ from .utils import (
     latest_timestamp,
     new_account,
     send_tempo_tx,
+    skip_before,
     suggested_max_fee,
     transfer_call,
 )
@@ -81,8 +82,7 @@ async def test_window_beyond_max_expiry_is_rejected(w3, chain_id):
 
 async def test_t11_widens_the_window(w3, chain_id):
     """A valid_before the pre-T11 window refused is accepted once T11 is active."""
-    if "T11" not in await active_forks(w3):
-        pytest.skip("the node under test is older than T11")
+    await skip_before(w3, "T11")
     acct = await funded(w3)
     beyond_old = await latest_timestamp(w3) + PRE_T11_MAX_EXPIRY_SECS + 90
     assert beyond_old <= await latest_timestamp(w3) + T11_MAX_EXPIRY_SECS

@@ -4,6 +4,8 @@ The launch genesis is generated, not hand-patched, so a chain starts on the runt
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from eth_utils import keccak
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, VALIDATOR_CONFIG_V2_ADDRESS
@@ -11,6 +13,7 @@ from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, VALIDATOR_CONFIG_V2_A
 from .abi import ANCHORING_ADDRESS
 from .anchoring import IMPLEMENTATION, IMPLEMENTATION_SLOT, LAUNCH_RUNTIME_HASH, OWNER_SLOT, PROXY_CODE
 from .network import DEV_GENESIS_ACCOUNTS, generate_dev_genesis, genesis_alloc
+from .utils import OUSD
 
 pytestmark = pytest.mark.tempo
 
@@ -62,6 +65,20 @@ class TestAnchoring:
     def test_a_genesis_without_the_flag_carries_no_contract(self, tmp_path):
         """Upstream's own networks generate the same way and must not pick it up."""
         assert ANCHORING_ADDRESS.lower() not in genesis_alloc(generate_dev_genesis(tmp_path))
+
+
+def test_ousd_is_where_mainnet_has_it(tmp_path):
+    """The dev genesis creates OUSD from its mainnet creator and salt, so apps meet it at one address."""
+    storage = genesis_alloc(generate_dev_genesis(tmp_path))[OUSD.lower()]["storage"]
+    assert {b"OpenUSD", b"OUSD"} <= set(_strings(storage)), "name and symbol"
+
+
+@pytest.mark.parametrize(("fork_times", "t13"), [({}, None), ({"t13_time": 100}, 100)])
+def test_hardfork_writes_later_forks_null(tmp_path, fork_times, t13):
+    """``--hardfork T12`` writes each later fork as ``null``, so a chain cannot inherit it, unless its own
+    ``--<fork>-time`` names it."""
+    config = json.loads(generate_dev_genesis(tmp_path, hardfork="T12", fork_times=fork_times).read_text())["config"]
+    assert (config["t12Time"], config["t13Time"], config["t14Time"]) == (0, t13, None)
 
 
 def test_the_reserved_stablecoin_is_named_nusd(tmp_path):

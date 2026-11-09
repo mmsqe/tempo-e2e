@@ -36,6 +36,7 @@ from .network import (
     free_port,
     generate_dev_genesis,
     genesis_alloc,
+    patched_node,
     resolve_tempo_bin,
     run_binary,
     running,
@@ -52,6 +53,7 @@ from .utils import (
     send_calls,
     wait_for_block,
     wait_for_timestamp,
+    wait_height,
 )
 from .utils import GENESIS_ADMIN as ADMIN
 
@@ -59,11 +61,27 @@ pytestmark = [pytest.mark.tempo, pytest.mark.slow]
 
 MMR_FORK = "t10_time"  # once put a precompile, which answers before code, at 0x…0a00
 OWNER_FORK = "t12_time"
+SYSTEM_CALLS_FORK = "t13_time"
 DEPLOY_GAS = 25_000_000  # 20.7 KB of code at 1,000 gas a byte, and the creation around it
+
+# Ethereum's beacon-root and request predeploys, whose system calls TIP-1119 drops at T13.
+ETHEREUM_SYSTEM_CONTRACTS = (
+    "0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02",  # EIP-4788 beacon roots
+    "0x00000961Ef480Eb55e80D19ad83579A64c007002",  # EIP-7002 withdrawal requests
+    "0x0000BBdDc7CE488642fb579F8B00f3a590007251",  # EIP-7251 consolidation requests
+)
+CALL_COUNTER = "0x60005460010160005500"  # slot 0 += 1 on every call
 
 
 def _generate_alloc(output_dir: Path, fork_times: dict[str, int] | None = None) -> dict[str, dict]:
     return genesis_alloc(generate_dev_genesis(output_dir, fork_times=fork_times))
+
+
+def _owed(head: dict[str, dict], scheduled: dict[str, dict]) -> list[str]:
+    """The accounts a genesis scheduling a fork lacks, or holds other code at, against one launched on it."""
+    return sorted(
+        a for a, account in head.items() if a not in scheduled or account.get("code") != scheduled[a].get("code")
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -72,8 +90,8 @@ def boundary_forks() -> tuple[str, ...]:
     isolate its footprint. Empty without xtask, which collects as a skip rather than an error."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            head = set(_generate_alloc(Path(tmp) / "head", dict.fromkeys(xtask_forks(), 0)))
-            return tuple(f for f in xtask_forks() if head - set(_generate_alloc(Path(tmp) / f, {f: FAR_FUTURE})))
+            head = _generate_alloc(Path(tmp) / "head", dict.fromkeys(xtask_forks(), 0))
+            return tuple(f for f in xtask_forks() if _owed(head, _generate_alloc(Path(tmp) / f, {f: FAR_FUTURE})))
     except (OSError, RuntimeError):
         return ()
 
@@ -131,8 +149,9 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
     activation = int(time.time()) + ACTIVATION_LEAD
     node = dev_node(tmp_path, log_name=f"{fork}.log", fork_times=fork_schedule(fork, activation))
 
-    # Whatever the scheduled genesis omits is precisely what the boundary installers owe.
-    owed = sorted(set(head_alloc) - set(genesis_alloc(node.genesis)))
+    # Whatever the scheduled genesis omits or holds older code for is precisely what the boundary owes.
+    scheduled = genesis_alloc(node.genesis)
+    owed = _owed(head_alloc, scheduled)
     assert owed, f"{fork} writes nothing into the alloc; boundary_forks() should not have yielded it"
 
     def fingerprints(client: Web3) -> dict[str, dict[str, str]]:
@@ -140,11 +159,12 @@ def test_boundary_installs_the_genesis_state_it_skipped(fork, head_chain, tmp_pa
 
     with running(node):
         w3 = Web3(Web3.HTTPProvider(node.rpc_url))
-        # Pre-fork: a live chain one fork short, holding none of the state.
+        # Pre-fork: a live chain one fork short, on the scheduled genesis's code.
         _assert_pre_fork(w3, activation, fork)
         assert _active_fork(w3) == forks[forks.index(fork) - 1]
         for address in owed:
-            assert _code(w3, address) == b"", f"{address} must hold no code before {fork}"
+            launch = bytes.fromhex(scheduled.get(address, {}).get("code", "0x")[2:])
+            assert _code(w3, address) == launch, f"{address} must hold its launch code before {fork}"
 
         node.wait_for_rpc(timeout=120, want_timestamp=activation)
 
@@ -175,6 +195,31 @@ def test_crossing_t10_leaves_the_anchoring_contract_alone(tmp_path):
 
         assert _active_fork(w3) == xtask_forks()[-1]
         assert state(w3) == before
+
+
+def test_crossing_t13_stops_the_ethereum_system_calls(tmp_path):
+    """TIP-1119: every block before T13 calls the beacon-root and request contracts once and none from
+    it on does, so a counter at each stops at the number of the last block before the fork."""
+    activation = int(time.time()) + ACTIVATION_LEAD
+    genesis = generate_dev_genesis(tmp_path / "xtask", fork_times=fork_schedule(SYSTEM_CALLS_FORK, activation))
+    assert not {a.lower() for a in ETHEREUM_SYSTEM_CONTRACTS} & set(genesis_alloc(genesis))
+    counters = {a: {"balance": "0x0", "code": CALL_COUNTER} for a in ETHEREUM_SYSTEM_CONTRACTS}
+    node = patched_node(tmp_path, genesis, lambda spec: spec["alloc"].update(counters))
+
+    def calls(w3: Web3, block) -> list[int]:
+        return [int.from_bytes(w3.eth.get_storage_at(a, 0, block), "big") for a in ETHEREUM_SYSTEM_CONTRACTS]
+
+    with running(node):
+        w3 = Web3(Web3.HTTPProvider(node.rpc_url))
+        _assert_pre_fork(w3, activation, SYSTEM_CALLS_FORK)
+        early = w3.eth.block_number
+        assert calls(w3, early) == [early] * len(ETHEREUM_SYSTEM_CONTRACTS), "one call a block before T13"
+
+        node.wait_for_rpc(timeout=120, want_timestamp=activation)
+        wait_height(node.rpc_url, w3.eth.block_number + 10)
+
+        [last] = set(calls(w3, "latest"))
+        assert w3.eth.get_block(last)["timestamp"] < activation <= w3.eth.get_block(last + 1)["timestamp"]
 
 
 async def _deploy(send, salt: int = 0) -> str:
@@ -244,7 +289,7 @@ class TestCrossingT12:
         chain launched like the testnet: its zone factory still on upstream's key."""
         genesis = generate_dev_genesis(
             tmp_path / "xtask",
-            fork_times={OWNER_FORK: FAR_FUTURE},
+            fork_times=fork_schedule(OWNER_FORK, FAR_FUTURE),
             anchoring=True,
             zone_owner=UPSTREAM_ZONE_OWNER,
         )

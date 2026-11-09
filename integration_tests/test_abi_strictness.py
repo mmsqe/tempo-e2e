@@ -8,8 +8,7 @@ import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import PATH_USD
 
-from .network import dev_node, fork_schedule, running, xtask_forks
-from .utils import FAR_FUTURE, active_forks, call_revert, rpc
+from .utils import active_forks, call_revert, rpc, skip_before
 
 pytestmark = pytest.mark.tempo
 
@@ -51,23 +50,12 @@ async def test_dirty_address_padding_is_refused_at_t11(w3):
         assert await w3.eth.call(payload(dirty)) == await w3.eth.call(payload(BALANCE_OF))
 
 
-@pytest.fixture(scope="module")
-def pre_t11_node(tmp_path_factory):
-    """A node held at the fork before T11, to price the same call on both sides."""
-    if "t11_time" not in xtask_forks():
-        pytest.skip("tempo-xtask cannot schedule t11_time")
-    held_back = fork_schedule("t11_time", FAR_FUTURE)
-    with running(dev_node(tmp_path_factory.mktemp("pre-t11"), log_name="pre_t11.log", fork_times=held_back)) as node:
-        yield node
-
-
 @pytest.mark.slow
-async def test_t11_charges_more_per_input_word(w3, pre_t11_node):
+async def test_t11_charges_more_per_input_word(w3, held_back):
     """Each word of precompile calldata costs 24 gas more once T11 is active."""
-    if "T11" not in await active_forks(w3):
-        pytest.skip("the node under test is older than T11")
+    await skip_before(w3, "T11")
 
-    async with rpc(pre_t11_node) as before:
+    async with rpc(held_back("t11_time")) as before:
         assert "T11" not in await active_forks(before)
         rise = await w3.eth.estimate_gas(payload(BALANCE_OF)) - await before.eth.estimate_gas(payload(BALANCE_OF))
 
