@@ -99,17 +99,7 @@ def rows_of(registry: Registry, seeded: dict[int, dict]) -> list[Record]:
         assert entry["registry"] == registry.name, f"registry {rid} is {registry.name}, the export's {entry}"
         with gzip.open(EXPORT / entry["file"], "rt") as f:
             return [
-                parsed(
-                    Record,
-                    {
-                        **r,
-                        "checksum_algo": r["checksumAlgo"],
-                        "record_id": i,
-                        "index": 1,
-                        "is_latest": True,
-                        "registry_id": rid,
-                    },
-                )
+                Record(r["uri"], r["checksum"], r["checksumAlgo"], r["metadata"], "", r["status"], i, 1, True, rid)
                 for i, r in enumerate(map(json.loads, f), 1)
             ]
     rows = []
