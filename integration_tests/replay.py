@@ -11,7 +11,6 @@ registries' rows come from NVNMCHAIN_EXPORT_DIR, everything else from the old ch
 """
 
 import argparse
-import bisect
 import gzip
 import itertools
 import json
@@ -24,6 +23,7 @@ from collections import Counter
 
 from eth_abi import decode, encode
 from eth_account import Account
+from eth_utils import keccak
 from tempo import Builder, Signer, serialize, sign_transaction
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
 from web3 import HTTPProvider
@@ -37,7 +37,7 @@ BASE_FEE_CAP = 12_000_000_000  # TIP-1067's ceiling; a fee under it stalls once 
 TX_GAS_CAP = 30_000_000
 WINDOW = 8192  # unconfirmed transactions kept in the pool
 ROUND = 1000  # transactions signed, then sent, at a time
-WORKERS = max(1, (os.cpu_count() or 4) - 4)  # signers, leaving cores to a node on the same machine
+WORKERS = max(1, (os.cpu_count() or 4) - 4)  # signers or verifiers, leaving cores to a node on the same machine
 PAGE = 200
 REPLAYED = {"timestamp", "created_at", "creator"}  # what the replay sets itself
 
@@ -101,14 +101,12 @@ def rows_of(registry: Registry, seeded: dict[int, dict]) -> list[Record]:
 
 class Node:
     def __init__(self, url: str):
+        self.url = url
         self.provider = HTTPProvider(url, request_kwargs={"timeout": 300})
         self.reader = None
 
     def rpc(self, method: str, *params):
-        reply = self.provider.make_request(method, list(params))
-        if "error" in reply:
-            raise RuntimeError(f"{method}: {reply['error']}")
-        return reply["result"]
+        return self.batch(method, [list(params)])[0]
 
     def batch(self, method: str, params: list[list]) -> list:
         if not params:  # a node answers an empty batch with one error, not a list
@@ -125,27 +123,34 @@ class Node:
     def check(self, address: str, after: int, until: int) -> int:
         """Stops on any of `address`'s transactions that failed in blocks after..until, and returns `until`: a
         failed one still took its nonce, so every record sent after it took the wrong id."""
+        address = address.lower()
         for receipts in self.batch("eth_getBlockReceipts", [[hex(n)] for n in range(after + 1, until + 1)]):
             for r in receipts:
-                if r["status"] != "0x1" and r["from"].lower() == address.lower():
+                if r["status"] != "0x1" and r["from"].lower() == address:
                     raise SystemExit(f"{r['transactionHash']} failed: rebuild the chain, the ids after it are off")
         return until
 
-    def call(self, data: bytes, override: dict | None = None) -> bytes:
-        params = [{"to": ANCHORING_ADDRESS, "data": "0x" + data.hex()}, "latest"] + ([override] if override else [])
-        out = self.rpc("eth_call", *params)
-        if out == "0x":  # every write would succeed and be lost, so nothing may be sent
+    def calls(self, datas: list[bytes], override: dict | None = None) -> list[bytes]:
+        """One request of `eth_call`s to the contract, answered in order."""
+        tail = ["latest"] + ([override] if override else [])
+        outs = self.batch("eth_call", [[{"to": ANCHORING_ADDRESS, "data": "0x" + d.hex()}, *tail] for d in datas])
+        if "0x" in outs:  # every write would succeed and be lost, so nothing may be sent
             raise SystemExit(f"{ANCHORING_ADDRESS} answered nothing: no anchoring implementation is deployed behind it")
-        return bytes.fromhex(out[2:])
+        return [bytes.fromhex(out[2:]) for out in outs]
 
-    def count(self, view, at_most: int) -> int:
-        """How many rows a paged view holds, by bisection: `view(offset)` asks for one row."""
+    def call(self, data: bytes, override: dict | None = None) -> bytes:
+        return self.calls([data], override)[0]
 
-        def held(offset: int) -> bool:
-            fn = view(offset)
-            return bool(fn.decode(self.call(fn.data))[0])
+    def word(self, slot: bytes) -> int:
+        return int(self.rpc("eth_getStorageAt", ANCHORING_ADDRESS, "0x" + slot.hex(), "latest"), 16)
 
-        return bisect.bisect_left(range(at_most + 1), True, key=lambda offset: not held(offset))
+    def registry_count(self) -> int:
+        """`_registryCount`, in slot 3 above the 160-bit `_formerAdmin`."""
+        return self.word((3).to_bytes(32, "big")) >> 160
+
+    def record_count(self, rid: int) -> int:
+        """`_recordCount[rid]`, of the mapping at slot 5."""
+        return self.word(keccak(encode(["uint256"] * 2, [rid, 5])))
 
     def registries(self) -> list[Registry]:
         rows = []
@@ -186,14 +191,12 @@ def gas_bound(record: Record) -> int:
 
 
 def remaining(node: Node, registry: Registry, rows: list[Record]):
-    """Each of `rows` not yet on the node, as calldata and a gas bound: whole records by bisection, then the last
-    one's versions."""
+    """Each of `rows` not yet on the node, as calldata and a gas bound: whole records by their count, then the
+    last one's versions."""
     if not rows:
         return
     rid = registry.id
-    have = node.count(
-        lambda offset: ANCHORING.fns.records(rid, "", 0, 0, Page(offset=offset, limit=1)), rows[-1].record_id
-    )
+    have = node.record_count(rid)
     done = sum(r.record_id < have for r in rows) + len(node.versions(rid, have, 1)) if have else 0
     if done < len(rows):
         print(f"{registry.name}: {done} of {len(rows)} rows here", flush=True)
@@ -298,23 +301,41 @@ def report(what: str, here: int, there: int, tally: Counter) -> None:
     print(f"{what}: {here} here, {there} on the old chain; fields that differ: {listed}", flush=True)
 
 
+VERIFIER: tuple  # a pool worker's node and the seeded court registries' export entries
+
+
+def _verifier(url: str, seeded: dict[int, dict]) -> None:
+    global VERIFIER
+    VERIFIER = Node(url), seeded
+
+
+def _verified(registry: Registry) -> tuple[Counter, int, int, int, list[str]]:
+    """One registry checked in a pool worker: `differ`'s tally and count, the rows here and on the old chain,
+    and the checksums its records hold."""
+    node, seeded = VERIFIER
+    want = rows_of(registry, seeded)
+    got = node.versions(registry.id, 1, (want[-1].record_id if want else 0) + 1)
+    tally, wrong = differ(got, want, Record._fields)
+    return tally, wrong, len(got), len(want), [r.checksum for r in want if r.index == 1]
+
+
 def verify(node: Node, old: list[Registry], chosen: list[Registry], seeded: dict[int, dict]) -> int:
     """Every registry, the chosen ones' records, and the order a checksum several of them hold lists them in."""
     here = node.registries()
     tally, bad = differ(here, old, Registry._fields)
     report("registries", len(here), len(old), tally)
 
-    ours, theirs, total, held = 0, 0, Counter(), {}
-    for registry in chosen:
-        want = rows_of(registry, seeded)
-        got = node.versions(registry.id, 1, (want[-1].record_id if want else 0) + 1)
-        tally, wrong = differ(got, want, Record._fields)
-        if wrong:
-            report(registry.name, len(got), len(want), tally)
-        bad, ours, theirs, total = bad + wrong, ours + len(got), theirs + len(want), total + tally
-        for r in want:
-            if r.index == 1:
-                held.setdefault(r.checksum, []).append(registry.id)
+    ours, theirs, total, held, start = 0, 0, Counter(), {}, time.time()
+    with multiprocessing.Pool(WORKERS, _verifier, (node.url, seeded)) as pool:
+        checked = zip(chosen, pool.imap(_verified, chosen))
+        for i, (registry, (tally, wrong, got, want, checksums)) in enumerate(checked, 1):
+            if wrong:
+                report(registry.name, got, want, tally)
+            bad, ours, theirs, total = bad + wrong, ours + got, theirs + want, total + tally
+            for checksum in checksums:
+                held.setdefault(checksum, []).append(registry.id)
+            if i % 100 == 0 and i < len(chosen):
+                print(f"verify: {i} of {len(chosen)} registries, {ours} rows in {time.time() - start:.0f}s", flush=True)
     report(f"records of {len(chosen)} registries", ours, theirs, total)
 
     # The old chain lists a checksum's registries by id; the contract in the order their first versions landed.
@@ -322,11 +343,8 @@ def verify(node: Node, old: list[Registry], chosen: list[Registry], seeded: dict
     for i in range(0, len(shared), 100):
         chunk = shared[i : i + 100]
         fns = [ANCHORING.fns.records(0, c, 0, 0, Page(limit=50)) for c, _ in chunk]
-        outs = node.batch(
-            "eth_call", [[{"to": ANCHORING_ADDRESS, "data": "0x" + fn.data.hex()}, "latest"] for fn in fns]
-        )
-        for (_, ids), fn, out in zip(chunk, fns, outs):
-            unordered += [r[9] for r in fn.decode(bytes.fromhex(out[2:]))[0] if r[9] in ids] != ids
+        for (_, ids), fn, out in zip(chunk, fns, node.calls([fn.data for fn in fns])):
+            unordered += [r[9] for r in fn.decode(out)[0] if r[9] in ids] != ids
     print(f"checksums several of them hold: {len(shared)}, listed out of id order: {unordered}", flush=True)
     return bad + unordered
 
@@ -362,7 +380,7 @@ def main() -> None:
     while node.nonce(address, "pending") > node.nonce(address):
         time.sleep(0.5)
     if args.cmd == "registries":
-        have = node.count(lambda offset: ANCHORING.fns.registries(0, Page(offset=offset, limit=1)), len(old))
+        have = node.registry_count()
         print(f"{have} registries here, {len(old) - have} to send", flush=True)
         # A registry each to a transaction: there are only a few thousand.
         calls = ((ANCHORING.fns.addRegistry(r.name, r.description, r.metadata).data, TX_GAS_CAP) for r in old[have:])
