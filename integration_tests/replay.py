@@ -7,7 +7,8 @@ A rerun resumes.
     .venv/bin/python -m integration_tests.replay verify [REGISTRY...]
 
 A REGISTRY is an id or a name only one registry has; none means every one. REPLAY_KEY signs. Seeded court
-registries' rows come from NVNMCHAIN_EXPORT_DIR, everything else from the old chain at NVNMCHAIN_API.
+registries' rows come from NVNMCHAIN_EXPORT_DIR unless the old chain has written to them since, everything else
+from the old chain at NVNMCHAIN_API.
 """
 
 import argparse
@@ -32,7 +33,8 @@ from .abi import ANCHORING, ANCHORING_ADDRESS, FEE
 from .anchoring import Page, Record, Registry, bech32
 from .tempo_vs_export import ADMIN, CHUNK, EXPORT, FIRST_SEEDED_ID, RECORD, VERSIONS, reader_code
 
-API = os.getenv("NVNMCHAIN_API", "https://api.nvnmchain.io") + "/NVNM-Chain/nvnmchain/anchoring/v1"
+API = os.getenv("NVNMCHAIN_API", "https://api.nvnmchain.io")
+SEED_HEIGHT = 2_046_500  # the old chain's block at the export's SEEDED_AT
 BASE_FEE_CAP = 12_000_000_000  # TIP-1067's ceiling; a fee under it stalls once full blocks raise the base fee
 TX_GAS_CAP = 30_000_000
 WINDOW = 8192  # unconfirmed transactions kept in the pool
@@ -42,17 +44,38 @@ PAGE = 200
 REPLAYED = {"timestamp", "created_at", "creator"}  # what the replay sets itself
 
 
+def fetch(path: str, params: dict) -> dict:
+    """One answer of the old chain's API, which refuses Python's default User-Agent."""
+    url = f"{API}/{path}?{urllib.parse.urlencode(params)}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "tempo-e2e"}), timeout=60) as r:
+        return json.load(r)
+
+
 def old_chain(path: str, **params) -> list[dict]:
-    """Every row of one of the old chain's lists. Its API refuses Python's default User-Agent."""
+    """Every row of one of the old chain's anchoring lists."""
     rows = []
     while True:
-        query = urllib.parse.urlencode({**params, "pagination.limit": PAGE, "pagination.offset": len(rows)})
-        request = urllib.request.Request(f"{API}/{path}?{query}", headers={"User-Agent": "tempo-e2e"})
-        with urllib.request.urlopen(request, timeout=60) as r:
-            page = json.load(r)[path]
+        query = {**params, "pagination.limit": PAGE, "pagination.offset": len(rows)}
+        page = fetch(f"NVNM-Chain/nvnmchain/anchoring/v1/{path}", query)[path]
         rows += page
         if len(page) < PAGE:
             return rows
+
+
+def written_since_seed() -> set[int]:
+    """The registries the old chain has added a record to or changed one in after the seed height."""
+    ids = set()
+    for event in ("add_record", "update_record_status"):
+        for page in itertools.count(1):  # a page past the last is an error, so `total` ends it
+            query = {"query": f"{event}.registry_id EXISTS AND tx.height>{SEED_HEIGHT}", "limit": 100, "page": page}
+            answer = fetch("cosmos/tx/v1beta1/txs", query)
+            for tx in answer["tx_responses"]:
+                for e in tx["events"]:
+                    if e["type"] == event:
+                        ids |= {int(a["value"]) for a in e["attributes"] if a["key"] == "registry_id"}
+            if page * 100 >= int(answer["total"]):
+                break
+    return ids
 
 
 def parsed(cls, row: dict):
@@ -368,6 +391,8 @@ def main() -> None:
     files = {f["registry"]: f for f in json.loads((EXPORT / "manifest.json").read_text())["files"]}
     names = json.loads((EXPORT / "registries.json").read_text())
     seeded = {FIRST_SEEDED_ID + i: files[r["name"]] for i, r in enumerate(names)}
+    for rid in sorted(written_since_seed() & seeded.keys()):  # the export no longer holds what they hold
+        print(f"{seeded.pop(rid)['registry']}: written since the export, read from the old chain", flush=True)
 
     if args.cmd == "verify":
         raise SystemExit(1 if verify(node, old, chosen, seeded) else 0)
