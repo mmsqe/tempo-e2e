@@ -85,11 +85,12 @@ def test_chain_survives_validator_restart(consensus_net, max_faults):
 
     for v in victims:
         consensus_net.stop_node(v)
-    assert wait_height(primary, start + 3) >= start + 3, f"chain halted with {max_faults} validator(s) down"
-    progressed = poll_height(primary)
-
-    for v in victims:
-        consensus_net.start_node(v)
+    try:
+        assert wait_height(primary, start + 3) >= start + 3, f"chain halted with {max_faults} validator(s) down"
+        progressed = poll_height(primary)
+    finally:  # the localnet is shared
+        for v in victims:
+            consensus_net.start_node(v)
     rejoined = consensus_net.node_rpc_url(victims[-1])
     assert wait_height(rejoined, progressed) >= progressed, "restarted validator did not catch up"
 
@@ -100,13 +101,14 @@ def test_chain_halts_without_quorum_and_recovers(consensus_net, max_faults):
     primary = consensus_net.node_rpc_url("node0")
     for v in victims:
         consensus_net.stop_node(v)
-    time.sleep(3)  # let any in-flight blocks finalize, then the height should freeze
-    halted = poll_height(primary)
-    time.sleep(8)
-    assert poll_height(primary) == halted, "chain advanced without a quorum"
-
-    for v in victims:
-        consensus_net.start_node(v)
+    try:
+        time.sleep(3)  # let any in-flight blocks finalize, then the height should freeze
+        halted = poll_height(primary)
+        time.sleep(8)
+        assert poll_height(primary) == halted, "chain advanced without a quorum"
+    finally:
+        for v in victims:
+            consensus_net.start_node(v)
     assert wait_height(primary, halted + 2) >= halted + 2, "chain did not recover after restart"
 
 

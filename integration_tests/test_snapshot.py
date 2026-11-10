@@ -100,9 +100,12 @@ def test_a_restored_follower_resumes_from_the_snapshot_anchor(consensus_net, tmp
     target = max(poll_height(consensus_net.node_rpc_url("node0")), 30)
     with running(source, timeout=120, want_block=target):
         w3 = Web3(Web3.HTTPProvider(source.rpc_url))
-        # The finalized marker the consensus half anchors on lands after the payloads.
+        # The finalized marker the consensus half anchors on lands after the payloads; until then it is null.
         deadline = time.time() + 60
-        while w3.eth.get_block("finalized")["number"] < target and time.time() < deadline:
+        while time.time() < deadline:
+            finalized = w3.provider.make_request("eth_getBlockByNumber", ["finalized", False])["result"]
+            if finalized and int(finalized["number"], 16) >= target:
+                break
             time.sleep(0.5)
         last = w3.eth.get_block("latest")
 

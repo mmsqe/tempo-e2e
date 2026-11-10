@@ -221,12 +221,12 @@ def _wait_until(cluster, ready, what: str, timeout: float) -> None:
 
 
 def _wait_for_finalization(cluster, timeout: float = 120.0) -> None:
-    """Wait until node0 finalizes a block through consensus."""
-    w3 = Web3(Web3.HTTPProvider(cluster.node_rpc_url("node0")))
+    """Wait until node0 finalizes a block and every validator serves one; a validator that cannot start fails here."""
+    clients = [Web3(Web3.HTTPProvider(cluster.node_rpc_url(v.moniker))) for v in cluster.config.validators]
 
     def finalized():
-        latest = (w3.provider.make_request("consensus_getLatest", []).get("result") or {}).get("finalized")
-        return latest and latest.get("view", 0) >= 1 and w3.eth.block_number >= 1
+        latest = (clients[0].provider.make_request("consensus_getLatest", []).get("result") or {}).get("finalized")
+        return latest and latest.get("view", 0) >= 1 and all(w3.eth.block_number >= 1 for w3 in clients)
 
     _wait_until(cluster, finalized, "consensus did not finalize", timeout)
 
@@ -265,16 +265,21 @@ def _run_devnet_init(base, config: dict, *, gen_compose_file: bool):
     return data_dir
 
 
-def _devnet_config(ports: list[int], *, tempo_bin: str, **extra) -> dict:
-    """A ``tempo-devnet`` config with a validator per free base port; xtask always runs on the host."""
-    return {
+def _devnet_config(ports: list[int], *, docker: dict | None = None, **extra) -> dict:
+    """A ``tempo-devnet`` config with a validator per free base port, in ``docker`` or on the host without IPC."""
+    config = {
         "chain_id": 1337,
         "seed": 0,
-        "tempo_bin": tempo_bin,
+        "tempo_bin": "tempo" if docker else resolve_tempo_bin(),
         "tempo_xtask_bin": resolve_xtask_bin(),
         "validators": [{"host": "127.0.0.1", "port": port, "moniker": f"node{i}"} for i, port in enumerate(ports)],
         **extra,
     }
+    if docker:
+        config["docker"] = docker
+    else:
+        config["patch_node_flags"] = ["--ipcdisable", *extra.get("patch_node_flags", [])]
+    return config
 
 
 @pytest.fixture(scope="session")
@@ -289,10 +294,8 @@ def consensus_net(request, tmp_path_factory):
 
     base = tmp_path_factory.mktemp("consensus-docker" if docker else "consensus")
     ports = find_free_base_ports(request.config.getoption("--consensus-validators"))
-    # Docker runs the in-image `tempo`; supervisord runs the host binary.
-    config = _devnet_config(ports, tempo_bin="tempo" if docker else resolve_tempo_bin(), accounts=200, epoch_length=100)
-    if docker:
-        config["docker"] = {"image": request.config.getoption("--tempo-image"), "network": "tempo-devnet"}
+    image = {"image": request.config.getoption("--tempo-image"), "network": "tempo-devnet"} if docker else None
+    config = _devnet_config(ports, docker=image, accounts=200, epoch_length=100)
     data_dir = _run_devnet_init(base, config, gen_compose_file=docker)
 
     if docker:
@@ -308,7 +311,7 @@ def supervisord_net(request, base, validators: int, *, accounts: int = 20, **ext
     if not request.config.getoption("--consensus"):
         pytest.skip("consensus localnet not requested (pass --consensus)")
     ports = find_free_base_ports(validators)
-    config = _devnet_config(ports, tempo_bin=resolve_tempo_bin(), accounts=accounts, **extra)
+    config = _devnet_config(ports, accounts=accounts, **extra)
     yield from _consensus_net_supervisord(request, base, _run_devnet_init(base, config, gen_compose_file=False))
 
 
@@ -407,7 +410,6 @@ def _init_two_network_devnet(request, base):
     val_ports, follow_port, proxy_port, public_port = ports[:n], ports[n], ports[n + 1], ports[n + 2]
     config = _devnet_config(
         val_ports,
-        tempo_bin="tempo",  # in-image binary
         accounts=200,
         epoch_length=100,
         docker={

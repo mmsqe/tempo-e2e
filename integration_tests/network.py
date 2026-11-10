@@ -255,6 +255,7 @@ class TempoNode:
             str(self.p2p_port),
             "--authrpc.port",
             str(self.auth_port),
+            "--ipcdisable",  # nodes on one host would share /tmp/reth.ipc
         ]
 
     def command(self) -> list[str]:
@@ -348,7 +349,6 @@ class FollowerNode(TempoNode):
             self.upstream,
             *(("--trusted-peers", ",".join(self.trusted_peers)) if self.trusted_peers else ()),
             *(("--discovery.port", str(self.p2p_port)) if self.discovery else ("--disable-discovery",)),
-            "--ipcdisable",
             *self.extra_args,
         ]
 
@@ -376,7 +376,6 @@ class ValidatorNode(TempoNode):
             "--trusted-peers",
             ",".join(self.trusted_peers),
             "--disable-discovery",
-            "--ipcdisable",
             *self.extra_args,
         ]
 
