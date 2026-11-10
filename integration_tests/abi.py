@@ -93,6 +93,24 @@ ACCOUNT_KEYCHAIN = Contract(
     tx={"to": ACCOUNT_KEYCHAIN_ADDRESS},
 )
 
+# Configurable account precompile (TIP-1112, T14+): an account whose owner quorum signs for it.
+CONFIGURABLE_ACCOUNT_ADDRESS = to_checksum_address("0xAACC000000000000000000000000000000000000")
+_OWNERS = "(address owner, uint8 weight)[]"
+_CONFIG = f"(bytes32 salt, uint64 version, uint8 threshold, {_OWNERS} owners)"
+CONFIGURABLE_ACCOUNT = Contract.from_abi(
+    [
+        f"function deriveAccount(bytes32 salt, uint8 threshold, {_OWNERS} owners) pure returns (address)",
+        "function getConfigCommitment(address account) view returns (bytes32)",
+        f"function updateConfig({_CONFIG} current, uint8 threshold, {_OWNERS} owners)",
+        f"function upgradeAccount(uint8 threshold, {_OWNERS} owners) returns (bytes32)",
+        f"event ConfigurableAccountConfigUpdated(address indexed account, bytes32 salt, uint64 version,"
+        f" uint8 threshold, {_OWNERS} owners)",
+        f"event AccountUpgraded(address indexed account, bytes32 indexed commitment, bytes32 salt, uint8 threshold,"
+        f" {_OWNERS} owners)",
+    ],
+    to=CONFIGURABLE_ACCOUNT_ADDRESS,
+)
+
 # Tempo TIP-20 extensions beyond ERC-20 (standard ops use eth_contract.erc20.ERC20).
 TIP20 = Contract.from_abi(
     [

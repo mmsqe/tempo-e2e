@@ -65,7 +65,7 @@ class TestUnclaimedChainId:
                 assert await ERC20.fns.balanceOf(recipient).call(w3, to=PATH_USD) == 1
 
                 # Signed one id over, the same write has to bounce.
-                with pytest.raises(Web3RPCError, match="chain ID"):
+                with pytest.raises(Web3RPCError, match="(?i)chain id"):
                     await send_call(w3, UNCLAIMED_CHAIN_ID + 1, signer, **transfer)
 
 

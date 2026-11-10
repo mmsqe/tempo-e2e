@@ -14,7 +14,7 @@ import pytest
 from eth_utils import keccak, to_checksum_address
 from web3 import AsyncWeb3, Web3
 
-from .abi import ANCHORING, ANCHORING_ADDRESS, UPSTREAM_ZONE_OWNER, VALIDATOR_CONFIG_V2
+from .abi import ACCOUNT_KEYCHAIN, ANCHORING, ANCHORING_ADDRESS, UPSTREAM_ZONE_OWNER, VALIDATOR_CONFIG_V2
 from .anchoring import (
     FACTORY,
     IMPLEMENTATION,
@@ -48,6 +48,7 @@ from .utils import (
     call_revert,
     emitted,
     latest_timestamp,
+    new_account,
     rpc,
     send_call,
     send_calls,
@@ -62,6 +63,7 @@ pytestmark = [pytest.mark.tempo, pytest.mark.slow]
 MMR_FORK = "t10_time"  # once put a precompile, which answers before code, at 0x…0a00
 OWNER_FORK = "t12_time"
 SYSTEM_CALLS_FORK = "t13_time"
+ADMIN_KEYS_FORK = "t14_time"
 DEPLOY_GAS = 25_000_000  # 20.7 KB of code at 1,000 gas a byte, and the creation around it
 
 # Ethereum's beacon-root and request predeploys, whose system calls TIP-1119 drops at T13.
@@ -346,3 +348,19 @@ class TestLaunchingOnT12:
             assert await _implementation(w3) == second
             assert to_checksum_address(await ANCHORING.fns.owner().call(w3)) == ADMIN.address
             assert await _added(send, "after") == [(ADMIN.address, 2, "after")]
+
+
+async def test_crossing_t14_demotes_admin_keys(tmp_path):
+    """TIP-1137: a key stored as an admin before T14 stays a key from it on, and no longer an admin."""
+    activation = int(time.time()) + ACTIVATION_LEAD
+    genesis = generate_dev_genesis(tmp_path / "xtask", fork_times=fork_schedule(ADMIN_KEYS_FORK, activation))
+    async with _launched(tmp_path, genesis) as (_, w3, send):
+        key = new_account().address
+        await send(ACCOUNT_KEYCHAIN.fns.authorizeAdminKey(key, 0, bytes(32)))
+        assert await ACCOUNT_KEYCHAIN.fns.isAdminKey(ADMIN.address, key).call(w3)
+        assert await latest_timestamp(w3) < activation, "authorized too late to test"
+
+        await wait_for_timestamp(w3, activation)
+        assert not await ACCOUNT_KEYCHAIN.fns.isAdminKey(ADMIN.address, key).call(w3)
+        _, key_id, _, _, is_revoked = await ACCOUNT_KEYCHAIN.fns.getKey(ADMIN.address, key).call(w3)
+        assert (to_checksum_address(key_id), is_revoked) == (key, False)

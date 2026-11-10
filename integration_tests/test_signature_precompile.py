@@ -91,24 +91,23 @@ async def test_verify_keychain_accepts_active_non_admin_key(w3, chain_id):
     assert not await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3)
 
 
-async def test_verify_keychain_admin_accepts_admin_key(w3, chain_id):
+async def test_verify_keychain_admin_accepts_admin_key(pre_t14):
+    w3 = pre_t14
     account, key = await funded(w3), new_account()
     blob = _keychain_blob(Signer(key.key.hex()), account.address)
-    await _authorize(w3, chain_id, account, key.address, is_admin=True)
+    await _authorize(w3, await w3.eth.chain_id, account, key.address, is_admin=True)
     assert await SIG.fns.verifyKeychainAdmin(account.address, HASH, blob).call(w3)
     assert await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3)  # an admin key is also active
 
 
 async def test_verify_keychain_rejects_account_mismatch(w3, chain_id):
     account, other, key = await funded(w3), new_account(), new_account()
-    await _authorize(w3, chain_id, account, key.address, is_admin=True)
+    await _authorize(w3, chain_id, account, key.address, is_admin=False)
     blob = _keychain_blob(Signer(key.key.hex()), account.address)  # the blob embeds `account`
 
     # the blob verifies only for the account it embeds
     assert await SIG.fns.verifyKeychain(account.address, HASH, blob).call(w3)
-    assert await SIG.fns.verifyKeychainAdmin(account.address, HASH, blob).call(w3)
     assert not await SIG.fns.verifyKeychain(other.address, HASH, blob).call(w3)
-    assert not await SIG.fns.verifyKeychainAdmin(other.address, HASH, blob).call(w3)
 
 
 async def test_verify_keychain_rejects_expired_key(w3, chain_id):

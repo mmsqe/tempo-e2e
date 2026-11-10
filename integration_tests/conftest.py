@@ -32,7 +32,7 @@ from .network import (
     running,
     xtask_forks,
 )
-from .utils import FAR_FUTURE, new_account, rpc
+from .utils import FAR_FUTURE, active_forks, new_account, rpc
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -119,6 +119,15 @@ def held_back(tmp_path_factory):
             return nodes[fork]
 
         yield node
+
+
+@pytest.fixture
+async def pre_t14(tempo, held_back):
+    """A client of a node short of T14: the session node when it is, else ``held_back``'s."""
+    async with rpc(tempo) as w3:
+        current = "T14" in await active_forks(w3)
+    async with rpc(held_back("t14_time") if current else tempo) as w3:
+        yield w3
 
 
 @pytest.fixture(scope="session")

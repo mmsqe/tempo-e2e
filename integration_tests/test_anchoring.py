@@ -324,7 +324,7 @@ class TestCaller:
     async def test_an_access_key(self, w3, chain_id):
         root, key = await funded(w3), new_account()
         tx = await prepare_tx(w3, chain_id, root, [ANCHORING.fns.addRegistry("access-key", "", "")])
-        receipt = await send_signed(w3, sign_tx_access_key(tx, key.key.hex(), Signer(root.key.hex()), is_admin=True))
+        receipt = await send_signed(w3, sign_tx_access_key(tx, key.key.hex(), Signer(root.key.hex()), is_admin=False))
         await self.assert_created_by(w3, receipt, root.address)
 
     async def test_a_7702_delegation(self, w3, chain_id, funded_account):

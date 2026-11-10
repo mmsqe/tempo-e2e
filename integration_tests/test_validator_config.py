@@ -19,12 +19,14 @@ from .abi import CURRENT_COMMITTEE, FEE
 from .abi import VALIDATOR_CONFIG_V2 as V2
 from .conftest import supervisord_net
 from .network import ValidatorNode, free_port, gas_token_flags, running
-from .utils import GENESIS_ADMIN, call_revert, new_account, rpc, send_call, send_type_2
+from .utils import GENESIS_ADMIN, call_revert, new_account, rpc, send_call, send_type_2, skip_before
 
 pytestmark = pytest.mark.tempo
 
 NS_ADD = b"TEMPO_VALIDATOR_CONFIG_V2_ADD_VALIDATOR"
 NS_ROTATE = b"TEMPO_VALIDATOR_CONFIG_V2_ROTATE_VALIDATOR"
+MAPPED_IP = "::ffff:10.5.0.1"  # 10.5.0.1 spelled as IPv6
+MAPPED = f"[{MAPPED_IP}]:26656"
 
 
 def enrolment(
@@ -154,6 +156,21 @@ class TestRefusals:
         pubkey, signature, egress, fee = enrolment(chain_id, joiner.address, "not-an-endpoint", egress="10.6.0.1")
         add = V2.fns.addValidator(joiner.address, pubkey, "not-an-endpoint", egress, fee, signature)
         assert "NotIpPort" in await call_revert(w3, add, sender=owner.address)
+
+    async def test_from_t14_an_endpoint_has_one_spelling_and_fits_its_length_byte(self, w3, owner):
+        """An IPv4-mapped IPv6 address, or an endpoint past 255 bytes, is refused before the signature."""
+        await skip_before(w3, "T14")
+        joiner = new_account().address
+        for ingress, egress in ((MAPPED, "10.5.0.1"), ("10.5.0.1:26656", MAPPED_IP), ("10.5.0.1:26656", "1" * 256)):
+            add = V2.fns.addValidator(joiner, b"\x11" * 32, ingress, egress, joiner, b"")
+            assert "InvalidIp" in await call_revert(w3, add, sender=owner.address), (ingress, egress)
+
+    async def test_before_t14_a_mapped_endpoint_is_taken(self, held_back, owner):
+        async with rpc(held_back("t14_time")) as w3:
+            joiner = new_account().address
+            pubkey, signature, egress, fee = enrolment(await w3.eth.chain_id, joiner, MAPPED, egress=MAPPED_IP)
+            add = V2.fns.addValidator(joiner, pubkey, MAPPED, egress, fee, signature)
+            assert await w3.eth.call({"from": owner.address, "to": V2_ADDR, "data": add.data})
 
 
 @pytest.fixture(scope="module")

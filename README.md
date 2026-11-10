@@ -111,7 +111,7 @@ variant.
 | `test_filters.py` | — | event logs / filters: transfer log, `get_logs`, block & log filters |
 | `test_indexer.py` | — | `eth_getTransactions` / `token_*`: wire contract vs the stubs, semantics vs an `eth_` oracle (`--indexer`) and vs tidx (`--tidx`) |
 | `test_subscribe.py` | — | `eth_subscribe`: new heads, logs |
-| `test_tracing.py` | — | `debug_traceTransaction` (callTracer, struct logger), `trace_block_by_number` |
+| `test_tracing.py` | — | callTracer, struct logs and vmTrace of a batch's every call, a failing call, a self-destruct, a block's traces |
 | `test_contract.py` | — | EVM contract deploy + call via tempo (0x76) txs |
 | `test_native_token.py` | — | no native token: `BALANCE` opcode is 0, `eth_getBalance` is a fixed placeholder |
 | `test_block_hashes.py` | EIP-2935 | history-storage predeploy: present at genesis, in-window hash read, out-of-window revert |
@@ -128,7 +128,7 @@ variant.
 | File | TIP(s) | Covers |
 |---|---|---|
 | `test_genesis.py` | — | what `tempo-xtask generate-genesis` writes: anchoring proxy, nUSD, OUSD, the deployment gas token, `--hardfork` |
-| `test_hardfork.py` | — | fork boundaries crossed on a running chain install the genesis state they skipped; T12's anchoring proxy; T13's dropped system calls; `shadow-replay` (`slow`) |
+| `test_hardfork.py` | — | fork boundaries crossed on a running chain install the genesis state they skipped; T12's anchoring proxy; T13's dropped system calls; T14's admin-key demotion; `shadow-replay` (`slow`) |
 | `test_abi_strictness.py` | TIP-1100 | strict precompile calldata decoding from T11, trailing bytes allowed again at T12, per-word gas |
 
 ### Tempo native tx & account abstraction
@@ -141,10 +141,11 @@ variant.
 | `test_nonces.py` | — | 2D nonces: parallel keys, sequencing, replay, Nonce precompile |
 | `test_expiring_nonce.py` | TIP-1009 | expiring nonces: success, expiry, replay, max-window, zero-nonce |
 | `test_7702.py` | EIP-7702 | set-code delegation: install, execute, revoke |
-| `test_access_keys.py` | — | delegated admin access key signs a tempo tx |
+| `test_access_keys.py` | — | an access key provisioned inline signs a tempo tx |
+| `test_configurable_accounts.py` | TIP-1112 | configurable accounts (T14): EOA upgrade, owner quorum, rotation, as a key's parent and as a key |
 | `test_access_key_scopes.py` | TIP-1011 | scoped access keys: call scoping, spend caps, period resets |
 | `test_permit.py` | TIP-1004 | EIP-2612 permit: 712 approval, domain, expiry/wrong-signer/replay reverts |
-| `test_keychain_admin.py` | TIP-1049, TIP-1053 | AccountKeychain admin keys + witnesses (T5/T6) |
+| `test_keychain_admin.py` | TIP-1049, TIP-1053, TIP-1137 | AccountKeychain admin keys + witnesses (T5/T6), none made from T14 |
 | `test_signature_precompile.py` | TIP-1020 | SignatureVerifier precompile: recover/verify, admin/expired-key cases |
 
 ### TIP-20 stablecoin & addressing
@@ -175,7 +176,7 @@ variant.
 | `test_fee_manager_policy.py` | TIP-1042 | FeeManager policy exemptions (T8+): blacklist still pays gas; mint/burn auth |
 | `test_dynamic_basefee.py` | TIP-1067 | dynamic base fee: congestion raises, idle decays (EIP-1559 integer formula) |
 | `test_storage_credits.py` | TIP-1060, TIP-1064 | storage credits (T7): slot-delete mint, recreate refund, replace consume |
-| `test_payment_lane.py` | TIP-1045 | payment-lane classification (T5): general lane capped, TIP-20 payments not |
+| `test_payment_lane.py` | TIP-1045 | payment-lane classification (T5): general lane capped, TIP-20 payments not, a 32-byte tag on a payment (T15) |
 | `test_rewards_deprecation.py` | TIP-1075 | TIP-20 rewards deprecation (T8 removes machinery): opt-in/distribute noop, no accrual |
 
 ### DEX
@@ -190,7 +191,7 @@ variant.
 |---|---|---|
 | `test_precompiles.py` | — | a contract STATICCALLs each enshrined precompile for deterministic output |
 | `test_current_committee.py` | TIP-1070 | current-committee precompile (T8+): read members, system-only writes, epoch boundary |
-| `test_validator_config.py` | TIP-1017 | ValidatorConfig V2 append-only registry: genesis state, key rotation, owner-gated mutators |
+| `test_validator_config.py` | TIP-1017 | ValidatorConfig V2 append-only registry: genesis state, key rotation, owner-gated mutators, endpoint bounds (T14) |
 | `test_zone_factory.py` | TIP-1091 | zone factory: the genesis owner flags, T12 handing it to the registry owner, a zone's portal |
 | `test_anchoring.py` | — | anchoring contract at `0x…0a00`: the precompile's ABI, a seed corpus loaded at block 0, writes on top, each sender type as the caller, owner recovery |
 | `test_anchoring_service.py` | — | nvnmchain-anchoring translating the node's search onto the module's REST route: its JSON, its mode names and `/health` |

@@ -1,10 +1,12 @@
-"""TIP-1049 admin keys and TIP-1053 authorization witnesses on AccountKeychain (T6/T5)."""
+"""TIP-1049 admin keys and TIP-1053 authorization witnesses on AccountKeychain (T6/T5). T14 stops
+making admin keys (TIP-1137), so the tests run on a node short of it."""
 
 import pytest
 from eth_contract.erc20 import ERC20
 from tempo import Signer
 from tempo.constants import PATH_USD
 from tempo.keychain import TokenLimit, sign_tx_access_key, sign_tx_registered_key
+from web3.exceptions import Web3RPCError
 
 from .abi import ACCOUNT_KEYCHAIN as KC
 from .utils import (
@@ -14,8 +16,10 @@ from .utils import (
     key_restrictions,
     new_account,
     prepare_tx,
+    rpc,
     send_call,
     send_signed,
+    skip_before,
     transfer_call,
 )
 
@@ -23,6 +27,12 @@ pytestmark = pytest.mark.tempo
 
 SECP256K1 = 0
 ZERO_WITNESS = bytes(32)
+UNKNOWN_FUNCTION = "0xaa4bc69a"  # UnknownFunctionSelector(bytes4)
+
+
+@pytest.fixture
+def w3(pre_t14):
+    return pre_t14
 
 
 def _authorize_admin(key_id):
@@ -196,3 +206,13 @@ async def test_non_admin_key_cannot_burn_witness(w3, chain_id):
     receipt = await _key_sends(w3, chain_id, root, non_admin, burn, is_admin=False)
     assert receipt["status"] == 0
     assert not await KC.fns.isKeyAuthorizationWitnessBurned(root.address, witness).call(w3)
+
+
+async def test_from_t14_no_key_becomes_an_admin(tempo):
+    """The call is gone, and the pool refuses an inline grant."""
+    async with rpc(tempo) as w3:
+        await skip_before(w3, "T14")
+        root, key = await funded(w3), new_account()
+        assert UNKNOWN_FUNCTION in await call_revert(w3, _authorize_admin(key.address), sender=root.address)
+        with pytest.raises(Web3RPCError, match="InvalidKeyId"):
+            await _key_sends(w3, tempo.chain_id, root, key, KC.fns.revokeKey(key.address), is_admin=True)
