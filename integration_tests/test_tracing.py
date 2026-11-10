@@ -64,6 +64,16 @@ class TestBatch:
         assert ("CALL", address.lower()) in frames, frames
 
     @BATCH_TRACING_UNFIXED
+    async def test_only_top_call_keeps_the_batch(self, w3, batch):
+        """A batch's top calls are its own, so `onlyTopCall` keeps them and drops what they called."""
+        address, (*_, both) = batch
+        config = {"tracer": "callTracer", "tracerConfig": {"onlyTopCall": True}}
+        trace = await rpc_result(w3, "debug_traceTransaction", [both, config])
+        calls = trace.get("calls", [])
+        assert [call["type"] for call in calls] == ["CREATE", "CALL"], trace
+        assert calls[1]["to"].lower() == address.lower() and not any("calls" in call for call in calls)
+
+    @BATCH_TRACING_UNFIXED
     async def test_call_tracer_marks_the_failing_call(self, w3, chain_id, funded_account):
         """A call that fails reverts its batch: it and the root carry the error, the call before it none."""
         pk = funded_account.key.hex()
@@ -94,6 +104,8 @@ class TestBatch:
         _, hashes = batch
         replays = [await rpc_result(w3, "trace_replayTransaction", [tx_hash, ["vmTrace"]]) for tx_hash in hashes]
         create, call, both = [_vm_ops(replay["vmTrace"]) for replay in replays]
+        # A call sent alone is the root itself, or the one entry of a root like the batch's.
+        create, call = ([op for op in ops if op] for ops in (create, call))
         assert create and call, "a single call's vmTrace"
         assert both == [None, *create, None, *call]
 
