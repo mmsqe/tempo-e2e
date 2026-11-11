@@ -351,10 +351,12 @@ async def sign_type_2(
     nonce: int | None = None,
     max_fee_per_gas: int | None = None,
     max_priority_fee_per_gas: int = DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
+    access_list: Sequence[dict] = (),
 ) -> bytes:
     """A signed plain EIP-1559 tx from ``account``. It names no fee token, so the payer's own setting
     decides, or failing that what it calls, or failing that the fallback list."""
     tx = {
+        "accessList": list(access_list),
         "to": to,
         "data": data,
         "value": value,
@@ -368,15 +370,17 @@ async def sign_type_2(
     return Account.sign_transaction(tx, account.key).raw_transaction
 
 
-async def send_type_2(w3: AsyncWeb3, account, to, data=None, *, gas: int | None = None, value: int = 0):
-    """A plain EIP-1559 tx from ``account``, asserting success; gas defaults to the estimate, since
-    TIP-1016 charges per new slot."""
+async def send_type_2(
+    w3: AsyncWeb3, account, to, data=None, *, gas: int | None = None, value: int = 0, check: bool = True, **kwargs
+):
+    """A plain EIP-1559 tx from ``account``, asserting success unless ``check`` is off; gas defaults to
+    the estimate, since TIP-1016 charges per new slot. ``kwargs`` go to ``sign_type_2``."""
     call = _call(to, data)
     if gas is None:
         gas = await w3.eth.estimate_gas({**call, "from": account.address, "value": value})
-    raw = await sign_type_2(w3, account, **call, gas=gas, value=value)
+    raw = await sign_type_2(w3, account, **call, gas=gas, value=value, **kwargs)
     receipt = await w3.eth.wait_for_transaction_receipt(await w3.eth.send_raw_transaction(raw))
-    assert receipt["status"] == 1, receipt
+    assert not check or receipt["status"] == 1, receipt
     return receipt
 
 
