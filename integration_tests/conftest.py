@@ -32,7 +32,7 @@ from .network import (
     running,
     xtask_forks,
 )
-from .utils import FAR_FUTURE, active_forks, new_account, rpc
+from .utils import FAR_FUTURE, RETURN_42_RUNTIME, active_forks, deploy_contract, init_code, new_account, rpc
 
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
@@ -175,6 +175,23 @@ async def funded_account(w3, driver):
     acct = new_account()
     await driver.fund(w3, acct.address, 10_000_000_000_000_000)
     return acct
+
+
+@pytest.fixture
+def deploy(w3, chain_id, funded_account):
+    """Deploys a runtime from the funded account, returning its address."""
+
+    async def deploy(runtime: bytes) -> str:
+        pk = funded_account.key.hex()
+        return (await deploy_contract(w3, chain_id=chain_id, private_key=pk, bytecode=init_code(runtime)))[1]
+
+    return deploy
+
+
+@pytest.fixture
+async def target(deploy):
+    """A contract returning the word 42."""
+    return await deploy(RETURN_42_RUNTIME)
 
 
 # -- consensus localnet lifecycle (client-side; tempo-devnet only does init) --

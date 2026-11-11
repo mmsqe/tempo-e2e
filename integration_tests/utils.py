@@ -76,7 +76,10 @@ def init_code(runtime: bytes) -> bytes:
 # Minimal EVM fixtures: a contract returning 42, and the ERC-20 Transfer topic.
 RETURN_42_RUNTIME = bytes.fromhex("602a60005260206000f3")
 RETURN_42_INIT = init_code(RETURN_42_RUNTIME)
+SPIN_RUNTIME = bytes.fromhex("5b600056")  # JUMPDEST PUSH1 0 JUMP: loops until it runs out of gas
+DESTRUCT_RUNTIME = bytes.fromhex("5fff")  # PUSH0 SELFDESTRUCT
 TRANSFER_TOPIC = HexBytes("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+CALL_TRACER = {"tracer": "callTracer"}
 
 
 def new_account():
@@ -245,6 +248,21 @@ async def rpc_result(w3: AsyncWeb3, method: str, params: Sequence = ()):
     resp = await w3.provider.make_request(method, list(params))
     assert "error" not in resp, f"{method} failed: {resp['error']}"
     return resp["result"]
+
+
+async def trace_tx(w3: AsyncWeb3, tx, config: dict | None = None):
+    """A receipt's or tx hash's ``debug_traceTransaction``; skips on a JS tracer tempo is built without."""
+    tx_hash = tx if isinstance(tx, str) else tx["transactionHash"].to_0x_hex()
+    resp = await w3.provider.make_request("debug_traceTransaction", [tx_hash, config or {}])
+    if "JS Tracer is not enabled" in str(resp.get("error")):
+        pytest.skip("tempo is built without the js-tracer feature")
+    assert "error" not in resp, resp["error"]
+    return resp["result"]
+
+
+def call_frames(trace: dict) -> list[dict]:
+    """A callTracer trace's frames, root first."""
+    return [trace, *(frame for call in trace.get("calls", []) for frame in call_frames(call))]
 
 
 async def call_revert(w3: AsyncWeb3, to, data=None, *, sender: str | None = None) -> str:
