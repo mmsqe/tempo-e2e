@@ -1,6 +1,7 @@
 """The anchoring contract at 0x…0a00, on a node built like the network's genesis: code in the alloc,
 the seed fixture loaded at block 0."""
 
+import asyncio
 import time
 
 import pytest
@@ -11,7 +12,9 @@ from tempo.keychain import sign_tx_access_key
 from .abi import ANCHORING, ANCHORING_ADDRESS
 from .anchoring import (
     GO_TIME,
+    IMPLEMENTATION,
     PROXY_CODE,
+    UPGRADE_INIT_CODE,
     Page,
     Record,
     Registry,
@@ -19,6 +22,7 @@ from .anchoring import (
     anchoring_node,
     bech32,
     deploy_relay,
+    implementation,
     new_registry,
     records,
     registries,
@@ -38,6 +42,7 @@ from .utils import (
     get_nonce,
     new_account,
     prepare_tx,
+    rpc,
     send_call,
     send_calls,
     send_set_code_tx,
@@ -65,6 +70,19 @@ def tempo(request, tmp_path_factory):
         return
     with anchoring_node(tmp_path_factory.mktemp("anchoring"), owner=OWNER.address) as node:
         yield node
+
+
+@pytest.fixture(scope="module")
+def owner(request, tempo):
+    """Funds OWNER once: the faucet refuses a second funding of one address within seconds."""
+    if request.config.getoption("--tempo-rpc"):
+        pytest.skip("an external node names its own owner, and an upgrade needs this module's node")
+
+    async def funded():
+        async with rpc(tempo) as client:
+            await fund(client, OWNER.address)
+
+    asyncio.run(funded())
 
 
 class TestBinding:
@@ -357,14 +375,9 @@ class TestCaller:
         ).call(w3)
 
 
+@pytest.mark.usefixtures("owner")
 class TestOwner:
     """The module's admin, named in the genesis."""
-
-    @pytest.fixture(autouse=True)
-    async def owner_funded(self, request, w3):
-        if request.config.getoption("--tempo-rpc"):
-            pytest.skip("an external node names its own owner")
-        await fund(w3, OWNER.address)
 
     async def test_the_owner_recovers_registry_3(self, w3, chain_id):
         assert to_checksum_address(await ANCHORING.fns.owner().call(w3)) == OWNER.address
@@ -400,3 +413,37 @@ class TestOwner:
         back = ANCHORING.fns.transferOwnership(OWNER.address).data
         receipt = await send_call(w3, chain_id, funded_account, relay, back)
         assert emitted(receipt, ANCHORING, "OwnershipTransferred") == [(relay, OWNER.address)]
+
+
+@pytest.mark.usefixtures("owner")
+class TestPagingKey:
+    """A page with no cursor of its own ignores a key on the T12 build, so a client resuming there
+    gets the first page again. The owner upgrades to the current build, which refuses the key."""
+
+    DEPLOY_GAS = 28_000_000  # 21 KB of code at 1,000 gas a byte, and the creation around it
+
+    async def test_a_key_is_ignored_until_the_upgrade_refuses_it(self, w3, chain_id):
+        _, (cursor, _) = await ANCHORING.fns.records(0, "", 0, 0, Page(limit=1)).call(w3)
+        resume, first = Page(key=cursor, limit=1), Page(limit=1)
+        pages = {
+            "registry": lambda page: ANCHORING.fns.records(1, "", 0, 0, page),
+            "checksum": lambda page: ANCHORING.fns.records(0, TestSeededCorpus.CITATION, 0, 0, page),
+            "name": lambda page: ANCHORING.fns.registriesByName("us-ca1", 1, page),
+        }
+        assert await implementation(w3) == IMPLEMENTATION
+        before = {name: await page(first).call(w3) for name, page in pages.items()}
+        for name, page in pages.items():
+            assert await page(resume).call(w3) == before[name], f"{name}: the resumed page is the first"
+
+        calls = [{"to": None, "data": UPGRADE_INIT_CODE}]
+        deployed = await send_calls(
+            w3, chain_id=chain_id, private_key=OWNER.key.hex(), calls=calls, gas_limit=self.DEPLOY_GAS
+        )
+        built = deployed["contractAddress"]
+        receipt = await send_call(w3, chain_id, OWNER, ANCHORING.fns.upgradeToAndCall(built, b""))
+        assert emitted(receipt, ANCHORING, "Upgraded") == [(built,)]
+
+        for name, page in pages.items():
+            refused = await call_revert(w3, page(resume))
+            assert "pagination key not supported; page by offset" in refused, name
+            assert await page(first).call(w3) == before[name], f"{name}: paging by offset is unchanged"

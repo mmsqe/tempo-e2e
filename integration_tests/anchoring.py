@@ -26,6 +26,7 @@ def _code(name: str) -> bytes:
 
 RUNTIME_CODE = _code("anchoring.bin")  # the implementation, as deployed at IMPLEMENTATION
 INIT_CODE = _code("anchoring.init.bin")  # what a deployment sends the factory after the salt
+UPGRADE_INIT_CODE = _code("upgrade.init.bin")  # the current build, which the owner upgrades to
 PROXY_CODE = _code("proxy.bin")  # what T12 puts at 0x…0a00
 _DEPLOYMENT = json.loads((LAYOUT / "deployment.json").read_text())
 FACTORY = to_checksum_address(_DEPLOYMENT["factory"])
@@ -194,6 +195,11 @@ async def records(
 ) -> list[Record]:
     rows, _ = await ANCHORING.fns.records(registry_id, checksum, record_id, index, page).call(w3)
     return [Record(*row) for row in rows]
+
+
+async def implementation(w3) -> str:
+    """What the proxy delegates to."""
+    return to_checksum_address((await w3.eth.get_storage_at(ANCHORING_ADDRESS, IMPLEMENTATION_SLOT))[12:])
 
 
 async def new_registry(w3, chain_id: int, creator, name: str = "tempo-e2e") -> int:
