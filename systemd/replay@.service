@@ -1,0 +1,20 @@
+# One replay writer, the instance only a name: `systemctl enable --now replay@0 replay@1 ...`, each with its key in
+# /etc/replay/writer-<instance>.env. A writer finds its share by its own address in REPLAY_WRITERS.
+[Unit]
+Description=Anchoring replay writer %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=replay
+WorkingDirectory=/opt/tempo-e2e
+EnvironmentFile=/etc/replay/replay.env
+EnvironmentFile=/etc/replay/writer-%i.env
+ExecStart=/opt/tempo-e2e/.venv/bin/python -m integration_tests.replay records $REPLAY_REGISTRIES --ramp ${REPLAY_RAMP}
+Restart=on-failure
+RestartSec=60
+# replay.py's HALT: a failed record or a missing role, which a person looks at before anything more is sent.
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=multi-user.target

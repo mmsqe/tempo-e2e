@@ -13,7 +13,8 @@ A REGISTRY is an id or a name only one registry has; none means every one. REPLA
 REPLAY_WRITERS, comma-separated addresses, `grant` gives each the editor role on its share of the registries,
 balanced by rows, `records` under a writer's key writes only its share, and `revoke` takes the roles back.
 Seeded court registries' rows come from NVNMCHAIN_EXPORT_DIR unless the old chain has written to them since,
-everything else from the old chain at NVNMCHAIN_API.
+everything else from the old chain at NVNMCHAIN_API. A stop that needs a person exits 3; any other failure is safe
+to rerun, and a service may restart it.
 """
 
 import argparse
@@ -29,6 +30,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from datetime import UTC, datetime
+from typing import NoReturn
 
 from eth_abi import decode, encode
 from eth_account import Account
@@ -50,6 +52,12 @@ ROUND = 1000  # transactions signed, then sent, at a time
 WORKERS = max(1, (os.cpu_count() or 4) - 4)  # signers or verifiers, leaving cores to a node on the same machine
 PAGE = 200
 REPLAYED = {"timestamp", "created_at", "creator"}  # what the replay sets itself
+HALT = 3
+
+
+def halt(why: str) -> NoReturn:
+    print(why, file=sys.stderr, flush=True)
+    raise SystemExit(HALT)
 
 
 def fetch(path: str, params: dict) -> dict:
@@ -148,7 +156,7 @@ class Node:
         for receipts in self.batch("eth_getBlockReceipts", [[hex(n)] for n in range(after + 1, until + 1)]):
             for r in receipts:
                 if r["status"] != "0x1" and r["from"].lower() == address:
-                    raise SystemExit(f"{r['transactionHash']} failed: rebuild the chain, the ids after it are off")
+                    halt(f"{r['transactionHash']} failed: rebuild the chain, the ids after it are off")
         return until
 
     def calls(self, datas: list[bytes], override: dict | None = None) -> list[bytes]:
@@ -156,7 +164,7 @@ class Node:
         tail = ["latest"] + ([override] if override else [])
         outs = self.batch("eth_call", [[{"to": ANCHORING_ADDRESS, "data": "0x" + d.hex()}, *tail] for d in datas])
         if "0x" in outs:  # every write would succeed and be lost, so nothing may be sent
-            raise SystemExit(f"{ANCHORING_ADDRESS} answered nothing: no anchoring implementation is deployed behind it")
+            halt(f"{ANCHORING_ADDRESS} answered nothing: no anchoring implementation is deployed behind it")
         return [bytes.fromhex(out[2:]) for out in outs]
 
     def call(self, data: bytes, override: dict | None = None) -> bytes:
@@ -475,9 +483,9 @@ def main() -> None:
 
     if writers:
         if (chosen := shares.get(address.lower())) is None:
-            raise SystemExit(f"{address} is not one of REPLAY_WRITERS")
+            halt(f"{address} is not one of REPLAY_WRITERS")
         if not all(editing([(r.id, address) for r in chosen])):  # else every write would fail on chain
-            raise SystemExit(f"{address} lacks the editor role on part of its share: grant first")
+            halt(f"{address} lacks the editor role on part of its share: grant first")
     mine = sum(rows[r.id] for r in chosen)
     print(f"writing {len(chosen)} registries, {mine} rows", flush=True)
     # Each writer takes the ramp in proportion to its rows, so they all finish together.
