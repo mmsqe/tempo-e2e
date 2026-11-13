@@ -26,6 +26,7 @@ import multiprocessing
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -61,10 +62,21 @@ def halt(why: str) -> NoReturn:
 
 
 def fetch(path: str, params: dict) -> dict:
-    """One answer of the old chain's API, which refuses Python's default User-Agent."""
+    """One answer of the old chain's API, which refuses Python's default User-Agent. Its gateway times out
+    when several writers start at once, so a 5xx, a 429 or a timeout is retried for a few minutes."""
     url = f"{API}/{path}?{urllib.parse.urlencode(params)}"
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "tempo-e2e"}), timeout=60) as r:
-        return json.load(r)
+    request = urllib.request.Request(url, headers={"User-Agent": "tempo-e2e"})
+    for wait in (5, 10, 20, 40, 80, None):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if wait is None or (e.code < 500 and e.code != 429):
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if wait is None:
+                raise
+        time.sleep(wait)
 
 
 def old_chain(path: str, **params) -> list[dict]:
