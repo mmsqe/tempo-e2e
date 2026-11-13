@@ -62,6 +62,8 @@ FEE = Contract.from_abi(
         "function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) returns (uint256 liquidity)",
         "function burn(address userToken, address validatorToken, uint256 liquidity, address to) returns (uint256 amountUserToken, uint256 amountValidatorToken)",
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
+        "function collectedFees(address validator, address token) view returns (uint256)",
+        "function distributeFees(address validator, address token)",
     ],
     to=FEE_MANAGER_ADDRESS,
 )
