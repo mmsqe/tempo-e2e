@@ -64,6 +64,7 @@ FEE = Contract.from_abi(
         "function liquidityBalances(bytes32 poolId, address user) view returns (uint256)",
         "function collectedFees(address validator, address token) view returns (uint256)",
         "function distributeFees(address validator, address token)",
+        "function claimFeeShares(address token)",
     ],
     to=FEE_MANAGER_ADDRESS,
 )

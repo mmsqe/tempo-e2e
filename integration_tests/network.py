@@ -167,6 +167,7 @@ def generate_dev_genesis(
     zone_owner: str | None = None,
     gas_token_admin: str | None = None,
     validator_address: str | None = None,
+    fee_wallets: tuple[str, str] | None = None,
     dkg: bool = False,
 ) -> Path:
     """The dev genesis: ``$TEMPO_GENESIS`` or the one already in ``output_dir`` when every option is
@@ -174,8 +175,8 @@ def generate_dev_genesis(
 
     ``fork_times`` (``{"t10_time": <unix seconds>}``) goes through xtask, which keys parts of the alloc off
     each activation; ``hardfork`` (``"T12"``) leaves every later fork off; ``epoch_length`` lets a long run
-    pass the boundary a single validator halts at; ``dkg`` keeps the DKG outcome in the header, which a
-    follower needs.
+    pass the boundary a single validator halts at; ``fee_wallets`` are the devshare and buyback wallets the
+    fee split pays; ``dkg`` keeps the DKG outcome in the header, which a follower needs.
     """
     genesis = output_dir / "genesis.json"
     options = [
@@ -188,6 +189,7 @@ def generate_dev_genesis(
         *(("--zone-owner", zone_owner) if zone_owner else ()),
         *(gas_token_flags(gas_token_admin) if gas_token_admin else ()),
         *(("--validator-addresses", validator_address) if validator_address else ()),
+        *(("--fee-devshare", fee_wallets[0], "--fee-buyback", fee_wallets[1]) if fee_wallets else ()),
     ]
     if not options and not dkg:
         # Only a default genesis may be supplied or reused: neither a prebuilt nor a leftover
@@ -411,11 +413,14 @@ def dev_node(
     fork_times: dict[str, int] | None = None,
     chain_id: int | None = None,
     gas_token_admin: str | None = None,
+    fee_wallets: tuple[str, str] | None = None,
     **kwargs,
 ) -> TempoNode:
     """A ``--dev`` node in ``base/devnet/node0`` beside a fresh ``genesis.json``, on a free HTTP port unless given."""
     devnet = base / "devnet"
-    genesis = generate_dev_genesis(devnet, fork_times=fork_times, chain_id=chain_id, gas_token_admin=gas_token_admin)
+    genesis = generate_dev_genesis(
+        devnet, fork_times=fork_times, chain_id=chain_id, gas_token_admin=gas_token_admin, fee_wallets=fee_wallets
+    )
     kwargs.setdefault("http_port", free_port())
     return TempoNode(datadir=devnet / "node0", log_path=devnet / log_name, genesis=genesis, **kwargs)
 
