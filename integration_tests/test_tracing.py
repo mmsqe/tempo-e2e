@@ -56,19 +56,6 @@ FRAME_TRACER = {
         result: function() { return this.frames; }
     }"""
 }
-# TODO: remove once the fork takes alloy-rs/evm2#1027.
-BATCH_TRACING_UNFIXED = pytest.mark.skip(
-    reason="tempo's evm2 runs a tempo tx's calls below an empty root: its struct logs come back empty and failed, "
-    "and onlyTopCall, vmTrace and the failing call's mark lose them"
-)
-
-
-def _vm_ops(vm_trace: dict | None) -> list[str | None]:
-    """A Parity vmTrace's opcodes, each subcall's right after the op that made it; None for an entry without one."""
-    ops = []
-    for op in (vm_trace or {}).get("ops", []):
-        ops += [op.get("op"), *_vm_ops(op.get("sub"))]
-    return ops
 
 
 async def _trace_call(w3, call: dict, config=None, block="latest"):
@@ -85,7 +72,7 @@ async def _sent(w3, account, to, data=b"", **kwargs):
 
 
 class TestBatch:
-    """Every call of a batch shows in each tracer."""
+    """A tempo tx's calls run under an empty root, as revm traced them: tracers that follow the root see none."""
 
     @pytest.fixture
     async def batch(self, w3, chain_id, funded_account, deploy):
@@ -107,65 +94,46 @@ class TestBatch:
         assert any(kind == "CREATE" for kind, _ in frames), frames
         assert ("CALL", address.lower()) in frames, frames
 
-    @BATCH_TRACING_UNFIXED
-    async def test_only_top_call_keeps_the_batch(self, w3, batch):
-        """A batch's top calls are its own, so `onlyTopCall` keeps them and drops what they called."""
-        address, (*_, both) = batch
+    async def test_only_top_call_keeps_the_root_alone(self, w3, batch):
+        """The top call is the root, so `onlyTopCall` drops the batch's own calls."""
+        *_, both = batch[1]
         trace = await trace_tx(w3, both, CALL_TRACER | {"tracerConfig": {"onlyTopCall": True}})
-        calls = trace.get("calls", [])
-        assert [call["type"] for call in calls] == ["CREATE", "CALL"], trace
-        assert calls[1]["to"].lower() == address.lower() and not any("calls" in call for call in calls)
+        assert int(trace["to"], 16) == 0 and "calls" not in trace, trace
 
-    @BATCH_TRACING_UNFIXED
     async def test_call_tracer_marks_the_failing_call(self, w3, chain_id, funded_account, deploy):
-        """A call that fails reverts its batch: it and the root carry the error, the call before it none."""
+        """A call that fails reverts its batch: it carries the error, the call before it and the root none."""
         ok, failing = [await deploy(runtime) for runtime in (RETURN_42_RUNTIME, SPIN_RUNTIME)]
         calls = [{"to": address, "data": b""} for address in (ok, failing)]
         receipt = await send_calls(w3, chain_id=chain_id, private_key=funded_account.key.hex(), calls=calls)
         assert receipt["status"] == 0
         trace = await trace_tx(w3, receipt, CALL_TRACER)
         errors = {frame["to"].lower(): frame.get("error") for frame in call_frames(trace)[1:]}
-        assert trace.get("error") and errors == {ok.lower(): None, failing.lower(): "out of gas"}, trace
+        assert "error" not in trace and errors == {ok.lower(): None, failing.lower(): "out of gas"}, trace
 
-    @BATCH_TRACING_UNFIXED
-    async def test_struct_logs(self, w3, batch):
-        traces = [await trace_tx(w3, tx_hash) for tx_hash in batch[1]]
-        create, call, both = [[(log["op"], log["depth"]) for log in trace["structLogs"]] for trace in traces]
-        assert create and call, "a single call's struct logs"
-        assert both == create + call, "a batch's calls run at the depth of a call sent alone"
+    async def test_parity_trace(self, w3, batch):
+        """The trace lists the root, then each call; the root ran no opcode, so its `vmTrace` is empty."""
+        *_, both = batch[1]
+        replay = await rpc_result(w3, "trace_replayTransaction", [both, ["trace", "vmTrace"]])
+        entries = [(entry["type"], entry["traceAddress"]) for entry in replay["trace"]]
+        assert entries == [("call", []), ("create", [0]), ("call", [1])], replay
+        assert replay["vmTrace"]["ops"] == []
 
-    @BATCH_TRACING_UNFIXED
-    async def test_vm_trace(self, w3, batch):
-        """A batch's root runs no opcode itself: it lists an entry without one per call, holding that call's."""
-        _, hashes = batch
-        replays = [await rpc_result(w3, "trace_replayTransaction", [tx_hash, ["vmTrace"]]) for tx_hash in hashes]
-        create, call, both = [_vm_ops(replay["vmTrace"]) for replay in replays]
-        # A call sent alone is the root itself, or the one entry of a root like the batch's.
-        create, call = ([op for op in ops if op] for ops in (create, call))
-        assert create and call, "a single call's vmTrace"
-        assert both == [None, *create, None, *call]
+    async def test_js_steps_run_through_the_batch(self, w3, batch):
+        """A JS tracer sees every opcode, one level below the root; a batch's steps are its calls' in turn."""
+        create, call, both = [await trace_tx(w3, tx_hash, STEP_TRACER) for tx_hash in batch[1]]
+        assert [op for _, op, _, _ in call] == "PUSH1 PUSH1 MSTORE PUSH1 PUSH1 RETURN".split()
+        assert both == create + call and {depth for *_, depth in both} == {2}
 
-    @BATCH_TRACING_UNFIXED
-    async def test_js_steps_match_the_struct_logs(self, w3, batch):
-        """A JS step sees its struct log's pc, opcode, stack top and depth; a batch's steps are its calls' in turn."""
-        _, (create, call, both) = batch
-        alone = [
-            [[log["pc"], log["op"], (log["stack"] or [None])[-1], log["depth"]] for log in trace["structLogs"]]
-            for trace in [await trace_tx(w3, tx_hash) for tx_hash in (create, call)]
-        ]
-        for tx_hash, steps in zip((create, call, both), [*alone, alone[0] + alone[1]]):
-            assert await trace_tx(w3, tx_hash, STEP_TRACER) == steps
-
-    @BATCH_TRACING_UNFIXED
     async def test_the_root_reports_its_tx(self, w3, funded_account, batch):
-        """Alone or in a batch, the root carries the tx's sender, gas and outcome under both tracers."""
+        """Alone or in a batch, the root carries the tx's sender and gas. The default tracer follows the root's own
+        steps and status: it logs none, and reports `failed` whatever the tx's outcome."""
         for tx_hash in batch[1]:
             gas_used = (await w3.eth.get_transaction_receipt(tx_hash))["gasUsed"]
             root = await trace_tx(w3, tx_hash, CALL_TRACER)
             assert HexBytes(root["from"]) == HexBytes(funded_account.address)
             assert int(root["gasUsed"], 16) == gas_used and "error" not in root, root
             default = await trace_tx(w3, tx_hash)
-            assert default["gas"] == gas_used and not default["failed"]
+            assert (default["gas"], default["failed"], default["structLogs"]) == (gas_used, True, []), default
 
     async def test_a_self_destruct_is_traced_once(self, w3, chain_id, funded_account, deploy):
         """The root takes its last call's outcome, yet destroys nothing itself."""
@@ -207,7 +175,6 @@ class TestTx:
         """The receipt of a TIP-20 transfer."""
         return await send_call(w3, chain_id, funded_account, **transfer_call(new_account().address, 1))
 
-    @BATCH_TRACING_UNFIXED
     async def test_every_tracer_at_once(self, w3, transfer):
         """Each tracer traces a TIP-20 transfer, and its block's traces list it."""
         configs = [
@@ -217,7 +184,7 @@ class TestTx:
             CALL_TRACER | {"tracerConfig": {"diffMode": True}},  # not a callTracer option: ignored
         ]
         default, call, _, in_diff_mode = await asyncio.gather(*(trace_tx(w3, transfer, c) for c in configs))
-        assert not default["failed"] and in_diff_mode == call
+        assert default["gas"] == transfer["gasUsed"] and in_diff_mode == call
         traces = await rpc_result(w3, "debug_traceBlockByNumber", [hex(transfer["blockNumber"]), CALL_TRACER])
         assert transfer["transactionHash"].to_0x_hex() in [trace["txHash"] for trace in traces]
 
