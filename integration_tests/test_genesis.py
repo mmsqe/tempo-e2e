@@ -1,10 +1,13 @@
-"""What ``tempo-xtask generate-genesis`` writes into the alloc for this chain; no node needed.
+"""What ``tempo-xtask generate-genesis`` writes into the alloc for this chain, and which config fields ``tempo``
+refuses; no node needed.
 
 The launch genesis is generated, not hand-patched, so a chain starts on the runtime the binary embeds."""
 
 from __future__ import annotations
 
+import functools
 import json
+import mmap
 
 import pytest
 from eth_utils import keccak
@@ -12,8 +15,8 @@ from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, VALIDATOR_CONFIG_V2_A
 
 from .abi import ANCHORING_ADDRESS
 from .anchoring import IMPLEMENTATION, IMPLEMENTATION_SLOT, LAUNCH_RUNTIME_HASH, OWNER_SLOT, PROXY_CODE
-from .network import DEV_GENESIS_ACCOUNTS, generate_dev_genesis, genesis_alloc
-from .utils import OUSD
+from .network import DEV_GENESIS_ACCOUNTS, generate_dev_genesis, genesis_alloc, resolve_tempo_bin, run_binary
+from .utils import FAR_FUTURE, OUSD
 
 pytestmark = pytest.mark.tempo
 
@@ -99,3 +102,34 @@ def test_the_deployment_gas_token_is_what_the_genesis_pays_fees_in(tmp_path):
     )
     minted = [v for v in alloc[token]["storage"].values() if int(v, 16) == 2**64 - 1]
     assert len(minted) == DEV_GENESIS_ACCOUNTS + 2, "every account, the issuer and the validator"
+
+
+REFUSAL = "invalid Tempo genesis config"
+
+
+@functools.lru_cache(maxsize=1)
+def _checks_fields() -> bool:
+    """Read off the binary, since an older tempo takes any genesis and a run cannot tell."""
+    with open(resolve_tempo_bin(), "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        return m.find(REFUSAL.encode()) != -1
+
+
+@pytest.mark.parametrize(
+    ("config", "reason"),
+    [
+        ({"t12Time": "soon"}, 'invalid type: string "soon"'),
+        ({"epochLenght": 20}, "unknown field `epochLenght`"),
+        ({"n999Time": 5}, "unknown field `n999Time`"),
+        ({"t99Time": FAR_FUTURE}, "unknown field `t99Time`"),
+    ],
+)
+def test_tempo_refuses_a_bad_genesis_field(tmp_path, config, reason):
+    """``tempo init`` refuses the dev genesis with ``config`` merged into its chain config."""
+    if not _checks_fields():
+        pytest.skip("tempo predates the genesis field checks")
+    genesis = json.loads(generate_dev_genesis(tmp_path / "xtask").read_text())
+    genesis["config"].update(config)
+    path = tmp_path / "genesis.json"
+    path.write_text(json.dumps(genesis))
+    with pytest.raises(RuntimeError, match=f"{REFUSAL}: {reason}"):
+        run_binary(resolve_tempo_bin(), "init", "--chain", str(path), "--datadir", str(tmp_path / "node"))
