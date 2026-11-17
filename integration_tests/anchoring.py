@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
-from eth_utils import to_checksum_address
+from eth_utils import keccak, to_checksum_address
 
 from .abi import ANCHORING, ANCHORING_ADDRESS
 from .network import TempoNode, default_genesis, free_port, generate_dev_genesis, resolve_tempo_bin, run_binary, running
@@ -146,6 +146,21 @@ def anchoring_node(base: Path, *, owner: str | None = None, extra_args: list[str
 RELAY_RUNTIME = (
     "36 6000 6000 37  6000 6000 36 6000 6000 73{addr} 5a f1  3d 6000 6000 3e  6033 57  3d 6000 fd  5b 3d 6000 f3"
 )
+
+
+DEPLOY_GAS = 25_000_000  # 20.7 KB of code at 1,000 gas a byte, and the creation around it
+
+
+async def deploy_implementation(send, salt: int = 0) -> str:
+    """Deploys the implementation through the factory under ``salt``; returns where it landed."""
+    salt_word = salt.to_bytes(32, "big")
+    await send(FACTORY, salt_word + INIT_CODE, gas_limit=DEPLOY_GAS)
+    return to_checksum_address(keccak(b"\xff" + bytes.fromhex(FACTORY[2:]) + salt_word + keccak(INIT_CODE))[12:])
+
+
+async def add_registry(send, name: str) -> list[tuple]:
+    """The registries an ``addRegistry`` call reports, as ``(caller, id, name)``; none when it did nothing."""
+    return emitted(await send(ANCHORING.fns.addRegistry(name, "", "")), ANCHORING, "AddRegistry")
 
 
 async def deploy_relay(w3, chain_id: int, account) -> str:
