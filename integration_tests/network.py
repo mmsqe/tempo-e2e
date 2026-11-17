@@ -204,6 +204,8 @@ def generate_dev_genesis(
         *("--output", str(output_dir), "--accounts", str(DEV_GENESIS_ACCOUNTS), "--seed", "0"),
         *("--validators", "127.0.0.1:30303"),
         *(() if dkg else ("--no-dkg-in-genesis",)),
+        # xtask starts a new genesis on every lane fork; a suite names the ones it wants in `fork_times`.
+        *(("--nvnm-hardfork", "baseline") if "--nvnm-hardfork" in _genesis_help() else ()),
         *options,
     )
     return genesis
