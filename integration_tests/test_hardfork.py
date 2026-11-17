@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import functools
 import os
@@ -26,10 +27,12 @@ from .anchoring import (
     implementation,
     seed_fixture,
 )
+from .conftest import supervisord_net
 from .network import (
     ACTIVATION_LEAD,
     TempoNode,
     dev_node,
+    fork_flags,
     fork_schedule,
     free_port,
     generate_dev_genesis,
@@ -39,6 +42,7 @@ from .network import (
     run_binary,
     running,
     xtask_forks,
+    xtask_nvnm_forks,
 )
 from .utils import (
     FAR_FUTURE,
@@ -49,6 +53,7 @@ from .utils import (
     latest_timestamp,
     new_account,
     rpc,
+    rpc_result,
     send_call,
     send_calls,
     wait_for_block,
@@ -102,6 +107,14 @@ def boundary_forks() -> tuple[str, ...]:
 
 def _node(base: Path, genesis: Path) -> TempoNode:
     return TempoNode(datadir=base / "node0", log_path=base / "node.log", genesis=genesis, http_port=free_port())
+
+
+def _lane_forks() -> tuple[str, ...]:
+    """The NVNM lane forks xtask can schedule; skips the test without one."""
+    lane = xtask_nvnm_forks()
+    if not lane:
+        pytest.skip("tempo-xtask has no lane fork (`--n<k>-time`)")
+    return lane
 
 
 @contextlib.asynccontextmanager
@@ -230,6 +243,88 @@ class TestForkBoundaries:
             assert not await ACCOUNT_KEYCHAIN.fns.isAdminKey(ADMIN.address, key).call(w3)
             _, key_id, _, _, is_revoked = await ACCOUNT_KEYCHAIN.fns.getKey(ADMIN.address, key).call(w3)
             assert (to_checksum_address(key_id), is_revoked) == (key, False)
+
+
+class TestNvnmLane:
+    """NVNM's own forks, scheduled apart from the T forks."""
+
+    async def test_a_chain_without_lane_forks_lists_only_t_forks(self, head_chain):
+        """An unscheduled lane adds nothing to the schedule, not even its baseline."""
+        async with rpc(head_chain[0]) as w3:
+            schedule = (await rpc_result(w3, "tempo_forkSchedule"))["schedule"]
+        assert all(f["name"].startswith("T") for f in schedule), schedule
+
+    async def test_crossing_a_lane_fork_moves_the_fork_id_and_no_t_fork(self, tmp_path):
+        """Crosses the newest lane fork with T12 held back, so a lane fork that turned it on would show."""
+        lane = _lane_forks()
+        name = _fork_name(lane[-1])
+        activation = int(time.time()) + ACTIVATION_LEAD
+        schedule = fork_schedule(OWNER_FORK, FAR_FUTURE) | dict.fromkeys(lane[:-1], 0) | {lane[-1]: activation}
+        node = dev_node(tmp_path, log_name="lane.log", fork_times=schedule)
+
+        async with _up(node) as (w3, _):
+            await _assert_before(w3, activation, lane[-1])
+            before = await rpc_result(w3, "tempo_forkSchedule")
+            assert {"name": name, "activationTime": activation, "active": False} in before["schedule"]
+            upcoming = (await rpc_result(w3, "eth_config"))["next"]
+            assert upcoming["activationTime"] == activation
+
+            await wait_for_timestamp(w3, activation)
+
+            after = await rpc_result(w3, "tempo_forkSchedule")
+            (entry,) = [f for f in after["schedule"] if f["name"] == name]
+            assert entry == {"name": name, "activationTime": activation, "active": True, "forkId": upcoming["forkId"]}
+            # `active` names the T fork, which a lane fork leaves where it was.
+            assert after["active"] == before["active"]
+            assert _fork_name(OWNER_FORK) not in await active_forks(w3)
+            current = (await rpc_result(w3, "eth_config"))["current"]
+            assert (current["activationTime"], current["forkId"]) == (activation, upcoming["forkId"])
+
+
+@pytest.fixture(scope="class")
+def lane_net(request, tmp_path_factory):
+    """Validators crossing the newest lane fork, and its activation time."""
+    lane = _lane_forks()
+    # A localnet takes longer than a dev node to finalize its first block.
+    activation = int(time.time()) + 3 * ACTIVATION_LEAD
+    flags = fork_flags(dict.fromkeys(lane[:-1], 0) | {lane[-1]: activation})
+    base = tmp_path_factory.mktemp("lane-net")
+    for net in supervisord_net(request, base, TestNvnmLaneOnValidators.VALIDATORS, patch_genesis_flags=flags):
+        yield net, activation
+
+
+async def _finalized(w3) -> int:
+    """The height this node's own consensus has finalized, -1 before any."""
+    finalized = (await rpc_result(w3, "consensus_getLatest"))["finalized"]
+    return int(finalized["block"]["header"]["number"], 16) if finalized else -1
+
+
+@pytest.mark.consensus
+class TestNvnmLaneOnValidators:
+    """A lane fork crossed by validators that check each other's blocks, which a dev node never does."""
+
+    VALIDATORS = 4
+    BLOCKS_PAST = 10
+
+    async def test_every_validator_finalizes_past_the_fork(self, lane_net):
+        net, activation = lane_net
+        name = _fork_name(_lane_forks()[-1])
+        async with contextlib.AsyncExitStack() as stack:
+            nodes = [await stack.enter_async_context(rpc(net.node_rpc_url(f"node{i}"))) for i in range(self.VALIDATORS)]
+            await _assert_before(nodes[0], activation, name)
+            assert not any([name in await active_forks(w3) for w3 in nodes])
+
+            await wait_for_timestamp(nodes[0], activation)
+            boundary = await nodes[0].eth.block_number
+            while (await nodes[0].eth.get_block(boundary - 1))["timestamp"] >= activation:
+                boundary -= 1
+            target = boundary + self.BLOCKS_PAST
+            async with asyncio.timeout(120):
+                while min([await _finalized(w3) for w3 in nodes]) < target:
+                    await asyncio.sleep(0.5)
+
+            assert len({(await w3.eth.get_block(boundary))["hash"] for w3 in nodes}) == 1
+            assert all([name in await active_forks(w3) for w3 in nodes])
 
 
 class TestCrossingT12:

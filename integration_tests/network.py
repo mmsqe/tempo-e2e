@@ -112,12 +112,30 @@ def _poll_rpc(
 
 
 @functools.lru_cache(maxsize=1)
+def _genesis_help() -> str:
+    return run_binary(resolve_xtask_bin(), "generate-genesis", "--help").stdout
+
+
 def xtask_forks() -> tuple[str, ...]:
     """The ``tN_time`` forks the installed ``tempo-xtask`` can schedule, oldest first, read off its flags so a
     test that schedules a newer fork can skip."""
-    forks = re.findall(r"--t(\d+)([a-z]?)-time", run_binary(resolve_xtask_bin(), "generate-genesis", "--help").stdout)
+    forks = re.findall(r"--t(\d+)([a-z]?)-time", _genesis_help())
     # Numeric sort, point releases after their base: t1 < t1a < t2 < ... < t9 < t10.
     return tuple(f"t{num}{point}_time" for num, point in sorted(forks, key=lambda f: (int(f[0]), f[1])))
+
+
+def xtask_nvnm_forks() -> tuple[str, ...]:
+    """As :func:`xtask_forks`, for NVNM's lane (``n1_time``, ...), which has its own order."""
+    return tuple(f"n{n}_time" for n in sorted(map(int, re.findall(r"--n(\d+)-time", _genesis_help()))))
+
+
+def fork_flags(fork_times: dict[str, int]) -> list[str]:
+    """xtask's flags for ``fork_times``: ``t10_time`` becomes ``--t10-time <ts>``. Refuses a fork it cannot
+    schedule."""
+    known = xtask_forks() + xtask_nvnm_forks()
+    if unknown := sorted(set(fork_times) - set(known)):
+        raise ValueError(f"tempo-xtask cannot schedule {unknown}; it knows {list(known)}")
+    return [a for name, ts in fork_times.items() for a in (f"--{name.replace('_', '-')}", str(ts))]
 
 
 def fork_schedule(fork: str, activation: int) -> dict[str, int]:
@@ -160,13 +178,8 @@ def generate_dev_genesis(
     follower needs.
     """
     genesis = output_dir / "genesis.json"
-    if fork_times:
-        unknown = sorted(set(fork_times) - set(xtask_forks()))
-        if unknown:
-            raise ValueError(f"tempo-xtask cannot schedule {unknown}; it knows {list(xtask_forks())}")
     options = [
-        # t10_time -> --t10-time <ts>
-        *[a for name, ts in (fork_times or {}).items() for a in (f"--{name.replace('_', '-')}", str(ts))],
+        *(fork_flags(fork_times) if fork_times else ()),
         *(("--hardfork", hardfork) if hardfork else ()),
         *(("--chain-id", str(chain_id)) if chain_id is not None else ()),
         *(("--epoch-length", str(epoch_length)) if epoch_length is not None else ()),
