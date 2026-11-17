@@ -64,3 +64,18 @@ async def test_valid_after_in_future_is_rejected(w3, chain_id, funded_account):
     signed = sign_transaction(tx, Signer(funded_account.key.hex()))
     with pytest.raises(Exception):
         await w3.eth.send_raw_transaction(serialize(signed))
+
+
+async def test_a_tip_above_the_fee_cap_is_refused(w3, chain_id, funded_account):
+    """The pool refuses it, and since #8819 so does decoding, so an SDK on tempo-primitives cannot sign one."""
+    max_fee = await suggested_max_fee(w3)
+    tx = build_tempo_tx(
+        chain_id=chain_id,
+        max_fee_per_gas=max_fee,
+        max_priority_fee_per_gas=max_fee + 1,
+        calls=[transfer_call(new_account().address, 1)],
+    )
+    resp = await w3.provider.make_request(
+        "eth_sendRawTransaction", [serialize(sign_transaction(tx, Signer(funded_account.key.hex())))]
+    )
+    assert "priority fee greater than max fee" in resp["error"]["message"], resp

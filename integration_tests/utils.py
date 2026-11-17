@@ -275,7 +275,8 @@ async def call_revert(w3: AsyncWeb3, to, data=None, *, sender: str | None = None
     resp = await w3.provider.make_request("eth_call", [tx, "latest"])
     err = resp.get("error")
     assert err is not None, f"expected revert, got result={resp.get('result')!r}"
-    return f"{err.get('message', '')} {err.get('data', '') or ''}".strip()
+    data = err.get("data") or ""
+    return f"{err.get('message', '')} {'' if data == '0x' else data}".strip()  # 0x: reth's empty revert data
 
 
 async def send_calls(

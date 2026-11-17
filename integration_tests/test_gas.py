@@ -4,12 +4,13 @@ import pytest
 from eth_contract.erc20 import ERC20
 from tempo.constants import ALPHA_USD, PATH_USD
 
-from .utils import funded, new_account, send_call, send_calls, transfer_call
+from .utils import funded, new_account, send_call, send_calls, skip_before, transfer_call
 
 pytestmark = pytest.mark.tempo
 
 SSTORE_CREATE_COST = 250_000  # TIP-1000: creating a new state element
 TX_GAS_CAP = 30_000_000  # TIP-1010: per-transaction gas limit cap
+COLD_ACCOUNT_ACCESS, WARM_ACCOUNT_ACCESS = 2_600, 100
 
 
 async def _transfer_gas(w3, chain_id, sender, recipient):
@@ -85,3 +86,22 @@ async def test_tx_gas_limit_cap_rejected(w3, chain_id, funded_account):
             gas_limit=TX_GAS_CAP + 1,
             calls=[transfer_call(new_account().address, 1)],
         )
+
+
+async def test_a_repeated_batch_target_pays_warm_access(w3, chain_id):
+    """From T14 a later call in a batch pays the cold access only for a target no earlier call named."""
+    await skip_before(w3, "T14")
+    sender = await funded(w3)
+    # All-nonzero addresses keep the calldata the same price whichever target a call names.
+    first, second, third = ("0x" + byte * 20 for byte in ("11", "22", "33"))
+
+    async def batch(*targets):
+        receipt = await send_calls(
+            w3, chain_id=chain_id, private_key=sender.key.hex(), calls=[{"to": t} for t in targets]
+        )
+        assert receipt["status"] == 1
+        return receipt["gasUsed"]
+
+    await batch(first)  # the sender's first tx pays for creating its account
+    repeated, fresh = await batch(first, second, second), await batch(first, second, third)
+    assert fresh - repeated == COLD_ACCOUNT_ACCESS - WARM_ACCOUNT_ACCESS

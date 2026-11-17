@@ -18,6 +18,7 @@ from web3.exceptions import TransactionNotFound, Web3RPCError
 from .abi import ACCOUNT_KEYCHAIN as KC
 from .abi import CONFIGURABLE_ACCOUNT as CA
 from .abi import CONFIGURABLE_ACCOUNT_ADDRESS
+from .abi import SIGNATURE_VERIFIER as SIG
 from .utils import (
     RETURN_42_INIT,
     call_revert,
@@ -305,6 +306,23 @@ class TestKeys:
         _, contract = await deploy_contract(w3, chain_id=chain_id, private_key=root.key.hex(), bytecode=RETURN_42_INIT)
         for key_id in (root.address, contract, PATH_USD, ACCOUNT_KEYCHAIN_ADDRESS):
             assert "InvalidKeyId" in await call_revert(w3, _delegate(key_id), sender=root.address), key_id
+
+    async def test_the_keychain_verifier_accepts_a_delegate_quorum(self, w3, chain_id):
+        """#9079: ``verifyKeychain`` checks a delegate's ``0x05`` signature against the delegate's configuration."""
+        parent, delegate, digest = await funded(w3), Multisig.derived(2, owners(1, 1)), os.urandom(32)
+        await send_call(w3, chain_id, parent, _delegate(delegate.address))
+        parent_bytes = to_canonical_address(parent.address)
+        blob = b"\x04" + parent_bytes + delegate.quorum(keccak(b"\x04" + digest + parent_bytes))
+        assert await SIG.fns.verifyKeychain(parent.address, digest, blob).call(w3)
+
+    async def test_an_upgraded_account_takes_only_a_delegate_grant(self, w3, chain_id):
+        """#9128: its root key is retired, so a primitive grant naming the account would revive that key."""
+        upgraded, parent = await funded(w3), await funded(w3)
+        account = Multisig.upgraded(upgraded.address, 1, owners(1))
+        await send_call(w3, chain_id, upgraded, CA.fns.upgradeAccount(1, account.abi_owners))
+        primitive = _delegate(upgraded.address, SECP256K1)
+        assert "InvalidSignatureType" in await call_revert(w3, primitive, sender=parent.address)
+        assert (await send_call(w3, chain_id, parent, _delegate(upgraded.address)))["status"] == 1
 
 
 def _delegate(key_id: str, signature_type: int = CONFIGURABLE_ACCOUNT):

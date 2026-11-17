@@ -56,11 +56,11 @@ FRAME_TRACER = {
         result: function() { return this.frames; }
     }"""
 }
-# TODO: remove both once the fork takes the evm2 batch-tracing fix.
+# TODO: remove once the fork takes alloy-rs/evm2#1027.
 BATCH_TRACING_UNFIXED = pytest.mark.skip(
-    reason="tempo's evm2 traces only a batch's last call, and trace_replayTransaction fails on a batch"
+    reason="tempo's evm2 runs a tempo tx's calls below an empty root: its struct logs come back empty and failed, "
+    "and onlyTopCall, vmTrace and the failing call's mark lose them"
 )
-WITH_LOG_UNFIXED = pytest.mark.skip(reason="tempo's evm2 fails callTracer withLog on a TIP-20 transfer")
 
 
 def _vm_ops(vm_trace: dict | None) -> list[str | None]:
@@ -98,7 +98,6 @@ class TestBatch:
             hashes.append(receipt["transactionHash"].to_0x_hex())
         return address, hashes
 
-    @BATCH_TRACING_UNFIXED
     async def test_call_tracer(self, w3, funded_account, batch):
         """Each call is a frame, whether the tracer roots it or nests it."""
         address, (*_, both) = batch
@@ -146,6 +145,7 @@ class TestBatch:
         assert create and call, "a single call's vmTrace"
         assert both == [None, *create, None, *call]
 
+    @BATCH_TRACING_UNFIXED
     async def test_js_steps_match_the_struct_logs(self, w3, batch):
         """A JS step sees its struct log's pc, opcode, stack top and depth; a batch's steps are its calls' in turn."""
         _, (create, call, both) = batch
@@ -156,6 +156,7 @@ class TestBatch:
         for tx_hash, steps in zip((create, call, both), [*alone, alone[0] + alone[1]]):
             assert await trace_tx(w3, tx_hash, STEP_TRACER) == steps
 
+    @BATCH_TRACING_UNFIXED
     async def test_the_root_reports_its_tx(self, w3, funded_account, batch):
         """Alone or in a batch, the root carries the tx's sender, gas and outcome under both tracers."""
         for tx_hash in batch[1]:
@@ -206,6 +207,7 @@ class TestTx:
         """The receipt of a TIP-20 transfer."""
         return await send_call(w3, chain_id, funded_account, **transfer_call(new_account().address, 1))
 
+    @BATCH_TRACING_UNFIXED
     async def test_every_tracer_at_once(self, w3, transfer):
         """Each tracer traces a TIP-20 transfer, and its block's traces list it."""
         configs = [
@@ -219,7 +221,6 @@ class TestTx:
         traces = await rpc_result(w3, "debug_traceBlockByNumber", [hex(transfer["blockNumber"]), CALL_TRACER])
         assert transfer["transactionHash"].to_0x_hex() in [trace["txHash"] for trace in traces]
 
-    @WITH_LOG_UNFIXED
     async def test_with_log(self, w3, transfer):
         """`withLog` shows the transfer's Transfer log."""
         trace = await trace_tx(w3, transfer, CALL_TRACER | {"tracerConfig": {"withLog": True}})

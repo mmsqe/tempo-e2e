@@ -7,7 +7,7 @@ import time
 import pytest
 from web3 import Web3
 
-from .network import default_genesis, dev_node, patched_node, resolve_tempo_bin, running
+from .network import FollowerNode, default_genesis, dev_node, free_port, patched_node, resolve_tempo_bin, running
 
 pytestmark = pytest.mark.slow
 
@@ -31,6 +31,35 @@ def test_a_zero_consensus_duration_is_refused(tmp_path):
     result = subprocess.run(node.command(), capture_output=True, text=True, timeout=60)
     assert result.returncode != 0
     assert "duration must be greater than zero" in result.stderr
+
+
+def _refused(command: list[str]) -> str:
+    """The stderr of ``command`` refusing to start; a node that starts instead fails the test."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the node started instead of refusing its flags")
+    assert result.returncode != 0
+    return result.stderr
+
+
+def test_a_network_reserve_percentile_below_50_is_refused(tmp_path):
+    """The proposal budget flags are checked before the node starts (#8468)."""
+    node = dev_node(tmp_path, extra_args=["--consensus.network-reserve-percentile", "40"])
+    assert "network reserve percentile (40) must be between 50 and 100, inclusive" in _refused(node.command())
+
+
+@pytest.mark.parametrize("debug_client", [["--debug.rpc-consensus-url", "ws://127.0.0.1:9"], ["--debug.etherscan"]])
+def test_a_debug_consensus_client_is_refused_beside_the_consensus_engine(tmp_path, debug_client):
+    """A certified follower runs the consensus engine, whose forkchoice a debug client would contend (#9152)."""
+    node = FollowerNode(
+        upstream="ws://127.0.0.1:9",
+        datadir=tmp_path / "node",
+        log_path=tmp_path / "node.log",
+        http_port=free_port(),
+        extra_args=debug_client,
+    )
+    assert "only allowed with --dev or --follow.nocertify" in _refused(node.command())
 
 
 def _consensus_info(*args: str) -> subprocess.CompletedProcess:
