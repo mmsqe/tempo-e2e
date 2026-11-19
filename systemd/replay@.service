@@ -1,4 +1,4 @@
-# The replay, `systemctl enable --now replay@0`, with its key in /etc/replay/writer-0.env.
+# The replay: `systemctl enable --now replay@0`. replay.env.example says what its two files hold.
 [Unit]
 Description=Anchoring replay writer %i
 After=network-online.target
@@ -12,7 +12,8 @@ EnvironmentFile=/etc/replay/writer-%i.env
 ExecStart=/opt/tempo-e2e/.venv/bin/python -m integration_tests.replay records $REPLAY_REGISTRIES --ramp ${REPLAY_RAMP}
 Restart=on-failure
 RestartSec=60
-# replay.py's HALT: a failed record or a missing role, which a person looks at before anything more is sent.
+# replay.py's HALT: a failed record, a missing role or a bad setting, which a person looks at before anything
+# more is sent.
 RestartPreventExitStatus=3
 
 [Install]

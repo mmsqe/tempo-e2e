@@ -291,12 +291,15 @@ def split(registries: list[Registry], rows: dict[int, int], k: int) -> list[list
 
 def schedule(spec: str, share: float):
     """Records a second for a writer with `share` of the rows, from `DATE:PER_DAY,...` in UTC: linear between the
-    points, none before the first, the last one's rate after it."""
-    points = []
-    for point in spec.split(","):
-        when, per_day = point.rsplit(":", 1)
-        at = datetime.fromisoformat(when).replace(tzinfo=UTC).timestamp()
-        points.append((at, float(per_day) * share / 86400))
+    points, none before the first, the last one's rate after it. A service's unset variable arrives as an empty
+    spec, which stops rather than send unpaced."""
+    try:
+        points = sorted(
+            (datetime.fromisoformat(when).replace(tzinfo=UTC).timestamp(), float(per_day) * share / 86400)
+            for when, per_day in (point.rsplit(":", 1) for point in spec.split(","))
+        )
+    except ValueError:
+        halt(f"--ramp {spec!r} is not DATE:PER_DAY,...")
 
     def rate(now: float) -> float:
         if now < points[0][0]:
@@ -451,11 +454,11 @@ def main() -> None:
     old = [r._replace(id=r.id - OFFSET) for r in court]
     chosen = old
     if args.registries:
-        chosen = []
-        for arg in args.registries:
-            (registry,) = [r for r in old if str(r.id) == arg or r.name == arg]  # an id, or a name only one has
-            chosen.append(registry)
-        chosen.sort()
+        found = {arg: [r for r in old if str(r.id) == arg or r.name == arg] for arg in args.registries}
+        if wrong := [arg for arg, matches in found.items() if len(matches) != 1]:
+            halt(f"not one court registry's id or name: {' '.join(wrong)}")
+        # Once each: named twice, a registry's last rows would be sent again and land as second versions.
+        chosen = sorted({matches[0] for matches in found.values()})
     files = {f["registry"]: f for f in json.loads((EXPORT / "manifest.json").read_text())["files"]}
     seeded = {i: files[r["name"]] for i, r in enumerate(names, 1)}
     for rid in sorted({i - OFFSET for i in written_since_seed()} & seeded.keys()):  # the export lacks what they hold
@@ -502,9 +505,10 @@ def main() -> None:
         if not all(editing([(r.id, address) for r in chosen])):  # else every write would fail on chain
             halt(f"{address} lacks the editor role on part of its share: grant first")
     mine = sum(rows[r.id] for r in chosen)
-    print(f"writing {len(chosen)} registries, {mine} rows", flush=True)
     # Each writer takes the ramp in proportion to its rows, so they all finish together.
-    pace = schedule(args.ramp, mine / sum(rows.values())) if args.ramp else None
+    pace = schedule(args.ramp, mine / sum(rows.values())) if args.ramp is not None else None
+    rate = f"{pace(time.time()) * 86400:,.0f} a day now" if pace else "unpaced"
+    print(f"writing {len(chosen)} registries, {mine} rows, {rate}", flush=True)
     calls = itertools.chain.from_iterable(remaining(node, r, rows_of(r, seeded)) for r in chosen)
     send(node, key, calls, args.per_block, "records", pace)
 
