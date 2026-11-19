@@ -1,5 +1,5 @@
 """What ``tempo-xtask generate-genesis`` writes into the alloc for this chain, and which config fields ``tempo``
-refuses; no node needed.
+refuses. Only the minted balances need a node.
 
 The launch genesis is generated, not hand-patched, so a chain starts on the runtime the binary embeds."""
 
@@ -10,13 +10,23 @@ import json
 import mmap
 
 import pytest
+from eth_contract.erc20 import ERC20
 from eth_utils import keccak
 from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD, VALIDATOR_CONFIG_V2_ADDRESS
 
 from .abi import ANCHORING_ADDRESS
 from .anchoring import IMPLEMENTATION, IMPLEMENTATION_SLOT, LAUNCH_RUNTIME_HASH, OWNER_SLOT, PROXY_CODE
-from .network import DEV_GENESIS_ACCOUNTS, generate_dev_genesis, genesis_alloc, resolve_tempo_bin, run_binary
-from .utils import FAR_FUTURE, OUSD
+from .network import (
+    DEV_GENESIS_ACCOUNTS,
+    _genesis_help,
+    dev_node,
+    generate_dev_genesis,
+    genesis_alloc,
+    resolve_tempo_bin,
+    run_binary,
+    running,
+)
+from .utils import FAR_FUTURE, OUSD, new_account, rpc, send_call
 
 pytestmark = pytest.mark.tempo
 
@@ -102,6 +112,19 @@ def test_the_deployment_gas_token_is_what_the_genesis_pays_fees_in(tmp_path):
     )
     minted = [v for v in alloc[token]["storage"].values() if int(v, 16) == 2**64 - 1]
     assert len(minted) == DEV_GENESIS_ACCOUNTS + 2, "every account, the issuer and the validator"
+
+
+async def test_a_holder_the_balances_file_names_pays_its_own_fee(tmp_path):
+    """It holds the file's amount at block 0 and has nothing else to pay with."""
+    if "--pathusd-balances" not in _genesis_help():
+        pytest.skip("tempo-xtask predates --pathusd-balances")
+    holder, amount = new_account(), 5_000_000
+    balances = tmp_path / "balances.json"
+    balances.write_text(json.dumps({holder.address: amount}))
+    with running(dev_node(tmp_path, pathusd_balances=balances)) as node:
+        async with rpc(node) as w3:
+            assert await ERC20.fns.balanceOf(holder.address).call(w3, to=PATH_USD, block_identifier=0) == amount
+            await send_call(w3, node.chain_id, holder, PATH_USD, ERC20.fns.transfer(new_account().address, 1).data)
 
 
 REFUSAL = "invalid Tempo genesis config"
