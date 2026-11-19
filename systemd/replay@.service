@@ -1,5 +1,4 @@
-# One replay writer, the instance only a name: `systemctl enable --now replay@0 replay@1 ...`, each with its key in
-# /etc/replay/writer-<instance>.env. A writer finds its share by its own address in REPLAY_WRITERS.
+# The replay, `systemctl enable --now replay@0`, with its key in /etc/replay/writer-0.env.
 [Unit]
 Description=Anchoring replay writer %i
 After=network-online.target

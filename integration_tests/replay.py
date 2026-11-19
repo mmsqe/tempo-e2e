@@ -1,6 +1,6 @@
-"""Replay the old chain's anchoring rows into a node as transactions: every registry in id order, then each
-registry's records in write order, so ids, versions and checksum lookups come out as the old chain has them.
-A rerun resumes.
+"""Replay the old chain's US court data into a node as transactions: the court registries the export lists, in
+the old chain's id order and renumbered from 1, then each one's records in write order, so record ids, versions
+and checksum lookups come out as the old chain has them. A rerun resumes.
 
     .venv/bin/python -m integration_tests.replay registries
     .venv/bin/python -m integration_tests.replay ids
@@ -9,12 +9,12 @@ A rerun resumes.
     .venv/bin/python -m integration_tests.replay revoke [REGISTRY...]
     .venv/bin/python -m integration_tests.replay verify [REGISTRY...]
 
-A REGISTRY is an id or a name only one registry has; none means every one. REPLAY_KEY signs. Given
+A REGISTRY is a court registry's id here or its name; none means every one. REPLAY_KEY signs. Given
 REPLAY_WRITERS, comma-separated addresses, `grant` gives each the editor role on its share of the registries,
 balanced by rows, `records` under a writer's key writes only its share, and `revoke` takes the roles back.
-Seeded court registries' rows come from NVNMCHAIN_EXPORT_DIR unless the old chain has written to them since,
-everything else from the old chain at NVNMCHAIN_API. A stop that needs a person exits 3; any other failure is safe
-to rerun, and a service may restart it.
+Rows come from NVNMCHAIN_EXPORT_DIR, or from the old chain at NVNMCHAIN_API for a registry it has written to
+since the export. A stop that needs a person exits 3; any other failure is safe to rerun, and a service may
+restart it.
 """
 
 import argparse
@@ -54,6 +54,7 @@ WORKERS = max(1, (os.cpu_count() or 4) - 4)  # signers or verifiers, leaving cor
 PAGE = 200
 REPLAYED = {"timestamp", "created_at", "creator"}  # what the replay sets itself
 HALT = 3
+OFFSET = FIRST_SEEDED_ID - 1  # the old chain's registries before the court ones, which do not carry over
 
 
 def halt(why: str) -> NoReturn:
@@ -130,13 +131,13 @@ def rows_of(registry: Registry, seeded: dict[int, dict]) -> list[Record]:
                 Record(r["uri"], r["checksum"], r["checksumAlgo"], r["metadata"], "", r["status"], i, 1, True, rid)
                 for i, r in enumerate(map(json.loads, f), 1)
             ]
-    rows = []
-    for latest in old_chain("records", registry_id=rid):  # the old chain lists only the latest versions
+    rows, old_id = [], rid + OFFSET
+    for latest in old_chain("records", registry_id=old_id):  # the old chain lists only the latest versions
         older = [
-            old_chain("records", registry_id=rid, record_id=latest["record_id"], index=i)[0]
+            old_chain("records", registry_id=old_id, record_id=latest["record_id"], index=i)[0]
             for i in range(1, int(latest["index"]))
         ]
-        rows += [parsed(Record, r) for r in older + [latest]]
+        rows += [parsed(Record, r)._replace(registry_id=rid) for r in older + [latest]]
     return rows
 
 
@@ -444,7 +445,10 @@ def main() -> None:
         out.writerow(["id", "name"])
         out.writerows(r[:2] for r in node.registries())
         return
-    old = old_registries()
+    names = json.loads((EXPORT / "registries.json").read_text())
+    court = old_registries()[OFFSET : OFFSET + len(names)]
+    assert [r.name for r in court] == [r["name"] for r in names], "the export's registries are not one run of ids"
+    old = [r._replace(id=r.id - OFFSET) for r in court]
     chosen = old
     if args.registries:
         chosen = []
@@ -453,9 +457,8 @@ def main() -> None:
             chosen.append(registry)
         chosen.sort()
     files = {f["registry"]: f for f in json.loads((EXPORT / "manifest.json").read_text())["files"]}
-    names = json.loads((EXPORT / "registries.json").read_text())
-    seeded = {FIRST_SEEDED_ID + i: files[r["name"]] for i, r in enumerate(names)}
-    for rid in sorted(written_since_seed() & seeded.keys()):  # the export no longer holds what they hold
+    seeded = {i: files[r["name"]] for i, r in enumerate(names, 1)}
+    for rid in sorted({i - OFFSET for i in written_since_seed()} & seeded.keys()):  # the export lacks what they hold
         print(f"{seeded.pop(rid)['registry']}: written since the export, read from the old chain", flush=True)
 
     if args.cmd == "verify":
