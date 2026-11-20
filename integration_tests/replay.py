@@ -296,10 +296,10 @@ def schedule(spec: str, share: float, done: int):
 
 
 def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, nonce_key=0, nonce=None) -> None:
-    """Sends the calls in order from one key, at most `per_block` transactions a block, workers signing each round
-    while the one before goes out. A lane far wider than one transaction is filled by declared gas anyway, so
-    there every transaction declares the cap and packs calls under it by their bounds; a normal lane needs each
-    call's estimate to fit several a block. `pace(now)`, the records this run may have sent by `now`, holds the
+    """Sends the calls in order from one key, at most `per_block` transactions a block, which workers sign up to a
+    block ahead so each goes out as its block starts. A lane far wider than one transaction is filled by declared gas
+    anyway, so there every transaction declares the cap and packs calls under it by their bounds; a normal lane needs
+    each call's estimate to fit several a block. `pace(now)`, the records this run may have sent by `now`, holds the
     calls to it. The transactions take `nonce_key`'s nonces from `nonce` on: by default the protocol's, from its
     next free one."""
     address = Account.from_key(key).address
@@ -322,7 +322,11 @@ def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, non
             if block != last_block:
                 last_block, budget = block, per_block
                 checked = node.check(address, checked, block)
-            room = min(WINDOW - (nonce - node.nonce(address, nonce_key=nonce_key)), budget)
+            out, signed = signed[:budget], signed[budget:]
+            for i in range(0, len(out), 250):
+                node.batch("eth_sendRawTransaction", [[raw] for raw in out[i : i + 250]])
+            budget -= len(out)
+            room = min(WINDOW - (nonce - node.nonce(address, nonce_key=nonce_key)), per_block - len(signed))
             if pace:
                 room = min(room, int(pace(time.time())) - sent)
             chunk = list(itertools.islice(txs, max(room, 0)))
@@ -335,20 +339,16 @@ def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, non
                     [[{**call, "data": "0x" + data.hex(), "nonce": hex(nonce + i)}] for i, [data] in enumerate(chunk)],
                 )
                 gases = [min(TX_GAS_CAP, int(e, 16) * 11 // 10) for e in estimates]
-            job = pool.map_async(
-                _sign, [(nonce + i, tx, g) for i, (tx, g) in enumerate(zip(chunk, gases))], chunksize=25
-            )
-            for i in range(0, len(signed), 250):  # the round before, while this one is signed
-                node.batch("eth_sendRawTransaction", [[raw] for raw in signed[i : i + 250]])
+            signed += pool.map(_sign, [(nonce + i, tx, g) for i, (tx, g) in enumerate(zip(chunk, gases))], chunksize=25)
             rows = sum(map(len, chunk))
-            signed, nonce, budget, sent = job.get(), nonce + len(chunk), budget - len(chunk), sent + rows
+            nonce, sent = nonce + len(chunk), sent + rows
             if sent // 10_000 != (sent - rows) // 10_000:
                 print(f"{label}: {sent} sent, block {block}, {sent / (time.time() - start):.0f}/s", flush=True)
             if chunk:
                 continue
-            if room > 0:
+            if room > 0 and not signed:
                 break
-            time.sleep(0.2 if pace else 0.01)  # no room yet, and the round before has gone out
+            time.sleep(0.2 if pace else 0.01)  # nothing to sign yet, or what is signed waits for the next block
     while node.nonce(address, nonce_key=nonce_key) < nonce:
         time.sleep(0.2)
     node.check(address, checked, int(node.rpc("eth_blockNumber"), 16))
