@@ -9,7 +9,8 @@ and checksum lookups come out as the old chain has them. A rerun resumes.
     .venv/bin/python -m integration_tests.replay revoke [REGISTRY...]
     .venv/bin/python -m integration_tests.replay verify [REGISTRY...]
 
-A REGISTRY is a court registry's id here or its name; none means every one. REPLAY_KEY signs. Given
+A REGISTRY is a court registry's id here or its name; none means every one. REPLAY_KEY signs, and the REGISTRYs
+of its `records` must be the first ones. Given
 REPLAY_WRITERS, comma-separated addresses, `grant` gives each the editor role on its share of the registries,
 balanced by rows, `records` under a writer's key writes only its share, and `revoke` takes the roles back.
 Rows come from NVNMCHAIN_EXPORT_DIR, and a court registry the old chain at NVNMCHAIN_API has written to since
@@ -487,6 +488,9 @@ def main() -> None:
             halt(f"{address} is not one of REPLAY_WRITERS")
         if not all(editing([(r.id, address) for r in chosen])):  # else every write would fail on chain
             halt(f"{address} lacks the editor role on part of its share: grant first")
+    elif chosen != old[: len(chosen)]:
+        # So nonce n is the n-th row whatever a run names, and a checksum several registries hold lands in id order.
+        halt("records go in id order: name the first registries to stop early, or none")
     mine = sum(rows[r.id] for r in chosen)
     # The nonce and every count are read at one block, so a second run signs the same record for the same nonce.
     # Where a transaction is one record they must agree, the one wallet's over every court registry and a writer's
