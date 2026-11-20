@@ -272,10 +272,10 @@ def split(registries: list[Registry], rows: dict[int, int], k: int) -> list[list
     return [sorted(share) for share in shares]
 
 
-def schedule(spec: str, share: float):
-    """Records a second for a writer with `share` of the rows, from `DATE:PER_DAY,...` in UTC: linear between the
-    points, none before the first, the last one's rate after it. A service's unset variable arrives as an empty
-    spec, which stops rather than send unpaced."""
+def schedule(spec: str, share: float, done: int):
+    """What a writer with `share` of the rows, `done` of them on chain, may have sent by a time: the rows due since
+    the first point of `DATE:PER_DAY,...` in UTC, linear between the points and held after the last, so a stop is
+    made up. A service's unset variable arrives as an empty spec, which stops rather than send unpaced."""
     try:
         points = sorted(
             (datetime.fromisoformat(when).replace(tzinfo=UTC).timestamp(), float(per_day) * share / 86400)
@@ -284,24 +284,23 @@ def schedule(spec: str, share: float):
     except ValueError:
         halt(f"--ramp {spec!r} is not DATE:PER_DAY,...")
 
-    def rate(now: float) -> float:
-        if now < points[0][0]:
-            return 0.0
+    def due(now: float) -> float:
+        total = max(0.0, now - points[-1][0]) * points[-1][1] - done
         for (t0, r0), (t1, r1) in itertools.pairwise(points):
-            if now < t1:
-                return r0 + (r1 - r0) * (now - t0) / (t1 - t0)
-        return points[-1][1]
+            if (d := min(now, t1) - t0) > 0:
+                total += d * (r0 + (r1 - r0) * d / (2 * (t1 - t0)))
+        return total
 
-    return rate
+    return due
 
 
 def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, nonce_key=0, nonce=None) -> None:
     """Sends the calls in order from one key, at most `per_block` transactions a block, workers signing each round
     while the one before goes out. A lane far wider than one transaction is filled by declared gas anyway, so
     there every transaction declares the cap and packs calls under it by their bounds; a normal lane needs each
-    call's estimate to fit several a block. `pace`, records a second at a time, holds the calls to that rate,
-    a few seconds' worth ahead at most. The transactions take `nonce_key`'s nonces from `nonce` on: by default
-    the protocol's, from its next free one."""
+    call's estimate to fit several a block. `pace(now)`, the records this run may have sent by `now`, holds the
+    calls to it. The transactions take `nonce_key`'s nonces from `nonce` on: by default the protocol's, from its
+    next free one."""
     address = Account.from_key(key).address
     chain_id = int(node.rpc("eth_chainId"), 16)
     fee = max(2 * int(node.rpc("eth_gasPrice"), 16), BASE_FEE_CAP)
@@ -316,7 +315,6 @@ def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, non
     nonce = node.nonce(address, "pending") if nonce is None else nonce
     checked = int(node.rpc("eth_blockNumber"), 16)
     last_block, budget, sent, start, signed = None, 0, 0, time.time(), []
-    credit, paced = 0.0, start
     with multiprocessing.Pool(WORKERS, _signer, (key, chain_id, fee, token, nonce_key)) as pool:
         while True:
             block = int(node.rpc("eth_blockNumber"), 16)
@@ -325,10 +323,7 @@ def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, non
                 checked = node.check(address, checked, block)
             room = min(WINDOW - (nonce - node.nonce(address, nonce_key=nonce_key)), budget)
             if pace:
-                now = time.time()
-                rate = pace(now)
-                credit, paced = min(credit + rate * (now - paced), max(1.0, 10 * rate)), now
-                room = min(room, int(credit))
+                room = min(room, int(pace(time.time())) - sent)
             chunk = list(itertools.islice(txs, max(room, 0)))
             if lifted:
                 gases = [TX_GAS_CAP] * len(chunk)
@@ -346,7 +341,6 @@ def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, non
                 node.batch("eth_sendRawTransaction", [[raw] for raw in signed[i : i + 250]])
             rows = sum(map(len, chunk))
             signed, nonce, budget, sent = job.get(), nonce + len(chunk), budget - len(chunk), sent + rows
-            credit -= rows
             if sent // 10_000 != (sent - rows) // 10_000:
                 print(f"{label}: {sent} sent, block {block}, {sent / (time.time() - start):.0f}/s", flush=True)
             if chunk:
@@ -494,10 +488,6 @@ def main() -> None:
         if not all(editing([(r.id, address) for r in chosen])):  # else every write would fail on chain
             halt(f"{address} lacks the editor role on part of its share: grant first")
     mine = sum(rows[r.id] for r in chosen)
-    # Each writer takes the ramp in proportion to its rows, so they all finish together.
-    pace = schedule(args.ramp, mine / sum(rows.values())) if args.ramp is not None else None
-    rate = f"{pace(time.time()) * 86400:,.0f} a day now" if pace else "unpaced"
-    print(f"writing {len(chosen)} registries, {mine} rows, {rate}", flush=True)
     # The nonce and every count are read at one block, so a second run signs the same record for the same nonce.
     # Where a transaction is one record the two must agree: a failed one took a nonce and added nothing.
     block = node.rpc("eth_blockNumber")
@@ -505,6 +495,12 @@ def main() -> None:
     nonce, landed = node.nonce(address, block, NONCE_KEY), sum(have.values())
     if nonce != landed and not writers and not node.lifted():
         halt(f"{nonce} record transactions but {landed} records: one failed, or something else wrote a record")
+    done = sum(have[r.id] for r in chosen)
+    # Each writer takes the ramp in proportion to its rows, so they all finish together. With none left it would
+    # only hold the run until it reached the rows on chain.
+    pace = schedule(args.ramp, mine / sum(rows.values()), done) if args.ramp is not None and done < mine else None
+    due = f"{max(0, pace(time.time())):,.0f} due now" if pace else "unpaced"
+    print(f"writing {len(chosen)} registries, {mine} rows, {due}", flush=True)
     calls = itertools.chain.from_iterable(remaining(r, rows_of(r, seeded), have[r.id]) for r in chosen)
     send(node, key, calls, args.per_block, "records", pace, NONCE_KEY, nonce)
 
