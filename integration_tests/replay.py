@@ -489,13 +489,15 @@ def main() -> None:
             halt(f"{address} lacks the editor role on part of its share: grant first")
     mine = sum(rows[r.id] for r in chosen)
     # The nonce and every count are read at one block, so a second run signs the same record for the same nonce.
-    # Where a transaction is one record the two must agree: a failed one took a nonce and added nothing.
+    # Where a transaction is one record they must agree, the one wallet's over every court registry and a writer's
+    # over its share: a failed one took a nonce and added nothing. A lifted lane packs records, so a rehearsal
+    # relies on `verify`.
     block = node.rpc("eth_blockNumber")
     have = dict(zip(seeded, node.record_counts(list(seeded), block)))
-    nonce, landed = node.nonce(address, block, NONCE_KEY), sum(have.values())
-    if nonce != landed and not writers and not node.lifted():
-        halt(f"{nonce} record transactions but {landed} records: one failed, or something else wrote a record")
     done = sum(have[r.id] for r in chosen)
+    nonce, landed = node.nonce(address, block, NONCE_KEY), done if writers else sum(have.values())
+    if nonce != landed and not node.lifted():
+        halt(f"{nonce} record transactions but {landed} records: one failed, or something else wrote a record")
     # Each writer takes the ramp in proportion to its rows, so they all finish together. With none left it would
     # only hold the run until it reached the rows on chain.
     pace = schedule(args.ramp, mine / sum(rows.values()), done) if args.ramp is not None and done < mine else None
