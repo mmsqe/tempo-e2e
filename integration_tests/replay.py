@@ -9,12 +9,14 @@ and checksum lookups come out as the old chain has them. A rerun resumes.
     .venv/bin/python -m integration_tests.replay revoke [REGISTRY...]
     .venv/bin/python -m integration_tests.replay verify [REGISTRY...]
 
-A REGISTRY is a court registry's id here or its name; none means every one. REPLAY_KEY signs. Given
+A REGISTRY is a court registry's id here or its name; none means every one. REPLAY_KEY signs, and the REGISTRYs
+of its `records` must be the first ones. Given
 REPLAY_WRITERS, comma-separated addresses, `grant` gives each the editor role on its share of the registries,
 balanced by rows, `records` under a writer's key writes only its share, and `revoke` takes the roles back.
-Rows come from NVNMCHAIN_EXPORT_DIR, or from the old chain at NVNMCHAIN_API for a registry it has written to
-since the export. A stop that needs a person exits 3; any other failure is safe to rerun, and a service may
-restart it.
+Rows come from NVNMCHAIN_EXPORT_DIR, and a court registry the old chain at NVNMCHAIN_API has written to since
+stops the run. Records go under one 2D nonce key, each of whose nonces lands once and in order, so a second run
+at the same time cannot write one twice. A stop that needs a person exits 3; any other failure is safe to rerun,
+and a service may restart it.
 """
 
 import argparse
@@ -37,10 +39,10 @@ from eth_abi import decode, encode
 from eth_account import Account
 from eth_utils import keccak
 from tempo import Builder, Signer, serialize, sign_transaction
-from tempo.constants import FEE_MANAGER_ADDRESS, PATH_USD
+from tempo.constants import FEE_MANAGER_ADDRESS, NONCE_ADDRESS, PATH_USD
 from web3 import HTTPProvider
 
-from .abi import ANCHORING, ANCHORING_ADDRESS, FEE
+from .abi import ANCHORING, ANCHORING_ADDRESS, FEE, NONCE
 from .anchoring import Page, Record, Registry, bech32
 from .tempo_vs_export import ADMIN, CHUNK, EXPORT, FIRST_SEEDED_ID, RECORD, VERSIONS, reader_code
 
@@ -48,8 +50,8 @@ API = os.getenv("NVNMCHAIN_API", "https://api.nvnmchain.io")
 SEED_HEIGHT = 2_046_500  # the old chain's block at the export's SEEDED_AT
 BASE_FEE_CAP = 12_000_000_000  # TIP-1067's ceiling; a fee under it stalls once full blocks raise the base fee
 TX_GAS_CAP = 30_000_000
-WINDOW = 8192  # unconfirmed transactions kept in the pool
-ROUND = 1000  # transactions signed, then sent, at a time
+WINDOW = 512  # unconfirmed transactions kept in the pool, which holds 1,024 of one nonce key by default
+NONCE_KEY = int.from_bytes(b"replay")  # the 2D nonce key records go under
 WORKERS = max(1, (os.cpu_count() or 4) - 4)  # signers or verifiers, leaving cores to a node on the same machine
 PAGE = 200
 REPLAYED = {"timestamp", "created_at", "creator"}  # what the replay sets itself
@@ -80,17 +82,6 @@ def fetch(path: str, params: dict) -> dict:
         time.sleep(wait)
 
 
-def old_chain(path: str, **params) -> list[dict]:
-    """Every row of one of the old chain's anchoring lists."""
-    rows = []
-    while True:
-        query = {**params, "pagination.limit": PAGE, "pagination.offset": len(rows)}
-        page = fetch(f"NVNM-Chain/nvnmchain/anchoring/v1/{path}", query)[path]
-        rows += page
-        if len(page) < PAGE:
-            return rows
-
-
 def written_since_seed() -> set[int]:
     """The registries the old chain has added a record to or changed one in after the seed height."""
     ids = set()
@@ -107,38 +98,29 @@ def written_since_seed() -> set[int]:
     return ids
 
 
-def parsed(cls, row: dict):
-    """A `Registry` or `Record` from the old chain's JSON, which leaves empty fields out and quotes integers."""
-    return cls(
-        *(int(row[f]) if f in ("id", "record_id", "index", "registry_id") else row.get(f, "") for f in cls._fields)
-    )
-
-
 def old_registries() -> list[Registry]:
-    rows = [parsed(Registry, r) for r in old_chain("registries")]
+    """Every registry of the old chain, whose JSON leaves empty fields out and quotes integers."""
+    rows = []
+    while True:
+        query = {"pagination.limit": PAGE, "pagination.offset": len(rows)}
+        page = fetch("NVNM-Chain/nvnmchain/anchoring/v1/registries", query)["registries"]
+        rows += [Registry(*(int(r[f]) if f == "id" else r.get(f, "") for f in Registry._fields)) for r in page]
+        if len(page) < PAGE:
+            break
     assert [r.id for r in rows] == list(range(1, len(rows) + 1)), "the old chain's ids have a gap"
     return rows
 
 
 def rows_of(registry: Registry, seeded: dict[int, dict]) -> list[Record]:
-    """Every version of a registry's records, in write order. No export file repeats a checksum, so each of
-    its rows is its own record."""
-    rid, entry = registry.id, seeded.get(registry.id)
-    if entry:
-        assert entry["registry"] == registry.name, f"registry {rid} is {registry.name}, the export's {entry}"
-        with gzip.open(EXPORT / entry["file"], "rt") as f:
-            return [
-                Record(r["uri"], r["checksum"], r["checksumAlgo"], r["metadata"], "", r["status"], i, 1, True, rid)
-                for i, r in enumerate(map(json.loads, f), 1)
-            ]
-    rows, old_id = [], rid + OFFSET
-    for latest in old_chain("records", registry_id=old_id):  # the old chain lists only the latest versions
-        older = [
-            old_chain("records", registry_id=old_id, record_id=latest["record_id"], index=i)[0]
-            for i in range(1, int(latest["index"]))
+    """A registry's records from the export, in write order. No export file repeats a checksum, so each row is
+    its own record."""
+    rid, entry = registry.id, seeded[registry.id]
+    assert entry["registry"] == registry.name, f"registry {rid} is {registry.name}, the export's {entry}"
+    with gzip.open(EXPORT / entry["file"], "rt") as f:
+        return [
+            Record(r["uri"], r["checksum"], r["checksumAlgo"], r["metadata"], "", r["status"], i, 1, True, rid)
+            for i, r in enumerate(map(json.loads, f), 1)
         ]
-        rows += [parsed(Record, r)._replace(registry_id=rid) for r in older + [latest]]
-    return rows
 
 
 class Node:
@@ -159,8 +141,17 @@ class Node:
                 raise RuntimeError(f"{method}: {reply['error']}")
         return [r["result"] for r in replies]
 
-    def nonce(self, address: str, block: str = "latest") -> int:
-        return int(self.rpc("eth_getTransactionCount", address, block), 16)
+    def nonce(self, address: str, block: str = "latest", nonce_key: int = 0) -> int:
+        """`address`'s next nonce at `block`: the protocol's, or a 2D `nonce_key`'s."""
+        if not nonce_key:
+            return int(self.rpc("eth_getTransactionCount", address, block), 16)
+        data = "0x" + NONCE.fns.getNonce(address, nonce_key).data.hex()
+        return int(self.rpc("eth_call", {"to": NONCE_ADDRESS, "data": data}, block), 16)
+
+    def lifted(self) -> bool:
+        """Whether the general lane is far wider than one transaction, as a rehearsal's is."""
+        limit = self.rpc("eth_getBlockByNumber", "latest", False)["mainBlockGeneralGasLimit"]
+        return int(limit, 16) >= 100 * TX_GAS_CAP
 
     def check(self, address: str, after: int, until: int) -> int:
         """Stops on any of `address`'s transactions that failed in blocks after..until, and returns `until`: a
@@ -183,16 +174,15 @@ class Node:
     def call(self, data: bytes, override: dict | None = None) -> bytes:
         return self.calls([data], override)[0]
 
-    def word(self, slot: bytes) -> int:
-        return int(self.rpc("eth_getStorageAt", ANCHORING_ADDRESS, "0x" + slot.hex(), "latest"), 16)
-
     def registry_count(self) -> int:
         """`_registryCount`, in slot 3 above the 160-bit `_formerAdmin`."""
-        return self.word((3).to_bytes(32, "big")) >> 160
+        return int(self.rpc("eth_getStorageAt", ANCHORING_ADDRESS, "0x3", "latest"), 16) >> 160
 
-    def record_count(self, rid: int) -> int:
-        """`_recordCount[rid]`, of the mapping at slot 5."""
-        return self.word(keccak(encode(["uint256"] * 2, [rid, 5])))
+    def record_counts(self, rids: list[int], block: str) -> list[int]:
+        """`_recordCount[rid]` of each at `block`, from the mapping at slot 5."""
+        slots = ["0x" + keccak(encode(["uint256"] * 2, [rid, 5])).hex() for rid in rids]
+        words = self.batch("eth_getStorageAt", [[ANCHORING_ADDRESS, slot, block] for slot in slots])
+        return [int(word, 16) for word in words]
 
     def registries(self) -> list[Registry]:
         rows = []
@@ -232,14 +222,8 @@ def gas_bound(record: Record) -> int:
     return 250_000 * (sum(0 if n == 0 else 1 if n < 32 else 1 + (n + 31) // 32 for n in lengths) + 7) + 1_000_000
 
 
-def remaining(node: Node, registry: Registry, rows: list[Record]):
-    """Each of `rows` not yet on the node, as calldata and a gas bound: whole records by their count, then the
-    last one's versions."""
-    if not rows:
-        return
-    rid = registry.id
-    have = node.record_count(rid)
-    done = sum(r.record_id < have for r in rows) + len(node.versions(rid, have, 1)) if have else 0
+def remaining(registry: Registry, rows: list[Record], done: int):
+    """Each of `rows` after the `done` the node holds, as calldata and a gas bound."""
     if done < len(rows):
         print(f"{registry.name}: {done} of {len(rows)} rows here", flush=True)
     yield from ((ANCHORING.fns.addRecord(r).data, gas_bound(r)) for r in rows[done:])
@@ -259,20 +243,20 @@ def packed(calls):
         yield batch
 
 
-SIGNER: tuple  # a pool worker's signer, chain id, fee and fee token
+SIGNER: tuple  # a pool worker's signer, chain id, fee, fee token and nonce key
 
 
-def _signer(key: str, chain_id: int, fee: int, token: str) -> None:
+def _signer(key: str, chain_id: int, fee: int, token: str, nonce_key: int) -> None:
     global SIGNER
-    SIGNER = Signer(key), chain_id, fee, token
+    SIGNER = Signer(key), chain_id, fee, token, nonce_key
 
 
 def _sign(job: tuple[int, list[bytes], int]) -> str:
     """A tempo transaction calling the contract once for each calldata, signed in a pool worker."""
     nonce, datas, gas = job
-    signer, chain_id, fee, token = SIGNER
+    signer, chain_id, fee, token, nonce_key = SIGNER
     tx = Builder().chain_id(chain_id).gas_limit(gas).max_fee_per_gas(fee).max_priority_fee_per_gas(0)
-    tx = tx.nonce(nonce).nonce_key(0).fee_token(token)
+    tx = tx.nonce(nonce).nonce_key(nonce_key).fee_token(token)
     for data in datas:
         tx.add_call(to=ANCHORING_ADDRESS, value=0, data=data)
     return serialize(sign_transaction(tx.build(), signer))
@@ -289,10 +273,10 @@ def split(registries: list[Registry], rows: dict[int, int], k: int) -> list[list
     return [sorted(share) for share in shares]
 
 
-def schedule(spec: str, share: float):
-    """Records a second for a writer with `share` of the rows, from `DATE:PER_DAY,...` in UTC: linear between the
-    points, none before the first, the last one's rate after it. A service's unset variable arrives as an empty
-    spec, which stops rather than send unpaced."""
+def schedule(spec: str, share: float, done: int):
+    """What a writer with `share` of the rows, `done` of them on chain, may have sent by a time: the rows due since
+    the first point of `DATE:PER_DAY,...` in UTC, linear between the points and held after the last, so a stop is
+    made up. A service's unset variable arrives as an empty spec, which stops rather than send unpaced."""
     try:
         points = sorted(
             (datetime.fromisoformat(when).replace(tzinfo=UTC).timestamp(), float(per_day) * share / 86400)
@@ -301,23 +285,23 @@ def schedule(spec: str, share: float):
     except ValueError:
         halt(f"--ramp {spec!r} is not DATE:PER_DAY,...")
 
-    def rate(now: float) -> float:
-        if now < points[0][0]:
-            return 0.0
+    def due(now: float) -> float:
+        total = max(0.0, now - points[-1][0]) * points[-1][1] - done
         for (t0, r0), (t1, r1) in itertools.pairwise(points):
-            if now < t1:
-                return r0 + (r1 - r0) * (now - t0) / (t1 - t0)
-        return points[-1][1]
+            if (d := min(now, t1) - t0) > 0:
+                total += d * (r0 + (r1 - r0) * d / (2 * (t1 - t0)))
+        return total
 
-    return rate
+    return due
 
 
-def send(node: Node, key: str, calls, per_block: int, label: str, pace=None) -> None:
-    """Sends the calls in order from one key, at most `per_block` transactions a block, workers signing each round
-    while the one before goes out. A lane far wider than one transaction is filled by declared gas anyway, so
-    there every transaction declares the cap and packs calls under it by their bounds; a normal lane needs each
-    call's estimate to fit several a block. `pace`, records a second at a time, holds the calls to that rate,
-    a few seconds' worth ahead at most."""
+def send(node: Node, key: str, calls, per_block: int, label: str, pace=None, nonce_key=0, nonce=None) -> None:
+    """Sends the calls in order from one key, at most `per_block` transactions a block, which workers sign up to a
+    block ahead so each goes out as its block starts. A lane far wider than one transaction is filled by declared gas
+    anyway, so there every transaction declares the cap and packs calls under it by their bounds; a normal lane needs
+    each call's estimate to fit several a block. `pace(now)`, the records this run may have sent by `now`, holds the
+    calls to it. The transactions take `nonce_key`'s nonces from `nonce` on: by default the protocol's, from its
+    next free one."""
     address = Account.from_key(key).address
     chain_id = int(node.rpc("eth_chainId"), 16)
     fee = max(2 * int(node.rpc("eth_gasPrice"), 16), BASE_FEE_CAP)
@@ -326,48 +310,46 @@ def send(node: Node, key: str, calls, per_block: int, label: str, pace=None) -> 
         bytes.fromhex(node.rpc("eth_call", {"to": FEE_MANAGER_ADDRESS, "data": "0x" + fn.data.hex()}, "latest")[2:])
     )
     token = PATH_USD if int(token, 16) == 0 else token
-    lifted = int(node.rpc("eth_getBlockByNumber", "latest", False)["mainBlockGeneralGasLimit"], 16) >= 100 * TX_GAS_CAP
+    lifted = node.lifted()
     txs = packed(calls) if lifted else ([data] for data, _ in calls)
-    nonce, checked = node.nonce(address, "pending"), int(node.rpc("eth_blockNumber"), 16)
+    call = {"from": address, "to": ANCHORING_ADDRESS, "nonceKey": hex(nonce_key)}
+    nonce = node.nonce(address, "pending") if nonce is None else nonce
+    checked = int(node.rpc("eth_blockNumber"), 16)
     last_block, budget, sent, start, signed = None, 0, 0, time.time(), []
-    credit, paced = 0.0, start
-    with multiprocessing.Pool(WORKERS, _signer, (key, chain_id, fee, token)) as pool:
+    with multiprocessing.Pool(WORKERS, _signer, (key, chain_id, fee, token, nonce_key)) as pool:
         while True:
             block = int(node.rpc("eth_blockNumber"), 16)
             if block != last_block:
                 last_block, budget = block, per_block
                 checked = node.check(address, checked, block)
-            room = min(WINDOW - (nonce - node.nonce(address)), budget, ROUND)
+            out, signed = signed[:budget], signed[budget:]
+            for i in range(0, len(out), 250):
+                node.batch("eth_sendRawTransaction", [[raw] for raw in out[i : i + 250]])
+            budget -= len(out)
+            room = min(WINDOW - (nonce - node.nonce(address, nonce_key=nonce_key)), per_block - len(signed))
             if pace:
-                now = time.time()
-                rate = pace(now)
-                credit, paced = min(credit + rate * (now - paced), max(1.0, 10 * rate)), now
-                room = min(room, int(credit))
-            if room <= 0:
-                time.sleep(0.2 if pace else 0.01)
-                continue
-            chunk = list(itertools.islice(txs, room))
+                room = min(room, int(pace(time.time())) - sent)
+            chunk = list(itertools.islice(txs, max(room, 0)))
             if lifted:
                 gases = [TX_GAS_CAP] * len(chunk)
             else:
+                # Told its nonce: a nonce key's first costs 250k more than its later ones.
                 estimates = node.batch(
                     "eth_estimateGas",
-                    [[{"from": address, "to": ANCHORING_ADDRESS, "data": "0x" + data.hex()}] for [data] in chunk],
+                    [[{**call, "data": "0x" + data.hex(), "nonce": hex(nonce + i)}] for i, [data] in enumerate(chunk)],
                 )
                 gases = [min(TX_GAS_CAP, int(e, 16) * 11 // 10) for e in estimates]
-            job = pool.map_async(
-                _sign, [(nonce + i, tx, g) for i, (tx, g) in enumerate(zip(chunk, gases))], chunksize=25
-            )
-            for i in range(0, len(signed), 250):  # the round before, while this one is signed
-                node.batch("eth_sendRawTransaction", [[raw] for raw in signed[i : i + 250]])
+            signed += pool.map(_sign, [(nonce + i, tx, g) for i, (tx, g) in enumerate(zip(chunk, gases))], chunksize=25)
             rows = sum(map(len, chunk))
-            signed, nonce, budget, sent = job.get(), nonce + len(chunk), budget - len(chunk), sent + rows
-            credit -= rows
+            nonce, sent = nonce + len(chunk), sent + rows
             if sent // 10_000 != (sent - rows) // 10_000:
                 print(f"{label}: {sent} sent, block {block}, {sent / (time.time() - start):.0f}/s", flush=True)
-            if not chunk:
+            if chunk:
+                continue
+            if room > 0 and not signed:
                 break
-    while node.nonce(address) < nonce:
+            time.sleep(0.2 if pace else 0.01)  # nothing to sign yet, or what is signed waits for the next block
+    while node.nonce(address, nonce_key=nonce_key) < nonce:
         time.sleep(0.2)
     node.check(address, checked, int(node.rpc("eth_blockNumber"), 16))
     print(f"{label}: {sent} confirmed in {time.time() - start:.0f}s", flush=True)
@@ -438,7 +420,7 @@ def main() -> None:
     ap.add_argument("cmd", choices=["registries", "ids", "grant", "records", "revoke", "verify"])
     ap.add_argument("registries", nargs="*", help="ids or names, for all but registries and ids; none means all")
     ap.add_argument("--rpc", default=os.getenv("TEMPO_RPC", "http://127.0.0.1:8545"))
-    ap.add_argument("--per-block", type=int, default=WINDOW, help="new transactions a block, to pace a drip")
+    ap.add_argument("--per-block", type=int, default=os.getenv("REPLAY_PER_BLOCK", WINDOW))
     ap.add_argument("--ramp", help="for records: DATE:PER_DAY,... in UTC, the writers' rate together")
     args = ap.parse_args()
 
@@ -461,8 +443,9 @@ def main() -> None:
         chosen = sorted({matches[0] for matches in found.values()})
     files = {f["registry"]: f for f in json.loads((EXPORT / "manifest.json").read_text())["files"]}
     seeded = {i: files[r["name"]] for i, r in enumerate(names, 1)}
-    for rid in sorted({i - OFFSET for i in written_since_seed()} & seeded.keys()):  # the export lacks what they hold
-        print(f"{seeded.pop(rid)['registry']}: written since the export, read from the old chain", flush=True)
+    # Rows come from the export alone, so one the old chain added since would be left out.
+    if changed := sorted({i - OFFSET for i in written_since_seed()} & seeded.keys()):
+        halt("written on the old chain since the export: " + " ".join(seeded[i]["registry"] for i in changed))
 
     if args.cmd == "verify":
         raise SystemExit(1 if verify(node, old, chosen, seeded) else 0)
@@ -471,8 +454,9 @@ def main() -> None:
     address = Account.from_key(key).address
     creator = bech32(address)
     print(f"signing as {creator}" + ("" if creator == ADMIN else f", not {ADMIN}"), flush=True)
-    # Resume from what landed: wait out this key's pending transactions, which a node restart drops.
-    while node.nonce(address, "pending") > node.nonce(address):
+    # Registries and roles resume from what landed: wait out this key's pending transactions, which a node
+    # restart drops.
+    while args.cmd != "records" and node.nonce(address, "pending") > node.nonce(address):
         time.sleep(0.5)
     if args.cmd == "registries":
         have = node.registry_count()
@@ -483,7 +467,7 @@ def main() -> None:
         return
 
     writers = [w.lower() for w in os.getenv("REPLAY_WRITERS", "").split(",") if w]
-    rows = {r.id: files.get(r.name, {}).get("records", 1) for r in chosen}  # court registries' from the export
+    rows = {r.id: seeded[r.id]["records"] for r in chosen}
     shares = dict(zip(writers, split(chosen, rows, len(writers)))) if writers else {}
 
     def editing(pairs: list[tuple[int, str]]) -> list[bool]:
@@ -504,13 +488,27 @@ def main() -> None:
             halt(f"{address} is not one of REPLAY_WRITERS")
         if not all(editing([(r.id, address) for r in chosen])):  # else every write would fail on chain
             halt(f"{address} lacks the editor role on part of its share: grant first")
+    elif chosen != old[: len(chosen)]:
+        # So nonce n is the n-th row whatever a run names, and a checksum several registries hold lands in id order.
+        halt("records go in id order: name the first registries to stop early, or none")
     mine = sum(rows[r.id] for r in chosen)
-    # Each writer takes the ramp in proportion to its rows, so they all finish together.
-    pace = schedule(args.ramp, mine / sum(rows.values())) if args.ramp is not None else None
-    rate = f"{pace(time.time()) * 86400:,.0f} a day now" if pace else "unpaced"
-    print(f"writing {len(chosen)} registries, {mine} rows, {rate}", flush=True)
-    calls = itertools.chain.from_iterable(remaining(node, r, rows_of(r, seeded)) for r in chosen)
-    send(node, key, calls, args.per_block, "records", pace)
+    # The nonce and every count are read at one block, so a second run signs the same record for the same nonce.
+    # Where a transaction is one record they must agree, the one wallet's over every court registry and a writer's
+    # over its share: a failed one took a nonce and added nothing. A lifted lane packs records, so a rehearsal
+    # relies on `verify`.
+    block = node.rpc("eth_blockNumber")
+    have = dict(zip(seeded, node.record_counts(list(seeded), block)))
+    done = sum(have[r.id] for r in chosen)
+    nonce, landed = node.nonce(address, block, NONCE_KEY), done if writers else sum(have.values())
+    if nonce != landed and not node.lifted():
+        halt(f"{nonce} record transactions but {landed} records: one failed, or something else wrote a record")
+    # Each writer takes the ramp in proportion to its rows, so they all finish together. With none left it would
+    # only hold the run until it reached the rows on chain.
+    pace = schedule(args.ramp, mine / sum(rows.values()), done) if args.ramp is not None and done < mine else None
+    due = f"{max(0, pace(time.time())):,.0f} due now" if pace else "unpaced"
+    print(f"writing {len(chosen)} registries, {mine} rows, {due}", flush=True)
+    calls = itertools.chain.from_iterable(remaining(r, rows_of(r, seeded), have[r.id]) for r in chosen)
+    send(node, key, calls, args.per_block, "records", pace, NONCE_KEY, nonce)
 
 
 if __name__ == "__main__":
